@@ -62,7 +62,7 @@ export function ConfigChip({
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" side="top" className="w-56 p-1">
-        <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
+        <div className="label-group px-2 py-1 text-muted-foreground/70">
           {promoted ? fallbackLabel : option.name}
         </div>
         {option.options.map((v) => (
@@ -112,9 +112,7 @@ export function ModeChip({
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" side="top" className="w-56 p-1">
-        <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
-          Mode
-        </div>
+        <div className="label-group px-2 py-1 text-muted-foreground/70">Mode</div>
         {modes.availableModes.map((m) => (
           <button
             key={m.id}
@@ -167,7 +165,7 @@ export function AgentHeader({ session, agentStatus }: AgentHeaderProps): React.J
           STATUS_COLOR[effectiveStatus ?? 'idle'] ?? 'text-muted-foreground'
         )}
       />
-      <span className="text-[11px] text-muted-foreground">{statusLabel}</span>
+      <span className="text-2xs text-muted-foreground">{statusLabel}</span>
     </div>
   )
 }
