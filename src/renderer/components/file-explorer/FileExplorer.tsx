@@ -99,6 +99,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
   const normalizedSearchQuery = searchQuery ?? ''
   const safeSearchResults = searchResults ?? []
   const safeSearchFileNameMatches = searchFileNameMatches ?? []
+  const fileNameMatchesPending = searchFileNameMatches === null
   const hasSearchInput = normalizedSearchQuery.length > 0
   const trimmedSearchQuery = normalizedSearchQuery.trim()
   const isSearchActive = trimmedSearchQuery.length > 0
@@ -274,6 +275,32 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
       finalizeResizeDrag()
     }
   }, [finalizeResizeDrag])
+
+  // Cancel any in-flight filename/content stream when the explorer unmounts.
+  // The store is a module-level singleton and the file explorer can be torn
+  // down while a stream is still mid-walk; without this cleanup the rg child
+  // process outlives the component and the next mount sees stale events.
+  //
+  // We capture the `searchRequestId` at effect setup time (not at cleanup
+  // time) so that a new search started via a different code path between
+  // setup and cleanup does not get cancelled by mistake.
+  useEffect(() => {
+    const id = useFileExplorerStore.getState().searchRequestId
+    return () => {
+      if (id > 0) {
+        const sid = `search-${id}`
+        // Surface silent IPC failures so a stuck rg process is at least
+        // visible in the console; the cancel is still fire-and-forget
+        // from the user's perspective.
+        filesystemApi.searchFileNamesStreamCancel(sid).catch((e) => {
+          console.warn(`[file-explorer] searchFileNamesStreamCancel(${sid}) failed:`, e)
+        })
+        filesystemApi.searchContentStreamCancel(sid).catch((e) => {
+          console.warn(`[file-explorer] searchContentStreamCancel(${sid}) failed:`, e)
+        })
+      }
+    }
+  }, [])
 
   // Focus inline input when it appears
   useEffect(() => {
@@ -1003,7 +1030,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                     {searchLoading && <LoaderCircle size={10} className="animate-spin" />}
                     Files{' '}
                     <span className="text-muted-foreground">
-                      {safeSearchFileNameMatches.length}
+                      {fileNameMatchesPending ? '…' : safeSearchFileNameMatches.length}
                     </span>
                   </button>
                 </div>
