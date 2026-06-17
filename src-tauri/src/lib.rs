@@ -1134,6 +1134,8 @@ pub fn run() {
             commands::git_push,
             commands::git_get_commit_context,
             commands::git_init,
+            commands::git_checkout_branch,
+            commands::git_create_branch,
             commands::git_stash_save,
             commands::git_stash_list,
             commands::git_stash_apply,

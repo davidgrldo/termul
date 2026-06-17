@@ -117,6 +117,9 @@ export interface GitApi {
   commit: (cwd: string, summary: string, description?: string, amend?: boolean) => Promise<void>
   push: (cwd: string) => Promise<void>
   getCommitContext: (cwd: string) => Promise<GitCommitContext>
+  init: (cwd: string) => Promise<void>
+  checkoutBranch: (cwd: string, branch: string, isRemote?: boolean) => Promise<void>
+  createBranch: (cwd: string, branch: string, startRef?: string) => Promise<void>
   stashSave: (cwd: string, message?: string, includeUntracked?: boolean) => Promise<void>
   stashList: (cwd: string) => Promise<GitStashInfo[]>
   stashApply: (cwd: string, index: number) => Promise<void>
@@ -205,6 +208,7 @@ export interface BranchInfo {
   isRemote: boolean
   isCurrent: boolean
   upstream?: string | null
+  hasOtherWorktree: boolean
 }
 
 export interface DirtyStatus {
