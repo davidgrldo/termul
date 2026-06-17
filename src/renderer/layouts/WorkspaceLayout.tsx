@@ -64,7 +64,7 @@ import {
   useConfirmTerminalClose,
   useDefaultShell,
   useMaxTerminalsPerProject,
-  useTerminalFontSize
+  useUiZoomLevel
 } from '@/stores/app-settings-store'
 import { useBrowserSessionStore } from '@/stores/browser-session-store'
 import { useCommandHistoryStore } from '@/stores/command-history-store'
@@ -105,7 +105,7 @@ import {
   usePaneRoot,
   useWorkspaceStore
 } from '@/stores/workspace-store'
-import { DEFAULT_APP_SETTINGS } from '@/types/settings'
+import { UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP } from '@/types/settings'
 
 function getShortcutTargetContext(target: EventTarget | null): {
   isInEditor: boolean
@@ -707,7 +707,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [shortcuts]
   )
 
-  const fontSize = useTerminalFontSize()
+  const uiZoomLevel = useUiZoomLevel()
   const colorTheme = useColorTheme()
   const appearanceMode = useAppearanceMode()
 
@@ -756,6 +756,21 @@ export default function WorkspaceLayout(): React.JSX.Element {
       return shortcut?.customKey ?? shortcut?.defaultKey ?? ''
     },
     [shortcuts]
+  )
+
+  // Shared whole-UI zoom action used by both the DOM keydown path and the
+  // keyboardApi.onShortcut callback so behavior stays identical.
+  const applyZoomAction = useCallback(
+    (action: 'zoomIn' | 'zoomOut' | 'zoomReset'): void => {
+      const next =
+        action === 'zoomIn'
+          ? Math.min(uiZoomLevel + UI_ZOOM_STEP, UI_ZOOM_MAX)
+          : action === 'zoomOut'
+            ? Math.max(uiZoomLevel - UI_ZOOM_STEP, UI_ZOOM_MIN)
+            : UI_ZOOM_DEFAULT
+      if (next !== uiZoomLevel) updateAppSetting('uiZoomLevel', next)
+    },
+    [uiZoomLevel, updateAppSetting]
   )
 
   // Determine if we should show the terminal area (only on workspace dashboard)
@@ -1051,27 +1066,23 @@ export default function WorkspaceLayout(): React.JSX.Element {
         return
       }
 
-      // Zoom in/out/reset
+      // Zoom in/out/reset — whole-UI zoom (VS Code style)
       if (matchesShortcut(e, getActiveKey('zoomIn'))) {
         e.preventDefault()
         e.stopPropagation()
-        const newSize = Math.min(fontSize + 1, 24)
-        if (newSize !== fontSize) updateAppSetting('terminalFontSize', newSize)
+        applyZoomAction('zoomIn')
         return
       }
       if (matchesShortcut(e, getActiveKey('zoomOut'))) {
         e.preventDefault()
         e.stopPropagation()
-        const newSize = Math.max(fontSize - 1, 10)
-        if (newSize !== fontSize) updateAppSetting('terminalFontSize', newSize)
+        applyZoomAction('zoomOut')
         return
       }
       if (matchesShortcut(e, getActiveKey('zoomReset'))) {
         e.preventDefault()
         e.stopPropagation()
-        if (fontSize !== DEFAULT_APP_SETTINGS.terminalFontSize) {
-          updateAppSetting('terminalFontSize', DEFAULT_APP_SETTINGS.terminalFontSize)
-        }
+        applyZoomAction('zoomReset')
         return
       }
 
@@ -1106,8 +1117,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     activeTerminalId,
     activeTerminal,
     getActiveKey,
-    fontSize,
-    updateAppSetting,
+    applyZoomAction,
     appDefaultShell,
     maxTerminals,
     isWorkspaceRoute,
@@ -1153,24 +1163,14 @@ export default function WorkspaceLayout(): React.JSX.Element {
         case 'prevTerminal':
           cycleTab('prev')
           break
-        case 'zoomIn': {
-          const newSize = Math.min(fontSize + 1, 24)
-          if (newSize !== fontSize) {
-            updateAppSetting('terminalFontSize', newSize)
-          }
+        case 'zoomIn':
+          applyZoomAction('zoomIn')
           break
-        }
-        case 'zoomOut': {
-          const newSize = Math.max(fontSize - 1, 10)
-          if (newSize !== fontSize) {
-            updateAppSetting('terminalFontSize', newSize)
-          }
+        case 'zoomOut':
+          applyZoomAction('zoomOut')
           break
-        }
         case 'zoomReset':
-          if (fontSize !== DEFAULT_APP_SETTINGS.terminalFontSize) {
-            updateAppSetting('terminalFontSize', DEFAULT_APP_SETTINGS.terminalFontSize)
-          }
+          applyZoomAction('zoomReset')
           break
         case 'sidebarToggle':
           void updatePanelVisibility('sidebarVisible', !isSidebarVisible).catch((error) => {
@@ -1184,14 +1184,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
           break
       }
     })
-  }, [
-    cycleTab,
-    fontSize,
-    handleOpenThemePicker,
-    updateAppSetting,
-    updatePanelVisibility,
-    isSidebarVisible
-  ])
+  }, [cycleTab, applyZoomAction, handleOpenThemePicker, updatePanelVisibility, isSidebarVisible])
 
   const closeTerminalByRecordId = useCallback(
     async (terminalRecordId: string): Promise<boolean> => {
