@@ -339,6 +339,20 @@ function ConnectedTerminalComponent({
 
   const { copySelection, pasteFromClipboard, hasSelection } = useTerminalClipboard({
     terminal: terminalInstance,
+    pasteText: async (text: string) => {
+      const ptyId = ptyIdRef.current
+      if (!ptyId) return
+      try {
+        const result = await terminalApi.write(ptyId, text)
+        if (!result.success && onErrorRef.current) {
+          onErrorRef.current(result.error)
+        }
+      } catch (err) {
+        if (onErrorRef.current) {
+          onErrorRef.current(err instanceof Error ? err.message : 'Paste write failed')
+        }
+      }
+    },
     onImagePaste: async () => {
       const ptyId = ptyIdRef.current
       if (!ptyId) return
