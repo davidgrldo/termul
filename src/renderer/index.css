@@ -2,9 +2,9 @@
 @import "@fontsource-variable/inter/index.css";
 @import "@fontsource-variable/jetbrains-mono/index.css";
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "shadcn/tailwind.css";
+@config "../../tailwind.config.ts";
 
 @layer base {
   :root {
@@ -143,7 +143,7 @@
     button:not(:disabled):not([data-press-feedback="off"]):active,
     [role="button"]:not([aria-disabled="true"]):not([data-press-feedback="off"]):active,
     summary:not([data-press-feedback="off"]):active {
-      transform: scale(0.97);
+      transform: scale(0.96);
     }
   }
 
@@ -404,6 +404,7 @@
 @layer components {
   .chat-prose {
     word-break: break-word;
+    text-wrap: pretty;
   }
   .chat-prose > :first-child {
     margin-top: 0;
@@ -419,6 +420,7 @@
     line-height: 1.3;
     margin: 0.75em 0 0.4em;
     color: hsl(var(--foreground));
+    text-wrap: balance;
   }
   .chat-prose h1 {
     font-size: 1.25em;
@@ -469,9 +471,23 @@
   .chat-prose code {
     font-family: "Cascadia Code", "JetBrains Mono", ui-monospace, monospace;
     font-size: 0.85em;
-    background: hsl(var(--muted) / 0.6);
-    padding: 0.12em 0.4em;
-    border-radius: 4px;
+    font-weight: 500;
+    padding: 0.1em 0.45em;
+    border-radius: 6px;
+    border: 1px solid hsl(var(--border) / 0.4);
+  }
+  .chat-prose code.chat-code-token {
+    background: hsl(var(--muted) / 0.55);
+    color: hsl(var(--foreground));
+  }
+  .chat-prose code.chat-code-path {
+    background: hsl(142 71% 45% / 0.12);
+    color: hsl(142 45% 32%);
+    border-color: hsl(142 40% 40% / 0.25);
+  }
+  .dark .chat-prose code.chat-code-path {
+    color: hsl(142 55% 62%);
+    border-color: hsl(142 40% 50% / 0.3);
   }
   .chat-prose pre {
     background: hsl(var(--muted) / 0.5);
@@ -487,6 +503,43 @@
     background: none;
     padding: 0;
     font-size: inherit;
+  }
+  /* Icon copy button injected onto code blocks by ChatMessage. */
+  .chat-code-copy {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.5rem;
+    min-height: 2.5rem;
+    padding: 0;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--background) / 0.85);
+    border: 1px solid hsl(var(--border));
+    border-radius: 4px;
+    opacity: 0;
+    transition:
+      opacity 150ms var(--ease-out),
+      color 150ms var(--ease-out);
+    cursor: pointer;
+  }
+  .chat-code-copy svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+  .chat-prose pre:hover .chat-code-copy,
+  .chat-code-copy:focus-visible {
+    opacity: 1;
+  }
+  .chat-code-copy:hover {
+    color: hsl(var(--foreground));
+  }
+  .chat-code-copy.is-copied {
+    opacity: 1;
+    color: hsl(142 71% 45%);
   }
   .chat-prose table {
     width: 100%;

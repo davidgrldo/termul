@@ -41,6 +41,7 @@ function session(): AcpSession {
     id: 'session-1',
     agentId: 'agent-1',
     cwd: '/work',
+    projectId: 'p1',
     status: 'active',
     title: null,
     activeTurn: false,
@@ -85,6 +86,7 @@ describe('ChatInputBar config controls', () => {
         busy={false}
         disabled={false}
         onSend={vi.fn()}
+        onSendBlocks={vi.fn()}
         onCancel={vi.fn()}
         commands={[]}
         configOptions={configOptions}
@@ -128,6 +130,7 @@ describe('ChatInputBar config controls', () => {
         busy={false}
         disabled={false}
         onSend={vi.fn()}
+        onSendBlocks={vi.fn()}
         onCancel={vi.fn()}
         commands={[]}
         configOptions={configOptions}
@@ -170,6 +173,7 @@ describe('ChatInputBar config controls', () => {
         busy={false}
         disabled={false}
         onSend={vi.fn()}
+        onSendBlocks={vi.fn()}
         onCancel={vi.fn()}
         commands={[]}
         configOptions={[]}

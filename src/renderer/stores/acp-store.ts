@@ -68,6 +68,8 @@ import {
   saveMcpServers as saveMcpServersToDisk
 } from '@/lib/acp-mcp-persistence'
 import { decideResume } from '@/lib/acp-resume-policy'
+import { formatAcpSpawnError } from '@/lib/agents/acp-spawn-errors'
+import { deleteSessionTempFiles } from '@/lib/attachment-temp-cleanup'
 
 export type AgentStatus = 'idle' | 'spawning' | 'connected' | 'error'
 export type SessionStatus = 'initializing' | 'active' | 'error' | 'closed'
@@ -79,12 +81,24 @@ export interface ChatMessage {
   blocks: ContentBlock[]
   streaming: boolean
   timestamp: number
+  /**
+   * Monotonic arrival sequence stamped at append time. Orders messages and
+   * tool calls on one chronological timeline, robust against same-millisecond
+   * ties that `timestamp` alone can't break. Absent on history persisted
+   * before seq existed (those order by `timestamp`).
+   */
+  seq?: number
 }
 
 export interface AcpSession {
   id: SessionId
   agentId: AgentId
   cwd: string
+  /**
+   * Owning `Project.id`. Persisted onto every history entry so the index can
+   * be filtered per-project + per-worktree (`(projectId, cwd)`). See ADR 0002.
+   */
+  projectId: string
   status: SessionStatus
   title: string | null
   /** True while a prompt turn is in flight (UI spinners, cancel). */
@@ -154,7 +168,12 @@ interface AcpState {
   // Actions — lifecycle
   spawnAgent: (config: Parameters<typeof acpApi.spawnAgent>[0]) => Promise<AgentId>
   killAgent: (agentId: AgentId) => Promise<void>
-  createSession: (agentId: AgentId, cwd: string, mcpServers?: McpServer[]) => Promise<SessionId>
+  createSession: (
+    agentId: AgentId,
+    cwd: string,
+    mcpServers: McpServer[] | undefined,
+    projectId: string
+  ) => Promise<SessionId>
   closeSession: (sessionId: SessionId) => Promise<void>
   setActiveSession: (sessionId: SessionId | null) => void
 
@@ -175,11 +194,21 @@ interface AcpState {
    * "Start Chat" can reuse a prepared session. Fire-and-forget from the UI;
    * dedupes in-flight work for the same key.
    */
-  prepareChat: (configId: string, cwd: string, mcpServers?: McpServer[]) => void
+  prepareChat: (
+    configId: string,
+    cwd: string,
+    mcpServers: McpServer[] | undefined,
+    projectId: string
+  ) => void
   /** Drop any prepared session for this key (e.g. dialog closed or inputs changed). */
   cancelPreparedChat: (key: string) => void
   /** Spawn (or reuse a connected) agent for a config, create a session, return its id. */
-  startChat: (configId: string, cwd: string, mcpServers?: McpServer[]) => Promise<SessionId>
+  startChat: (
+    configId: string,
+    cwd: string,
+    mcpServers: McpServer[] | undefined,
+    projectId: string
+  ) => Promise<SessionId>
 
   // Actions — chat history (P5)
   loadSessionIndex: () => Promise<void>
@@ -193,6 +222,8 @@ interface AcpState {
 
   // Actions — conversation
   sendPrompt: (sessionId: SessionId, text: string) => Promise<void>
+  /** Send a prompt turn carrying structured content blocks (text + image/resource). */
+  sendPromptBlocks: (sessionId: SessionId, blocks: ContentBlock[]) => Promise<void>
   cancelPrompt: (sessionId: SessionId) => Promise<void>
 
   // Actions — config (P2 drives the UI; method available now)
@@ -224,6 +255,29 @@ function newId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
 }
 
+/**
+ * Monotonic arrival sequence for timeline ordering. Stamped on every message
+ * and tool call as it lands so the UI can interleave the two on one
+ * chronological timeline without relying on `Date.now()` (which ties within a
+ * millisecond when text and tool events arrive back-to-back).
+ */
+let seqCounter = 0
+function nextSeq(): number {
+  seqCounter += 1
+  return seqCounter
+}
+
+/**
+ * Rebase the process-wide seq counter so live events appended after a persisted
+ * session is reopened sort after the restored history. Without this, the
+ * counter (which starts at 0 on every app load) could let `nextSeq()` return a
+ * value smaller than an existing restored `seq`, and `buildTimeline` would
+ * interleave fresh chunks/tool calls ahead of older history.
+ */
+function rebaseSeqCounter(maxSeq: number): void {
+  if (maxSeq > seqCounter) seqCounter = maxSeq
+}
+
 /** Index of the last user message in a thread, or -1 if none. */
 function lastUserIndex(messages: ChatMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -245,6 +299,16 @@ function hasActiveAssistantTail(messages: ChatMessage[], role: MessageRole): boo
   const userIdx = lastUserIndex(messages)
   if (userIdx === -1) return false
   return messages.length - 1 > userIdx
+}
+
+/**
+ * True when a tool call landed after `message` (by seq). Marks the point where
+ * a new text run must start its own bubble instead of merging back into the
+ * pre-tool message.
+ */
+function toolIntervened(toolCalls: ToolCall[], message: ChatMessage): boolean {
+  if (message.seq == null) return false
+  return toolCalls.some((t) => typeof t.seq === 'number' && t.seq > message.seq!)
 }
 
 /** Whether a chunk may open a new message (not coalesced into the previous one). */
@@ -288,17 +352,22 @@ function noteForStopReason(reason: StopReason): string | null {
   }
 }
 
-/** Finalize the trailing streaming message for a session (mark non-streaming). */
+/**
+ * Finalize every streaming message for a session (mark non-streaming). A turn
+ * can leave several messages mid-stream (e.g. a thought followed by the agent
+ * reply); clearing only the trailing one strands earlier markers in their
+ * `streaming` state and leaves their shimmer animating forever.
+ */
 function finalizeStreaming(
   messages: Record<SessionId, ChatMessage[]>,
   sessionId: SessionId
 ): Record<SessionId, ChatMessage[]> {
   const list = messages[sessionId] ?? []
-  const last = list[list.length - 1]
-  if (last && last.streaming) {
-    return { ...messages, [sessionId]: [...list.slice(0, -1), { ...last, streaming: false }] }
+  if (!list.some((m) => m.streaming)) return messages
+  return {
+    ...messages,
+    [sessionId]: list.map((m) => (m.streaming ? { ...m, streaming: false } : m))
   }
-  return messages
 }
 
 /** Mark a reopened history session live after a successful load/resume IPC call. */
@@ -406,6 +475,7 @@ function persistSession(
     agentConfigId,
     title: session.title ?? deriveTitle(messages, session.agentId),
     cwd: session.cwd,
+    projectId: session.projectId,
     createdAt: session.createdAt,
     lastActivityAt: Date.now(),
     messageCount: messages.length,
@@ -474,6 +544,85 @@ export function prepareChatKey(
 /** In-flight `session/new` for a prepare key. */
 const inFlightPrepared = new Map<string, Promise<SessionId | null>>()
 
+type EnsureLiveAgentOptions = {
+  /** Mirror membership in `warmingConfigs` for the prewarm UI. */
+  registerWarmUi?: boolean
+  /** When true, spawn failures resolve to `null` instead of rejecting (prewarm). */
+  silentSpawnFailure?: boolean
+}
+
+/**
+ * Return a connected agent process for `configId + cwd`, spawning at most one
+ * in-flight process per reuse key. Registers `inFlightWarms` synchronously so
+ * concurrent `prewarmAgent`, `prepareChat`, and `startChat` cannot race a
+ * second spawn.
+ */
+function ensureLiveAgent(
+  get: () => AcpState,
+  set: (fn: (s: AcpState) => Partial<AcpState> | AcpState) => void,
+  configId: string,
+  cwd: string,
+  options: EnsureLiveAgentOptions = {}
+): Promise<AgentId | null> {
+  const trimmedCwd = cwd.trim()
+  if (trimmedCwd.length === 0) return Promise.resolve(null)
+  const config = get().agentConfigs.find((c) => c.id === configId)
+  if (!config) return Promise.resolve(null)
+
+  const reuseKey = agentReuseKey(configId, trimmedCwd)
+  const existing = get().configToLiveAgent[reuseKey]
+  if (existing && isReusableStatus(get().agentStatus[existing])) {
+    return Promise.resolve(existing)
+  }
+
+  const inFlight = inFlightWarms.get(reuseKey)
+  if (inFlight) return inFlight
+
+  if (options.registerWarmUi) {
+    set((s) => ({ warmingConfigs: { ...s.warmingConfigs, [reuseKey]: true } }))
+  }
+
+  const spawnPromise = (async (): Promise<AgentId | null> => {
+    try {
+      const agentId = await get().spawnAgent({
+        name: config.name,
+        command: config.command,
+        args: config.args,
+        env: config.env,
+        allowTerminal: config.allowTerminal
+      })
+      if (get().agentConfigs.some((c) => c.id === configId)) {
+        set((s) => ({ configToLiveAgent: { ...s.configToLiveAgent, [reuseKey]: agentId } }))
+        return agentId
+      }
+      try {
+        await get().killAgent(agentId)
+      } catch {
+        /* best-effort cleanup */
+      }
+      return null
+    } catch (err) {
+      if (options.silentSpawnFailure) {
+        console.warn('[acp] ensureLiveAgent failed for', reuseKey, err)
+        return null
+      }
+      throw err
+    } finally {
+      inFlightWarms.delete(reuseKey)
+      if (options.registerWarmUi) {
+        set((s) => {
+          const warming = { ...s.warmingConfigs }
+          delete warming[reuseKey]
+          return { warmingConfigs: warming }
+        })
+      }
+    }
+  })()
+
+  inFlightWarms.set(reuseKey, spawnPromise)
+  return spawnPromise
+}
+
 function cancelPreparedChatEntry(
   key: string,
   set: (fn: (s: AcpState) => Partial<AcpState> | AcpState) => void
@@ -495,6 +644,66 @@ function cancelPreparedChatEntry(
     delete prepareChatErrors[key]
     return { preparedSessions, preparingChatKeys, prepareChatErrors }
   })
+}
+
+/**
+ * Shared orchestration for a user-initiated prompt turn: stage the optimistic
+ * user message, mark the turn active, persist, then dispatch to the agent and
+ * schedule turn-end. On failure, finalize any streaming markers and record the
+ * error. `sendPrompt` and `sendPromptBlocks` differ only in the blocks they
+ * stage and which IPC they invoke — captured by `userBlocks` and `dispatch`.
+ */
+async function runPromptTurn(
+  set: TurnEndSetter,
+  get: () => AcpState,
+  sessionId: SessionId,
+  userBlocks: ContentBlock[],
+  dispatch: (session: AcpSession) => Promise<StopReason>
+): Promise<void> {
+  const session = get().sessions[sessionId]
+  if (!session) throw new Error(`unknown session ${sessionId}`)
+  if (session.status === 'closed') throw new Error('session is closed')
+  if (session.openTurnId) throw new Error('a prompt turn is already in progress')
+  if (userBlocks.length === 0) throw new Error('prompt content must not be empty')
+  const openTurnId = newId('turn')
+  // optimistic user message + mark turn active
+  const userMessage: ChatMessage = {
+    id: newId('msg'),
+    role: 'user',
+    blocks: userBlocks,
+    streaming: false,
+    timestamp: Date.now(),
+    seq: nextSeq()
+  }
+  set((s) => ({
+    messages: { ...s.messages, [sessionId]: [...(s.messages[sessionId] ?? []), userMessage] },
+    sessions: {
+      ...s.sessions,
+      [sessionId]: { ...s.sessions[sessionId], activeTurn: true, openTurnId, lastError: null }
+    }
+  }))
+  persistSession(get(), sessionId, (entries) => set({ sessionIndex: entries }))
+  try {
+    // Command reply vs streamed chunks have no ordering guarantee; defer turn
+    // end to a macrotask so chunk listeners run first. Idempotent with
+    // `_onPromptComplete` (which also calls `scheduleTurnEnd`).
+    const stopReason = await dispatch(session)
+    scheduleTurnEnd(set, sessionId, stopReason)
+  } catch (err) {
+    set((s) => ({
+      messages: finalizeStreaming(s.messages, sessionId),
+      sessions: {
+        ...s.sessions,
+        [sessionId]: {
+          ...s.sessions[sessionId],
+          activeTurn: false,
+          openTurnId: null,
+          lastError: String(err)
+        }
+      }
+    }))
+    throw err
+  }
 }
 
 export const useAcpStore = create<AcpState>((set, get) => ({
@@ -570,7 +779,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })
   },
 
-  createSession: async (agentId, cwd, mcpServers) => {
+  createSession: async (agentId, cwd, mcpServers, projectId) => {
     const outcome = await acpApi.newSession(agentId, cwd, mcpServers)
     const sessionId = outcome.sessionId
     set((s) => {
@@ -584,6 +793,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             id: sessionId,
             agentId,
             cwd,
+            projectId,
             status: existing?.status === 'closed' ? 'closed' : 'active',
             title: existing?.title ?? null,
             activeTurn: existing?.activeTurn ?? false,
@@ -614,6 +824,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         // close may fail if the agent lacks the capability; mark closed locally regardless
       }
     }
+    // Reclaim app-owned temp files (pasted screenshots) staged for this session
+    // now that no further turns can read them.
+    void deleteSessionTempFiles(sessionId)
     set((s) => {
       const sessions = { ...s.sessions }
       if (sessions[sessionId]) {
@@ -714,59 +927,10 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   prewarmAgent: async (configId, cwd) => {
-    const config = get().agentConfigs.find((c) => c.id === configId)
-    if (!config) return
-    const trimmedCwd = cwd.trim()
-    if (trimmedCwd.length === 0) return
-    const reuseKey = agentReuseKey(configId, trimmedCwd)
-    // Dedupe: a warm already in flight, or a live reusable agent (connected or
-    // awaiting auth) for this config+cwd, is a no-op. Re-spawning would orphan
-    // the original and overwrite the reuse entry — matching prepareChat/startChat.
-    const inFlight = inFlightWarms.get(reuseKey)
-    if (inFlight) {
-      await inFlight
-      return
-    }
-    const existing = get().configToLiveAgent[reuseKey]
-    if (existing && isReusableStatus(get().agentStatus[existing])) return
-
-    set((s) => ({ warmingConfigs: { ...s.warmingConfigs, [reuseKey]: true } }))
-    const spawnPromise = (async (): Promise<AgentId | null> => {
-      try {
-        const agentId = await get().spawnAgent({
-          name: config.name,
-          command: config.command,
-          args: config.args,
-          env: config.env,
-          allowTerminal: config.allowTerminal
-        })
-        // Only register the warm agent if the config still exists (it may have
-        // been disabled mid-spawn); otherwise kill the orphan immediately.
-        if (get().agentConfigs.some((c) => c.id === configId)) {
-          set((s) => ({ configToLiveAgent: { ...s.configToLiveAgent, [reuseKey]: agentId } }))
-          return agentId
-        }
-        try {
-          await get().killAgent(agentId)
-        } catch {
-          /* best-effort cleanup */
-        }
-        return null
-      } catch (err) {
-        // Silent: chat will lazy-spawn on demand if warm-up failed.
-        console.warn('[acp] prewarm failed for', reuseKey, err)
-        return null
-      } finally {
-        inFlightWarms.delete(reuseKey)
-        set((s) => {
-          const warming = { ...s.warmingConfigs }
-          delete warming[reuseKey]
-          return { warmingConfigs: warming }
-        })
-      }
-    })()
-    inFlightWarms.set(reuseKey, spawnPromise)
-    await spawnPromise
+    await ensureLiveAgent(get, set, configId, cwd, {
+      registerWarmUi: true,
+      silentSpawnFailure: true
+    })
   },
 
   cancelPreparedChat: (key) => {
@@ -788,7 +952,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       })
   },
 
-  prepareChat: (configId, cwd, mcpServers) => {
+  prepareChat: (configId, cwd, mcpServers, projectId) => {
     const trimmedCwd = cwd.trim()
     if (!configId || trimmedCwd.length === 0) return
     const key = prepareChatKey(configId, trimmedCwd, mcpServers)
@@ -804,35 +968,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
 
     const task = (async (): Promise<SessionId | null> => {
       try {
-        const config = get().agentConfigs.find((c) => c.id === configId)
-        if (!config) return null
-        const reuseKey = agentReuseKey(configId, trimmedCwd)
-        const warming = inFlightWarms.get(reuseKey)
-        if (warming) await warming
-        const existing = get().configToLiveAgent[reuseKey]
-        const reuse = existing && isReusableStatus(get().agentStatus[existing]) ? existing : null
-        let agentId: AgentId
-        if (reuse) {
-          agentId = reuse
-        } else {
-          agentId = await get().spawnAgent({
-            name: config.name,
-            command: config.command,
-            args: config.args,
-            env: config.env,
-            allowTerminal: config.allowTerminal
-          })
-          if (!get().agentConfigs.some((c) => c.id === configId)) {
-            try {
-              await get().killAgent(agentId)
-            } catch {
-              /* best-effort */
-            }
-            return null
-          }
-          set((s) => ({ configToLiveAgent: { ...s.configToLiveAgent, [reuseKey]: agentId } }))
-        }
-        const sessionId = await get().createSession(agentId, trimmedCwd, mcpServers)
+        const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
+        if (!agentId) return null
+        const sessionId = await get().createSession(agentId, trimmedCwd, mcpServers, projectId)
         if (prepareChatKey(configId, trimmedCwd, mcpServers) !== key) {
           return null
         }
@@ -846,10 +984,12 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       } catch (err) {
         console.warn('[acp] prepareChat failed', configId, err)
         if (inFlightPrepared.has(key)) {
-          const message = err instanceof Error ? err.message : String(err)
+          const config = get().agentConfigs.find((c) => c.id === configId)
+          const message = formatAcpSpawnError(err, config)
           set((s) => ({
             prepareChatErrors: { ...s.prepareChatErrors, [key]: message }
           }))
+          toast.error(message)
         }
         return null
       } finally {
@@ -914,7 +1054,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
   },
 
-  startChat: async (configId, cwd, mcpServers) => {
+  startChat: async (configId, cwd, mcpServers, projectId) => {
     const trimmedCwd = cwd.trim()
     const config = get().agentConfigs.find((c) => c.id === configId)
     if (!config) throw new Error(`unknown agent config ${configId}`)
@@ -932,29 +1072,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         return sessionId
       }
     }
-    // If a background pre-warm is still spawning this config+cwd, wait for it
-    // instead of racing a second spawn (which would orphan one of the processes).
-    const reuseKey = agentReuseKey(configId, trimmedCwd)
-    const warming = inFlightWarms.get(reuseKey)
-    if (warming) await warming
-    // Reuse a live connected agent for this config+cwd; else spawn.
-    // Keyed per-cwd so the same agent in another project gets its own process.
-    const existing = get().configToLiveAgent[reuseKey]
-    const reuse = existing && isReusableStatus(get().agentStatus[existing]) ? existing : null
-    let agentId: AgentId
-    if (reuse) {
-      agentId = reuse
-    } else {
-      agentId = await get().spawnAgent({
-        name: config.name,
-        command: config.command,
-        args: config.args,
-        env: config.env,
-        allowTerminal: config.allowTerminal
-      })
-      set((s) => ({ configToLiveAgent: { ...s.configToLiveAgent, [reuseKey]: agentId } }))
-    }
-    return get().createSession(agentId, trimmedCwd, mcpServers)
+    const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
+    if (!agentId) throw new Error(`failed to spawn agent for config ${configId}`)
+    return get().createSession(agentId, trimmedCwd, mcpServers, projectId)
   },
 
   loadSessionIndex: async () => {
@@ -977,6 +1097,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const capabilities = get().agents[meta.agentId]?.capabilities ?? null
     const strategy = decideResume({ connected, capabilities })
 
+    // Rebase the process-wide seq counter so live events appended after the
+    // restored transcript sort after it (nextSeq() returns > max restored seq).
+    let maxRestoredSeq = 0
+    for (const m of payload.messages) {
+      if (typeof m.seq === 'number' && m.seq > maxRestoredSeq) maxRestoredSeq = m.seq
+    }
+    rebaseSeqCounter(maxRestoredSeq)
+
     // Show the persisted transcript locally and register the session record so the
     // pane has content regardless of strategy.
     set((s) => ({
@@ -986,6 +1114,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           id,
           agentId: meta.agentId,
           cwd: meta.cwd,
+          projectId: meta.projectId,
           status: 'closed',
           title: meta.title,
           activeTurn: false,
@@ -1037,6 +1166,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       }
       return { sessionIndex: next, sessions }
     })
+    // Reclaim any app-owned temp files staged for this session.
+    void deleteSessionTempFiles(id)
     try {
       await saveSessionIndexToDisk(next)
       await deleteSessionPayload(id)
@@ -1075,59 +1206,19 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
   },
 
-  sendPrompt: async (sessionId, text) => {
-    const session = get().sessions[sessionId]
-    if (!session) throw new Error(`unknown session ${sessionId}`)
-    if (session.status === 'closed') throw new Error('session is closed')
-    if (session.openTurnId) throw new Error('a prompt turn is already in progress')
-    const openTurnId = newId('turn')
-    // optimistic user message + mark turn active
-    const userMessage: ChatMessage = {
-      id: newId('msg'),
-      role: 'user',
-      blocks: [{ type: 'text', text }],
-      streaming: false,
-      timestamp: Date.now()
-    }
-    set((s) => ({
-      messages: { ...s.messages, [sessionId]: [...(s.messages[sessionId] ?? []), userMessage] },
-      sessions: {
-        ...s.sessions,
-        [sessionId]: {
-          ...s.sessions[sessionId],
-          activeTurn: true,
-          openTurnId,
-          lastError: null
-        }
-      }
-    }))
-    persistSession(get(), sessionId, (entries) => set({ sessionIndex: entries }))
-    try {
-      const stopReason = await acpApi.sendPrompt(session.agentId, sessionId, text)
-      // Command reply vs streamed chunks have no ordering guarantee; defer turn
-      // end to a macrotask so chunk listeners run first. Idempotent with
-      // `_onPromptComplete` (which also calls `scheduleTurnEnd`).
-      scheduleTurnEnd(set, sessionId, stopReason)
-    } catch (err) {
-      set((s) => ({
-        messages: finalizeStreaming(s.messages, sessionId),
-        sessions: {
-          ...s.sessions,
-          [sessionId]: {
-            ...s.sessions[sessionId],
-            activeTurn: false,
-            openTurnId: null,
-            lastError: String(err)
-          }
-        }
-      }))
-      throw err
-    }
-  },
+  sendPrompt: (sessionId, text) =>
+    runPromptTurn(set, get, sessionId, [{ type: 'text', text }], (session) =>
+      acpApi.sendPrompt(session.agentId, sessionId, text)
+    ),
+
+  sendPromptBlocks: (sessionId, blocks) =>
+    runPromptTurn(set, get, sessionId, blocks, (session) =>
+      acpApi.sendPromptBlocks(session.agentId, sessionId, blocks)
+    ),
 
   cancelPrompt: async (sessionId) => {
     const session = get().sessions[sessionId]
-    if (!session || !session.activeTurn) return
+    if (!session?.activeTurn) return
     await acpApi.cancelPrompt(session.agentId, sessionId)
     // turn cleared by _onPromptComplete (cancelled) or by sendPrompt's resolution
   },
@@ -1232,6 +1323,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             id: e.sessionId,
             agentId: e.agentId,
             cwd: '',
+            projectId: '',
             status: 'active',
             title: null,
             activeTurn: false,
@@ -1256,8 +1348,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       const last = list[list.length - 1]
       const role = e.role as MessageRole
       // Attach to the trailing assistant/user message for this turn (including
-      // chunks that arrive after streaming was finalized but IPC lagged).
-      if (last && last.role === role && (last.streaming || hasActiveAssistantTail(list, role))) {
+      // chunks that arrive after streaming was finalized but IPC lagged) —
+      // UNLESS a tool call landed after that message. Coalescing across a tool
+      // boundary would fold a post-tool text run back into the pre-tool bubble,
+      // collapsing the real `text → tool → text` order into one position.
+      const tools = s.toolCalls[e.sessionId] ?? []
+      if (
+        last &&
+        last.role === role &&
+        (last.streaming || hasActiveAssistantTail(list, role)) &&
+        !toolIntervened(tools, last)
+      ) {
         const updated: ChatMessage = {
           ...last,
           blocks: appendBlocks(last.blocks, e.content),
@@ -1273,19 +1374,21 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         role,
         blocks: [e.content],
         streaming: true,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        seq: nextSeq()
       }
       return { messages: { ...s.messages, [e.sessionId]: [...list, message] } }
     }),
 
   _onToolCall: (e) =>
     set((s) => {
-      // Stamp arrival time (unless already present) so the UI can interleave
-      // tool calls with messages on a single chronological timeline.
-      const stamped =
-        typeof e.toolCall.timestamp === 'number'
-          ? e.toolCall
-          : { ...e.toolCall, timestamp: Date.now() }
+      // Stamp arrival time + monotonic seq (unless already present) so the UI
+      // can interleave tool calls with messages on one chronological timeline.
+      const stamped: ToolCall = {
+        ...e.toolCall,
+        timestamp: typeof e.toolCall.timestamp === 'number' ? e.toolCall.timestamp : Date.now(),
+        seq: typeof e.toolCall.seq === 'number' ? e.toolCall.seq : nextSeq()
+      }
       return {
         toolCalls: {
           ...s.toolCalls,
@@ -1437,6 +1540,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   _onSessionClosed: (e) => {
+    // Reclaim app-owned temp files staged for this session (e.g. agent
+    // disconnected) so they do not linger in the OS temp dir.
+    void deleteSessionTempFiles(e.sessionId)
     set((s) => {
       const session = s.sessions[e.sessionId]
       const pendingPermissions = dropPermissionsForSession(s.pendingPermissions, e.sessionId)
@@ -1560,6 +1666,23 @@ export function selectAgentIdentity(state: AcpState, agentId: AgentId | null): A
 
 export const useAgentIdentity = (agentId: AgentId | null): AgentIdentity =>
   useAcpStore(useShallow((s) => selectAgentIdentity(s, agentId)))
+
+/** Project IDs with at least one open agent-chat session in an active turn. */
+export function collectProjectsWithActiveAgentChat(
+  sessions: Record<SessionId, AcpSession>
+): string[] {
+  const ids = new Set<string>()
+  for (const session of Object.values(sessions)) {
+    if (session.status !== 'closed' && session.activeTurn && session.projectId) {
+      ids.add(session.projectId)
+    }
+  }
+  return Array.from(ids).sort()
+}
+
+export function useProjectsWithActiveAgentChat(): string[] {
+  return useAcpStore(useShallow((state) => collectProjectsWithActiveAgentChat(state.sessions)))
+}
 
 /** Aggregate warm state for a config across all of its per-project processes. */
 export interface ConfigWarmState {

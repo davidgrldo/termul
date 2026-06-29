@@ -1,23 +1,11 @@
-import { Brain, ChevronDown, Circle } from 'lucide-react'
+import { Brain } from 'lucide-react'
 import { useState } from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { SessionConfigOption } from '@/lib/acp-api'
 import { cn } from '@/lib/utils'
-import type { AcpSession, AgentStatus } from '@/stores/acp-store'
-import { AgentBadge } from './AgentBadge'
+import type { AcpSession } from '@/stores/acp-store'
+import { ComposerPill } from './ComposerPill'
 import { KNOWN_CATEGORY_HEADINGS } from './slash-menu-model'
-
-interface AgentHeaderProps {
-  session: AcpSession
-  agentStatus: AgentStatus | undefined
-}
-
-const STATUS_COLOR: Record<string, string> = {
-  connected: 'text-green-500',
-  spawning: 'text-amber-500',
-  idle: 'text-muted-foreground',
-  error: 'text-red-500'
-}
 
 /**
  * Resolve the display label for a config chip. Promoted chips (e.g.
@@ -65,15 +53,10 @@ export function ConfigChip({
   return (
     <Popover>
       <PopoverTrigger asChild disabled={disabled}>
-        <button
-          type="button"
-          disabled={disabled}
-          className="flex h-[30px] items-center gap-1 rounded-lg bg-foreground/[0.06] px-2.5 text-xs text-foreground/80 hover:bg-foreground/[0.09] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {promoted && <Brain size={13} className="text-muted-foreground" />}
+        <ComposerPill disabled={disabled} chevron>
+          {promoted && <Brain size={13} className="shrink-0 text-muted-foreground" />}
           {current?.name ?? fallbackLabel}
-          <ChevronDown size={11} className="text-muted-foreground" />
-        </button>
+        </ComposerPill>
       </PopoverTrigger>
       <PopoverContent align="start" side="top" className="w-56 p-1">
         <div className="label-group px-2 py-1 text-muted-foreground/70">
@@ -139,14 +122,9 @@ export function ModeChip({
   return (
     <Popover>
       <PopoverTrigger asChild disabled={disabled}>
-        <button
-          type="button"
-          disabled={disabled}
-          className="flex h-[30px] items-center gap-1 rounded-lg bg-foreground/[0.06] px-2.5 text-xs text-foreground/80 hover:bg-foreground/[0.09] disabled:cursor-not-allowed disabled:opacity-50"
-        >
+        <ComposerPill disabled={disabled} chevron>
           {current?.name ?? label}
-          <ChevronDown size={11} className="text-muted-foreground" />
-        </button>
+        </ComposerPill>
       </PopoverTrigger>
       <PopoverContent align="start" side="top" className="w-56 p-1">
         <div className="label-group px-2 py-1 text-muted-foreground/70">{label}</div>
@@ -168,41 +146,5 @@ export function ModeChip({
         ))}
       </PopoverContent>
     </Popover>
-  )
-}
-
-/**
- * Agent chat header: agent identity, connection status, and interactive
- * mode/model selectors. Config options supersede the legacy modes API
- * (ADR-003.4): when configOptions exist, the legacy mode chip is not shown.
- */
-export function AgentHeader({ session, agentStatus }: AgentHeaderProps): React.JSX.Element {
-  const isClosed = session.status === 'closed'
-  const effectiveStatus: AgentStatus | undefined = isClosed ? 'error' : agentStatus
-
-  let statusLabel: string
-  if (isClosed) {
-    statusLabel = session.lastError ?? 'closed'
-  } else {
-    statusLabel = effectiveStatus ?? 'idle'
-  }
-
-  return (
-    <div className="flex items-center gap-2 bg-transparent px-3 py-1.5">
-      <AgentBadge
-        agentId={session.agentId}
-        fallbackName={session.title ?? undefined}
-        iconSize={14}
-        className="truncate text-xs font-medium text-foreground"
-      />
-      <Circle
-        size={8}
-        className={cn(
-          'fill-current',
-          STATUS_COLOR[effectiveStatus ?? 'idle'] ?? 'text-muted-foreground'
-        )}
-      />
-      <span className="text-2xs text-muted-foreground">{statusLabel}</span>
-    </div>
   )
 }

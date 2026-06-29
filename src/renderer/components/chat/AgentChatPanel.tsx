@@ -1,14 +1,22 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useShallow } from 'zustand/shallow'
-import type { AvailableCommand, PlanEntry, SessionId, ToolCall } from '@/lib/acp-api'
+import type { AvailableCommand, ContentBlock, PlanEntry, SessionId, ToolCall } from '@/lib/acp-api'
 import { useAcpMessages, useAcpSession, useAcpStore } from '@/stores/acp-store'
-import { AgentHeader } from './AgentHeader'
+import { ChatErrorNotice } from './ChatErrorNotice'
 import { ChatInputBar } from './ChatInputBar'
 import { ChatMessageList } from './ChatMessageList'
-import { buildTimeline } from './chat-timeline'
+import { buildTimeline, consolidateThoughtGroups } from './chat-timeline'
 import { PermissionDialog } from './PermissionDialog'
 import { PlanPanel } from './PlanPanel'
+
+/** Concatenate the text blocks of a message into a single string. */
+function messageText(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text ?? '')
+    .join('')
+}
 
 const EMPTY_COMMANDS: AvailableCommand[] = []
 const EMPTY_TOOL_CALLS: ToolCall[] = []
@@ -25,7 +33,14 @@ interface AgentChatPanelProps {
 export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.Element {
   const session = useAcpSession(sessionId)
   const messages = useAcpMessages(sessionId)
-  const agentStatus = useAcpStore((s) => (session ? s.agentStatus[session.agentId] : undefined))
+  const imageCapable = useAcpStore((s) =>
+    session ? Boolean(s.agents[session.agentId]?.capabilities?.promptCapabilities?.image) : false
+  )
+  const embedCapable = useAcpStore((s) =>
+    session
+      ? Boolean(s.agents[session.agentId]?.capabilities?.promptCapabilities?.embeddedContext)
+      : false
+  )
   const commands = useAcpStore((s) => s.commands[sessionId] ?? EMPTY_COMMANDS)
   const toolCalls = useAcpStore((s) => s.toolCalls[sessionId] ?? EMPTY_TOOL_CALLS)
   const plan = useAcpStore((s) => s.plans[sessionId] ?? EMPTY_PLAN)
@@ -36,10 +51,16 @@ export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.El
     )
   )
   const sendPrompt = useAcpStore((s) => s.sendPrompt)
+  const sendPromptBlocks = useAcpStore((s) => s.sendPromptBlocks)
   const cancelPrompt = useAcpStore((s) => s.cancelPrompt)
   const setConfigOption = useAcpStore((s) => s.setConfigOption)
   const setMode = useAcpStore((s) => s.setMode)
   const setModel = useAcpStore((s) => s.setModel)
+
+  // Composer seed (edit a message / pick a starter prompt) + dismissed-error tracking.
+  const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null)
+  const [dismissedError, setDismissedError] = useState<string | null>(null)
+  const seedComposer = useCallback((text: string) => setSeed({ text, nonce: Date.now() }), [])
 
   const handleSend = useCallback(
     (text: string) => {
@@ -48,6 +69,15 @@ export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.El
       })
     },
     [sendPrompt, sessionId]
+  )
+
+  const handleSendBlocks = useCallback(
+    (blocks: ContentBlock[]) => {
+      void sendPromptBlocks(sessionId, blocks).catch((err) => {
+        toast.error(`Failed to send: ${String(err)}`)
+      })
+    },
+    [sendPromptBlocks, sessionId]
   )
 
   const handleCancel = useCallback(() => {
@@ -83,12 +113,49 @@ export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.El
     [setModel, sessionId]
   )
 
-  const timeline = useMemo(() => buildTimeline(messages, toolCalls), [messages, toolCalls])
-  // Show the typing indicator while a turn is active but no agent text has
-  // streamed yet (a trailing agent message means text is already rendering).
+  // Most recent user turn — drives the regenerate/retry affordances. We keep
+  // the original blocks so retrying re-sends structured attachments (images,
+  // resource/file-ref), not just the concatenated text; an attachment-only
+  // prompt (no text) is still retryable via the blocks.
+  const lastUserBlocks = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return messages[i].blocks
+    }
+    return null
+  }, [messages])
+  const lastUserText = lastUserBlocks ? messageText(lastUserBlocks) : ''
+  const canRetryLastUserTurn = Boolean(
+    lastUserBlocks?.some((b) => b.type !== 'text' || (b.text ?? '').trim().length > 0)
+  )
+
+  const handleRetry = useCallback(() => {
+    if (!lastUserBlocks || !canRetryLastUserTurn) return
+    setDismissedError(session?.lastError ?? null)
+    const hasStructuredBlocks = lastUserBlocks.some((b) => b.type !== 'text')
+    const task = hasStructuredBlocks
+      ? sendPromptBlocks(sessionId, lastUserBlocks)
+      : sendPrompt(sessionId, lastUserText.trim())
+    void task.catch((err) => {
+      toast.error(`Failed to send: ${String(err)}`)
+    })
+  }, [
+    lastUserBlocks,
+    canRetryLastUserTurn,
+    lastUserText,
+    sendPrompt,
+    sendPromptBlocks,
+    sessionId,
+    session?.lastError
+  ])
+
+  const timeline = useMemo(
+    () => consolidateThoughtGroups(buildTimeline(messages, toolCalls)),
+    [messages, toolCalls]
+  )
+  // Typing dots only before any thought or agent text arrives in the turn.
   const lastMessage = messages[messages.length - 1]
-  const hasAgentTextTail = lastMessage?.role === 'agent'
-  const showTyping = Boolean(session?.activeTurn) && !hasAgentTextTail
+  const hasTurnOutput = lastMessage?.role === 'agent' || lastMessage?.role === 'thought'
+  const showTyping = Boolean(session?.activeTurn) && !hasTurnOutput
 
   if (!session) {
     return (
@@ -99,22 +166,33 @@ export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.El
   }
 
   const isClosed = session.status === 'closed'
+  const activeError =
+    session.lastError && session.lastError !== dismissedError ? session.lastError : null
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <AgentHeader session={session} agentStatus={agentStatus} />
-      {session.lastError && (
-        <div className="border-b border-red-500/30 bg-red-500/10 px-3 py-1 text-2xs text-red-400">
-          {session.lastError}
-        </div>
-      )}
+      <ChatErrorNotice
+        message={activeError}
+        onRetry={canRetryLastUserTurn && !session.activeTurn ? handleRetry : undefined}
+        onDismiss={() => setDismissedError(session.lastError)}
+      />
       <PlanPanel entries={plan} />
-      <ChatMessageList items={timeline} agentId={session.agentId} showTyping={showTyping} />
+      <ChatMessageList
+        items={timeline}
+        sessionId={session.id}
+        agentId={session.agentId}
+        showTyping={showTyping}
+        onEditMessage={seedComposer}
+        onRetry={canRetryLastUserTurn && !session.activeTurn ? handleRetry : undefined}
+      />
       <ChatInputBar
         session={session}
         busy={session.activeTurn}
         disabled={isClosed}
+        imageCapable={imageCapable}
+        embedCapable={embedCapable}
         onSend={handleSend}
+        onSendBlocks={handleSendBlocks}
         onCancel={handleCancel}
         commands={commands}
         configOptions={session.configOptions}
@@ -122,6 +200,8 @@ export function AgentChatPanel({ sessionId }: AgentChatPanelProps): React.JSX.El
         onSetConfig={handleSetConfig}
         onSetMode={handleSetMode}
         onSetModel={handleSetModel}
+        seedText={seed?.text}
+        seedNonce={seed?.nonce}
       />
       {pendingPermission && !isClosed && <PermissionDialog permission={pendingPermission} />}
     </div>
