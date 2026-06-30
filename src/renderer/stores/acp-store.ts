@@ -44,6 +44,7 @@ import {
   type SessionConfigOption,
   type SessionCreatedEvent,
   type SessionId,
+  type SessionInfo,
   type SessionInfoUpdateEvent,
   type SessionMode,
   type SessionModelState,
@@ -152,6 +153,14 @@ interface AcpState {
   // Persisted chat-history index (loaded on mount; payloads load lazily)
   sessionIndex: SessionIndexEntry[]
 
+  // Discovered (agent-native) sessions via `session/list` — ephemeral, not persisted.
+  // Keyed by `discoveryKey(agentId, cwd)` so each (agent, cwd) pair owns its own
+  // result slot; switching cwd never clobbers another cwd's results, and a slow
+  // in-flight discovery for one cwd can't overwrite a newer cwd's results.
+  discoveredSessions: Record<string, SessionInfo[]>
+  /** discoveryKeys whose discovery is currently in flight (prevents duplicate requests). */
+  discoveringKeys: Record<string, true>
+
   // Global MCP server registry (persisted)
   mcpServers: StoredMcpServer[]
 
@@ -215,6 +224,17 @@ interface AcpState {
   loadSessionIndex: () => Promise<void>
   openHistorySession: (id: string) => Promise<void>
   deleteHistorySession: (id: string) => Promise<void>
+
+  // Actions — session discovery (gh-407)
+  /** Discover agent-native sessions via `session/list` for the given cwd. Best-effort, silent on failure. */
+  discoverSessions: (agentId: AgentId, cwd: string) => Promise<void>
+  /** Continue a discovered (non-mirror) session via load/resume, following the decideResume policy. */
+  openDiscoveredSession: (
+    agentId: AgentId,
+    sessionId: SessionId,
+    cwd: string,
+    projectId: string
+  ) => Promise<void>
 
   // Actions — MCP server registry (P6)
   loadMcpServers: () => Promise<void>
@@ -568,6 +588,34 @@ export function configIdFromReuseKey(key: string): string {
   return nul === -1 ? key : key.slice(0, nul)
 }
 
+/**
+ * Normalize a filesystem path for keying/comparison: forward slashes and no
+ * trailing slash. Case-folds only Windows-style paths (drive-letter or
+ * backslash-bearing), which are case-insensitive; POSIX paths keep their case
+ * since `/Work` and `/work` are distinct directories there.
+ */
+export function normalizeCwd(cwd: string): string {
+  const trimmed = cwd.trim()
+  if (trimmed === '') return ''
+  const isWindowsPath = /^[a-zA-Z]:/.test(trimmed) || trimmed.includes('\\')
+  let slashed = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
+  // Preserve roots: stripping trailing slashes must not collapse a root like
+  // "/" (POSIX) or "C:/" (Windows drive) into "" / "C:", which would alias the
+  // no-cwd key or lose the drive root.
+  if (slashed === '') slashed = '/'
+  else if (/^[a-zA-Z]:$/.test(slashed)) slashed = `${slashed}/`
+  return isWindowsPath ? slashed.toLowerCase() : slashed
+}
+
+/**
+ * Stable key for a discovery result/in-flight slot, scoped per (agent, cwd) so
+ * switching cwd never clobbers another cwd's results and a slow in-flight
+ * discovery can't overwrite a newer cwd's results. cwd is normalized.
+ */
+export function discoveryKey(agentId: AgentId, cwd: string): string {
+  return `${agentId}\0${normalizeCwd(cwd)}`
+}
+
 /** Stable key for prepare/start dedupe (MCP list order-independent). */
 export function prepareChatKey(
   configId: string,
@@ -757,6 +805,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   preparingChatKeys: {},
   prepareChatErrors: {},
   sessionIndex: [],
+  discoveredSessions: {},
+  discoveringKeys: {},
   mcpServers: [],
   sessions: {},
   activeSessionId: null,
@@ -1219,6 +1269,139 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
   },
 
+  // --- Session discovery (gh-407) -------------------------------------------
+
+  discoverSessions: async (agentId, cwd) => {
+    // Gate on sessionCapabilities.list — never call session/list without it.
+    const agent = get().agents[agentId]
+    if (!agent?.capabilities) {
+      console.info('[acp] discoverSessions: no capabilities for agent', agentId)
+      return
+    }
+    if (!agent.capabilities.sessionCapabilities?.list) {
+      console.info(
+        '[acp] discoverSessions: agent does not advertise sessionCapabilities.list, skipping',
+        agentId,
+        agent.capabilities.sessionCapabilities
+      )
+      return
+    }
+
+    // Scope the result + in-flight slot per (agent, cwd) so switching cwd never
+    // clobbers another cwd's results, and a slow in-flight discovery for one cwd
+    // can't overwrite a newer cwd's results.
+    const key = discoveryKey(agentId, cwd)
+
+    // Prevent duplicate concurrent discovery for the same (agent, cwd).
+    if (get().discoveringKeys[key]) return
+    // Gate on a LIVE connection, not just capability presence: _onAgentDisconnected
+    // leaves the agent in `agents` (status 'error') but it can no longer service
+    // session/list. Skip stale agents up front.
+    if (get().agentStatus[agentId] !== 'connected') return
+    set((s) => ({ discoveringKeys: { ...s.discoveringKeys, [key]: true } }))
+
+    try {
+      const all: SessionInfo[] = []
+      const seen = new Set<string>()
+      let cursor: string | undefined
+      // Safety cap: 10 pages max.
+      for (let i = 0; i < 10; i++) {
+        const res = await acpApi.listSessions(agentId, cwd || undefined, cursor)
+        if (Array.isArray(res.sessions)) {
+          // De-dupe by sessionId across pages (an agent may repeat an entry
+          // when paginating) so the sidebar never renders the same chat twice.
+          for (const info of res.sessions) {
+            if (seen.has(info.sessionId)) continue
+            seen.add(info.sessionId)
+            all.push(info)
+          }
+        }
+        // Treat the cursor as opaque: only stop when it is absent (nullish).
+        // An empty-string cursor is a valid token and must NOT end pagination.
+        if (res.nextCursor == null) break
+        cursor = res.nextCursor
+      }
+      // Drop the result if the agent disconnected while the request was in
+      // flight, so a slow response can't repopulate state after teardown.
+      if (get().agentStatus[agentId] !== 'connected') return
+      // Log only counts + context — never session metadata (titles/ids/cwd can
+      // be sensitive). Detailed payloads stay out of the console.
+      console.info(`[acp] discoverSessions: agent ${agentId} returned ${all.length} session(s)`)
+      set((s) => ({ discoveredSessions: { ...s.discoveredSessions, [key]: all } }))
+    } catch (e) {
+      // Best-effort: log warning, don't toast (discovery is opportunistic).
+      console.warn('[acp] session/list failed for agent', agentId, e)
+      // Clear any stale discovered entries for this (agent, cwd).
+      set((s) => {
+        const next = { ...s.discoveredSessions }
+        delete next[key]
+        return { discoveredSessions: next }
+      })
+    } finally {
+      set((s) => {
+        const next = { ...s.discoveringKeys }
+        delete next[key]
+        return { discoveringKeys: next }
+      })
+    }
+  },
+
+  openDiscoveredSession: async (agentId, sessionId, cwd, projectId) => {
+    const connected = get().agentStatus[agentId] === 'connected'
+    const capabilities = get().agents[agentId]?.capabilities ?? null
+    const strategy = decideResume({ connected, capabilities })
+
+    if (strategy === 'local') {
+      throw new Error(
+        'agent does not support loading or resuming sessions (no loadSession or sessionCapabilities.resume)'
+      )
+    }
+
+    // Create a minimal session record so streaming events (session/update)
+    // during replay have a session to attach to, mirroring openHistorySession.
+    set((s) => ({
+      sessions: {
+        ...s.sessions,
+        [sessionId]: {
+          id: sessionId,
+          agentId,
+          cwd,
+          projectId,
+          status: 'closed',
+          title: null,
+          activeTurn: false,
+          openTurnId: null,
+          modes: null,
+          models: null,
+          configOptions: [],
+          lastError: null,
+          createdAt: Date.now()
+        }
+      },
+      messages: { ...s.messages, [sessionId]: [] }
+    }))
+
+    if (strategy === 'load') {
+      // Agent replays history via session/update; clear local copy to avoid dupes.
+      try {
+        await acpApi.loadSession(agentId, sessionId, cwd)
+        set((s) => ({ sessions: withSessionActive(s.sessions, sessionId) }))
+      } catch (err) {
+        // Restore empty messages so the pane doesn't show stale content.
+        set((s) => ({ sessions: withSessionResumeError(s.sessions, sessionId, err) }))
+        throw err
+      }
+    } else if (strategy === 'resume') {
+      try {
+        await acpApi.resumeSession(agentId, sessionId, cwd)
+        set((s) => ({ sessions: withSessionActive(s.sessions, sessionId) }))
+      } catch (err) {
+        set((s) => ({ sessions: withSessionResumeError(s.sessions, sessionId, err) }))
+        throw err
+      }
+    }
+  },
+
   loadMcpServers: async () => {
     const list = await loadMcpServersFromDisk()
     set({ mcpServers: list })
@@ -1587,10 +1770,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           affected.push(id)
         }
       }
+      const discoveredSessions = { ...s.discoveredSessions }
+      // Keys are `discoveryKey(agentId, cwd)`; drop every cwd slot for this agent.
+      const prefix = `${e.agentId}\0`
+      for (const k of Object.keys(discoveredSessions)) {
+        if (k.startsWith(prefix)) delete discoveredSessions[k]
+      }
       return {
         agentStatus,
         sessions,
-        pendingPermissions: dropPermissionsForAgent(s.pendingPermissions, e.agentId)
+        pendingPermissions: dropPermissionsForAgent(s.pendingPermissions, e.agentId),
+        discoveredSessions
       }
     })
     // Persist the closed status for each session the disconnect affected, so the
