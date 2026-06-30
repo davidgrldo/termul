@@ -1,11 +1,12 @@
-import { MessageSquare, Search, Trash2 } from 'lucide-react'
+import { Search, Trash2 } from 'lucide-react'
 import { useCallback, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { groupSessionsByRecency } from '@/lib/acp-history-persistence'
 import { cn } from '@/lib/utils'
-import { useAcpStore } from '@/stores/acp-store'
+import { useAcpStore, useAgentTemplateId } from '@/stores/acp-store'
 import { getActiveWorktreeFromStore, useActiveProject } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
+import { AgentGlyph } from './AgentGlyph'
 
 /** Sidebar tab listing persisted chat sessions, grouped by recency with search. */
 export function ChatHistoryTab(): React.JSX.Element {
@@ -104,7 +105,7 @@ export function ChatHistoryTab(): React.JSX.Element {
                     onClick={() => void handleOpen(entry.id)}
                     className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left text-xs"
                   >
-                    <MessageSquare size={12} className="shrink-0 text-muted-foreground" />
+                    <ChatEntryIcon agentId={entry.agentId} agentConfigId={entry.agentConfigId} />
                     <span className="truncate flex-1 text-sidebar-foreground">{entry.title}</span>
                     <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
                   </button>
@@ -125,4 +126,16 @@ export function ChatHistoryTab(): React.JSX.Element {
       </div>
     </div>
   )
+}
+
+/** Resolve the agent's bundled registry icon for a history entry. */
+function ChatEntryIcon({
+  agentId,
+  agentConfigId
+}: {
+  agentId: string
+  agentConfigId?: string
+}): React.JSX.Element {
+  const templateId = useAgentTemplateId(agentId, agentConfigId)
+  return <AgentGlyph templateId={templateId} size={12} className="text-muted-foreground" />
 }
