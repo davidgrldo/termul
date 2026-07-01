@@ -1,7 +1,7 @@
 import { Search, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { groupSessionsByRecency } from '@/lib/acp-history-persistence'
+import { groupSessionsByRecency, scopeSessionIndex } from '@/lib/acp-history-persistence'
 import { cn } from '@/lib/utils'
 import {
   configIdFromReuseKey,
@@ -86,12 +86,15 @@ export function ChatHistoryTab(): React.JSX.Element {
     }
   }, [activeCwd, agentIds, agents, discoverSessions])
 
-  // Hard isolation (ADR 0002): show only sessions whose `(projectId, cwd)`
-  // match the active project + its current worktree/root.
-  const scopedIndex = useMemo(() => {
-    if (!activeProjectId || !activeCwd) return []
-    return sessionIndex.filter((e) => e.projectId === activeProjectId && e.cwd === activeCwd)
-  }, [sessionIndex, activeProjectId, activeCwd])
+  // ADR 0002 scoping: show only sessions whose `(projectId, cwd)` match the
+  // active project + worktree/root, falling back to projectId-only matching
+  // when the exact cwd yields nothing (a chat whose cwd drifted since it was
+  // created is still reachable instead of silently hidden). See
+  // `scopeSessionIndex` for the contract.
+  const scopedIndex = useMemo(
+    () => scopeSessionIndex(sessionIndex, activeProjectId, activeCwd),
+    [sessionIndex, activeProjectId, activeCwd]
+  )
 
   // Build a unified sidebar list: local mirror + discovered sessions (deduped).
   const mergedEntries = useMemo(() => {
