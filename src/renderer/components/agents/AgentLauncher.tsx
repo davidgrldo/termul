@@ -26,6 +26,8 @@ import {
 import { useComposerAttachments } from '@/components/chat/use-composer-attachments'
 import { useComposerMentions } from '@/components/chat/use-composer-mentions'
 import { useComposerTextarea } from '@/components/chat/use-composer-textarea'
+import { useOptimisticSelect } from '@/components/chat/use-optimistic-select'
+import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -374,27 +376,38 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   )
 
   const handleSetConfig = useCallback(
-    (configId: string, valueId: string) => {
-      if (!preparedSessionId) return
-      void useAcpStore
-        .getState()
-        .setConfigOption(preparedSessionId, configId, valueId)
-        .catch((err) => toast.error(`Failed to set option: ${String(err)}`))
+    async (configId: string, valueId: string) => {
+      if (!preparedSessionId) {
+        throw new Error('No prepared ACP session is ready yet')
+      }
+      try {
+        await useAcpStore.getState().setConfigOption(preparedSessionId, configId, valueId)
+      } catch (err) {
+        toast.error(`Failed to set option: ${String(err)}`)
+        throw err
+      }
     },
     [preparedSessionId]
   )
 
   const handleSetModel = useCallback(
-    (valueId: string) => {
-      if (!preparedSessionId) return
+    async (valueId: string) => {
+      if (!preparedSessionId) {
+        throw new Error('No prepared ACP session is ready yet')
+      }
       if (modelSource === 'models') {
-        void useAcpStore
-          .getState()
-          .setModel(preparedSessionId, valueId)
-          .catch((err) => toast.error(`Failed to set model: ${String(err)}`))
+        try {
+          await useAcpStore.getState().setModel(preparedSessionId, valueId)
+        } catch (err) {
+          toast.error(`Failed to set model: ${String(err)}`)
+          throw err
+        }
         return
       }
-      if (modelOption) handleSetConfig(modelOption.id, valueId)
+      if (!modelOption) {
+        throw new Error('No model option is available for this session')
+      }
+      await handleSetConfig(modelOption.id, valueId)
     },
     [handleSetConfig, modelOption, modelSource, preparedSessionId]
   )
@@ -407,12 +420,16 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [activeConfigId, preparedKey, projectRoot, activeProjectId])
 
   const handleSetMode = useCallback(
-    (modeId: string) => {
-      if (!preparedSessionId) return
-      void useAcpStore
-        .getState()
-        .setMode(preparedSessionId, modeId)
-        .catch((err) => toast.error(`Failed to set agent: ${String(err)}`))
+    async (modeId: string) => {
+      if (!preparedSessionId) {
+        throw new Error('No prepared ACP session is ready yet')
+      }
+      try {
+        await useAcpStore.getState().setMode(preparedSessionId, modeId)
+      } catch (err) {
+        toast.error(`Failed to set agent: ${String(err)}`)
+        throw err
+      }
     },
     [preparedSessionId]
   )
@@ -553,12 +570,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       className={cn('absolute inset-0 flex flex-col items-center justify-center p-8', className)}
     >
       <div className="mb-8 flex flex-col items-center gap-4 text-center">
-        <EntryGlyph
-          config={selectedConfig}
-          templateId={selectedEntry?.agent.id}
-          name={selectedEntry?.agent.name}
-          size="lg"
-        />
+        <TermulMark size={48} className="text-foreground" />
         <h1 className="text-3xl font-medium tracking-tight text-foreground md:text-4xl">
           {`What should we do in ${projectLabel}?`}
         </h1>
@@ -1014,10 +1026,15 @@ function AcpModelPicker({
   errorMessage: string | null
   disabled: boolean
   onRetry: () => void
-  onSelectModel: (valueId: string) => void
+  onSelectModel: (valueId: string) => void | Promise<void>
 }): React.JSX.Element {
   const [query, setQuery] = useState('')
-  const currentModel = modelOption?.options.find((o) => o.value === modelOption.currentValue)
+  const [open, setOpen] = useState(false)
+  const { displayValue, pending, select } = useOptimisticSelect(
+    modelOption?.currentValue,
+    onSelectModel
+  )
+  const currentModel = modelOption?.options.find((o) => o.value === displayValue)
   const label = loading
     ? 'Loading model…'
     : errorMessage
@@ -1033,14 +1050,22 @@ function AcpModelPicker({
         .toLowerCase()
         .includes(normalizedQuery)
     }) ?? []
+
+  const handleSelectModel = (valueId: string): void => {
+    setQuery('')
+    setOpen(false)
+    select(valueId)
+  }
+
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild disabled={disabled}>
         <ComposerPill
           disabled={disabled}
           aria-label={`Select model: ${label}`}
           className="max-w-[220px]"
           chevron
+          pending={pending}
         >
           <span className="truncate">{label}</span>
         </ComposerPill>
@@ -1076,13 +1101,14 @@ function AcpModelPicker({
                   <button
                     key={value.value}
                     type="button"
-                    onClick={() => {
-                      setQuery('')
-                      onSelectModel(value.value)
+                    onPointerDown={(event) => {
+                      event.preventDefault()
+                      handleSelectModel(value.value)
                     }}
+                    onClick={() => handleSelectModel(value.value)}
                     className={cn(
                       'flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent',
-                      value.value === modelOption.currentValue && 'bg-accent/50'
+                      value.value === displayValue && 'bg-accent/50'
                     )}
                   >
                     <span className="min-w-0 flex-1">
@@ -1093,7 +1119,7 @@ function AcpModelPicker({
                         </span>
                       )}
                     </span>
-                    {value.value === modelOption.currentValue && (
+                    {value.value === displayValue && (
                       <Check size={14} className="mt-0.5 text-muted-foreground" />
                     )}
                   </button>
@@ -1134,13 +1160,11 @@ function AcpModelPicker({
 const EntryGlyph = memo(function EntryGlyph({
   config,
   templateId,
-  name,
-  size = 'sm'
+  name
 }: {
   config: StoredAgentConfig | null
   templateId?: string
   name?: string
-  size?: 'sm' | 'lg'
 }): React.JSX.Element {
   const normalized = useMemo(() => {
     const key = config?.templateId ?? templateId
@@ -1148,8 +1172,7 @@ const EntryGlyph = memo(function EntryGlyph({
     const icon = findBundledIconByKey(`acp:${key}`)?.svg
     return icon ? sanitizeInlineAgentSvg(icon) : null
   }, [config?.templateId, templateId])
-  const className =
-    size === 'lg' ? 'h-12 w-12 rounded-2xl text-base' : 'h-4 w-4 rounded-sm text-4xs'
+  const className = 'h-4 w-4 rounded-sm text-4xs'
 
   if (normalized) {
     return (

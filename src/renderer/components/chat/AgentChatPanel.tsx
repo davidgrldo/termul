@@ -117,28 +117,37 @@ export function AgentChatPanel({
   }, [cancelPrompt, sessionId])
 
   const handleSetConfig = useCallback(
-    (configId: string, valueId: string) => {
-      void setConfigOption(sessionId, configId, valueId).catch((err) => {
+    async (configId: string, valueId: string) => {
+      try {
+        await setConfigOption(sessionId, configId, valueId)
+      } catch (err) {
         toast.error(`Failed to set option: ${String(err)}`)
-      })
+        throw err
+      }
     },
     [setConfigOption, sessionId]
   )
 
   const handleSetMode = useCallback(
-    (modeId: string) => {
-      void setMode(sessionId, modeId).catch((err) => {
+    async (modeId: string) => {
+      try {
+        await setMode(sessionId, modeId)
+      } catch (err) {
         toast.error(`Failed to set mode: ${String(err)}`)
-      })
+        throw err
+      }
     },
     [setMode, sessionId]
   )
 
   const handleSetModel = useCallback(
-    (modelId: string) => {
-      void setModel(sessionId, modelId).catch((err) => {
+    async (modelId: string) => {
+      try {
+        await setModel(sessionId, modelId)
+      } catch (err) {
         toast.error(`Failed to set model: ${String(err)}`)
-      })
+        throw err
+      }
     },
     [setModel, sessionId]
   )
@@ -182,10 +191,9 @@ export function AgentChatPanel({
     () => consolidateThoughtGroups(buildTimeline(messages, toolCalls)),
     [messages, toolCalls]
   )
-  // Typing dots only before any thought or agent text arrives in the turn.
-  const lastMessage = messages[messages.length - 1]
-  const hasTurnOutput = lastMessage?.role === 'agent' || lastMessage?.role === 'thought'
-  const showTyping = Boolean(session?.activeTurn) && !hasTurnOutput
+  // Keep the bottom cue visible for the complete turn, including while thought,
+  // tool, and agent-message surfaces stream their own local progress.
+  const showRunningIndicator = Boolean(session?.activeTurn)
 
   if (!session) {
     if (rehydrateError) {
@@ -251,7 +259,7 @@ export function AgentChatPanel({
         items={timeline}
         sessionId={session.id}
         agentId={session.agentId}
-        showTyping={showTyping}
+        showRunningIndicator={showRunningIndicator}
         onEditMessage={seedComposer}
         onRetry={canRetryLastUserTurn && !session.activeTurn ? handleRetry : undefined}
       />
