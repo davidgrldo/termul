@@ -2,8 +2,18 @@ import { code as codePlugin } from '@streamdown/code'
 import { mermaid as mermaidPlugin } from '@streamdown/mermaid'
 import { motion, useReducedMotion } from 'framer-motion'
 import { memo, useEffect, useMemo, useState } from 'react'
-import { Streamdown } from 'streamdown'
+import { type LinkSafetyConfig, type LinkSafetyModalProps, Streamdown } from 'streamdown'
 import { Attachment, AttachmentPreview, Attachments } from '@/components/ai-elements/attachments'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from '@/components/ui/alert-dialog'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import { Message, MessageContent } from '@/components/ui/message'
@@ -23,6 +33,8 @@ import {
   isLocalFileUri,
   uint8ToBase64
 } from './chat-attachments'
+import { ChatMarkdownCode } from './chat-markdown-code'
+import { ChatMarkdownTable } from './chat-markdown-table'
 import { type BubbleAlign, staggerChild } from './chat-motion'
 import { MessageActions } from './MessageActions'
 
@@ -124,8 +136,15 @@ const STREAMDOWN_PLUGINS = { code: CODE_PLUGIN, mermaid: MERMAID_PLUGIN }
 // Copy on code blocks, plus download (save an agent-generated file); no line
 // numbers (chat snippets are short). Mermaid keeps its interactive controls.
 const STREAMDOWN_CONTROLS = {
-  code: { copy: true, download: true },
+  // Fenced code copy/download come from ChatMarkdownCode (IconActionButton).
+  code: false,
+  table: { copy: true, download: true, fullscreen: true },
   mermaid: { copy: true, download: true, fullscreen: true, panZoom: true }
+} as const
+
+const STREAMDOWN_COMPONENTS = {
+  code: ChatMarkdownCode,
+  table: ChatMarkdownTable
 } as const
 
 // Word-by-word reveal so replies feel like they stream even when an agent
@@ -133,14 +152,51 @@ const STREAMDOWN_CONTROLS = {
 // imported in main.tsx; already-visible words get duration 0 (no re-animation).
 const STREAMDOWN_ANIMATED = { animation: 'blurIn', sep: 'word', duration: 350, stagger: 8 } as const
 
-// Route link clicks to the OS browser rather than navigating inside the Tauri
-// webview. Returning false aborts Streamdown's own navigation after we hand off.
-const LINK_SAFETY = {
+/**
+ * Confirm external links, then hand off to the OS browser.
+ *
+ * `onLinkCheck` only decides whether to show the confirm UI (never opens).
+ * Opening happens in the modal action so Streamdown's default `window.open`
+ * path is not used and the dialog actually closes after confirm.
+ */
+function StreamdownLinkSafetyModal({
+  isOpen,
+  onClose,
+  url
+}: LinkSafetyModalProps): React.JSX.Element {
+  return (
+    <AlertDialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Open external link?</AlertDialogTitle>
+          <AlertDialogDescription className="break-all">{url}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={() => {
+              void openerApi.openUrlWithSystemBrowser(url)
+              onClose()
+            }}
+          >
+            Open
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+const LINK_SAFETY: LinkSafetyConfig = {
   enabled: true,
-  onLinkCheck: (url: string): boolean => {
-    void openerApi.openUrlWithSystemBrowser(url)
-    return false
-  }
+  // Always take the confirm path; never open from the check callback.
+  onLinkCheck: () => false,
+  renderModal: (props) => <StreamdownLinkSafetyModal {...props} />
 }
 
 /** Agent reply rendered as streaming-safe, hardened markdown via Streamdown. */
@@ -163,6 +219,7 @@ function AgentProse({
         parseIncompleteMarkdown
         plugins={STREAMDOWN_PLUGINS}
         controls={STREAMDOWN_CONTROLS}
+        components={STREAMDOWN_COMPONENTS}
         lineNumbers={false}
         linkSafety={LINK_SAFETY}
         shikiTheme={['github-light', 'github-dark']}

@@ -63,11 +63,14 @@ const FRESH = {
   mcpServers: [],
   sessions: {},
   activeSessionId: null,
+  sessionUsage: {},
   messages: {},
   toolCalls: {},
   plans: {},
   commands: {},
-  pendingPermissions: {}
+  pendingPermissions: {},
+  promptQueues: {},
+  suppressQueueFlush: {}
 }
 
 /**
@@ -284,11 +287,230 @@ describe('acp-store', () => {
     )
   })
 
-  it('rejects a second prompt while a turn is active', async () => {
+  it('enqueues a second prompt while a turn is active', async () => {
     seedSession('s1', 'agent-1') // active by default
-    await expect(useAcpStore.getState().sendPrompt('s1', 'again')).rejects.toThrow(
-      /already in progress/
+    await useAcpStore.getState().sendPrompt('s1', 'follow up')
+    const queue = useAcpStore.getState().promptQueues['s1']
+    expect(queue).toHaveLength(1)
+    expect(queue[0].blocks).toEqual([{ type: 'text', text: 'follow up' }])
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(0)
+  })
+
+  it('enqueues when activeTurn is set without openTurnId', async () => {
+    seedSession('s1', 'agent-1', false)
+    useAcpStore.setState((s) => ({
+      sessions: {
+        s1: { ...s.sessions.s1, activeTurn: true, openTurnId: null }
+      }
+    }))
+    await useAcpStore.getState().sendPrompt('s1', 'follow up')
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(0)
+  })
+
+  it('queues a prompt when the backend rejects a concurrent turn', async () => {
+    seedSession('s1', 'agent-1', false)
+    ;(invoke as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('ACP_TURN_IN_PROGRESS: session s1')
     )
+    await useAcpStore.getState().sendPrompt('s1', 'queued after race')
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().promptQueues['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'queued after race' }
+    ])
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(0)
+    expect(useAcpStore.getState().sessions['s1'].lastError).toBeNull()
+  })
+
+  it('flushes the next queued prompt when the turn ends', async () => {
+    seedSession('s1', 'agent-1', true)
+    await useAcpStore.getState().sendPrompt('s1', 'queued one')
+    await useAcpStore.getState().sendPrompt('s1', 'queued two')
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(2)
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}))
+    useAcpStore.getState()._onPromptComplete({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      stopReason: 'end_turn'
+    })
+    await flushTurnEnd()
+    await Promise.resolve()
+
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'queued one' }
+    ])
+    expect(useAcpStore.getState().sessions['s1'].activeTurn).toBe(true)
+  })
+
+  it('preserves FIFO order when a flushed prompt hits ACP_TURN_IN_PROGRESS', async () => {
+    seedSession('s1', 'agent-1', true)
+    await useAcpStore.getState().sendPrompt('s1', 'queued A')
+    await useAcpStore.getState().sendPrompt('s1', 'queued B')
+    const before = useAcpStore.getState().promptQueues['s1']
+    expect(before).toHaveLength(2)
+    const idA = before[0].id
+    const idB = before[1].id
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('ACP_TURN_IN_PROGRESS: session s1')
+    )
+    useAcpStore.getState()._onPromptComplete({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      stopReason: 'end_turn'
+    })
+    await flushTurnEnd()
+    // Allow the flush's runPromptTurn rejection path to settle.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const after = useAcpStore.getState().promptQueues['s1']
+    expect(after.map((q) => q.id)).toEqual([idA, idB])
+    expect(after[0].blocks).toEqual([{ type: 'text', text: 'queued A' }])
+    expect(after[1].blocks).toEqual([{ type: 'text', text: 'queued B' }])
+  })
+
+  it('ignores duplicate turn-end signals so a flushed queued turn keeps running', async () => {
+    seedSession('s1', 'agent-1', true)
+    await useAcpStore.getState().sendPrompt('s1', 'queued next')
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(1)
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}))
+
+    // Mirrors dispatch resolve + acp:prompt_complete scheduling end twice.
+    useAcpStore.getState()._onPromptComplete({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      stopReason: 'end_turn'
+    })
+    useAcpStore.getState()._onPromptComplete({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      stopReason: 'end_turn'
+    })
+    await flushTurnEnd()
+    await flushTurnEnd()
+
+    expect(useAcpStore.getState().sessions['s1'].activeTurn).toBe(true)
+    expect(useAcpStore.getState().promptQueues['s1']).toHaveLength(0)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'queued next' }
+    ])
+  })
+
+  it('sendQueuedPromptNow cancels an active turn and sends the queued message', async () => {
+    seedSession('s1', 'agent-1', true)
+    await useAcpStore.getState().sendPrompt('s1', 'queued now')
+    const queueId = useAcpStore.getState().promptQueues['s1'][0].id
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_cancel_prompt') {
+        useAcpStore.getState()._onPromptComplete({
+          agentId: 'agent-1',
+          sessionId: 's1',
+          stopReason: 'cancelled'
+        })
+        return undefined
+      }
+      if (cmd === 'acp_send_prompt') return 'end_turn'
+      return undefined
+    })
+
+    await useAcpStore.getState().sendQueuedPromptNow('s1', queueId)
+    await flushTurnEnd()
+
+    expect(invoke).toHaveBeenCalledWith('acp_cancel_prompt', {
+      agentId: 'agent-1',
+      sessionId: 's1'
+    })
+    expect(useAcpStore.getState().promptQueues['s1'] ?? []).toHaveLength(0)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'queued now' }
+    ])
+  })
+
+  it('sendQueuedPromptNow cancels when activeTurn is set without openTurnId', async () => {
+    seedSession('s1', 'agent-1', false)
+    useAcpStore.setState((s) => ({
+      sessions: {
+        s1: { ...s.sessions.s1, activeTurn: true, openTurnId: null }
+      },
+      promptQueues: {
+        s1: [
+          {
+            id: 'q-now',
+            blocks: [{ type: 'text', text: 'send now activeTurn-only' }],
+            createdAt: Date.now()
+          }
+        ]
+      }
+    }))
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_cancel_prompt') {
+        useAcpStore.getState()._onPromptComplete({
+          agentId: 'agent-1',
+          sessionId: 's1',
+          stopReason: 'cancelled'
+        })
+        return undefined
+      }
+      if (cmd === 'acp_send_prompt') return 'end_turn'
+      return undefined
+    })
+
+    await useAcpStore.getState().sendQueuedPromptNow('s1', 'q-now')
+    await flushTurnEnd()
+
+    expect(invoke).toHaveBeenCalledWith('acp_cancel_prompt', {
+      agentId: 'agent-1',
+      sessionId: 's1'
+    })
+    expect(useAcpStore.getState().promptQueues['s1'] ?? []).toHaveLength(0)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'send now activeTurn-only' }
+    ])
+  })
+
+  it('prompt_complete clears activeTurn-only sessions and flushes the queue', async () => {
+    seedSession('s1', 'agent-1', false)
+    useAcpStore.setState((s) => ({
+      sessions: {
+        s1: { ...s.sessions.s1, activeTurn: true, openTurnId: null }
+      },
+      promptQueues: {
+        s1: [
+          {
+            id: 'q-flush',
+            blocks: [{ type: 'text', text: 'after activeTurn-only' }],
+            createdAt: Date.now()
+          }
+        ]
+      }
+    }))
+
+    ;(invoke as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}))
+    useAcpStore.getState()._onPromptComplete({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      stopReason: 'end_turn'
+    })
+    await flushTurnEnd()
+    await Promise.resolve()
+
+    expect(useAcpStore.getState().sessions['s1'].activeTurn).toBe(true)
+    expect(useAcpStore.getState().sessions['s1'].openTurnId).not.toBeNull()
+    expect(useAcpStore.getState().promptQueues['s1'] ?? []).toHaveLength(0)
+    expect(useAcpStore.getState().messages['s1']).toHaveLength(1)
+    expect(useAcpStore.getState().messages['s1'][0].blocks).toEqual([
+      { type: 'text', text: 'after activeTurn-only' }
+    ])
   })
 
   it('coalesces agent message_chunk events into one streaming message', () => {
@@ -578,6 +800,54 @@ describe('acp-store', () => {
       sessionId: 's1'
     })
     expect(useAcpStore.getState().sessions['s1'].title).toBe('Keep me')
+  })
+
+  it('_onUsageUpdate stores agent-reported context window usage', () => {
+    seedSession('s1', 'agent-1')
+    useAcpStore.getState()._onUsageUpdate({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      used: 53_000,
+      size: 200_000,
+      cost: { amount: 0.045, currency: 'USD' }
+    })
+    const usage = useAcpStore.getState().sessionUsage['s1']
+    expect(usage?.used).toBe(53_000)
+    expect(usage?.size).toBe(200_000)
+    expect(usage?.baselineUsed).toBe(53_000)
+    expect(usage?.cost).toEqual({ amount: 0.045, currency: 'USD' })
+    expect(usage?.source).toBe('reported')
+  })
+
+  it('_onUsageUpdate ignores zero cost placeholders', () => {
+    seedSession('s1', 'agent-1')
+    useAcpStore.getState()._onUsageUpdate({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      used: 22_961,
+      size: 200_000,
+      cost: { amount: 0, currency: 'USD' }
+    })
+    expect(useAcpStore.getState().sessionUsage['s1']?.cost).toBeUndefined()
+    expect(useAcpStore.getState().sessionUsage['s1']?.baselineUsed).toBe(22_961)
+  })
+
+  it('_onUsageUpdate ignores invalid or unknown sessions', () => {
+    seedSession('s1', 'agent-1')
+    useAcpStore.getState()._onUsageUpdate({
+      agentId: 'agent-1',
+      sessionId: 'missing',
+      used: 1,
+      size: 100
+    })
+    useAcpStore.getState()._onUsageUpdate({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      used: 0,
+      size: 100
+    })
+    expect(useAcpStore.getState().sessionUsage['s1']).toBeUndefined()
+    expect(useAcpStore.getState().sessionUsage['missing']).toBeUndefined()
   })
 
   it('respondPermission is re-entrancy safe (W3): second call is a no-op', async () => {
@@ -2527,5 +2797,52 @@ describe('session discovery (gh-407)', () => {
     expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === 'acp_load_session')).toHaveLength(
       0
     )
+  })
+})
+
+describe('ACP agent plan store', () => {
+  beforeEach(() => {
+    useAcpStore.setState(FRESH)
+  })
+
+  it('_onPlanUpdate replaces entries and empty update clears plan', () => {
+    useAcpStore.getState()._onPlanUpdate({
+      agentId: 'agent-1',
+      sessionId: 'sess-1',
+      plan: {
+        entries: [{ content: 'step one', status: 'pending', priority: 'high' }]
+      }
+    })
+    expect(useAcpStore.getState().plans['sess-1']).toHaveLength(1)
+
+    useAcpStore.getState()._onPlanUpdate({
+      agentId: 'agent-1',
+      sessionId: 'sess-1',
+      plan: { entries: [] }
+    })
+    expect(useAcpStore.getState().plans['sess-1']).toBeUndefined()
+  })
+
+  it('closeSession clears cached plan for the session', async () => {
+    seedSession('sess-1', 'agent-1', false)
+    useAcpStore.setState({
+      plans: {
+        'sess-1': [{ content: 'old plan', status: 'completed' }]
+      }
+    })
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    await useAcpStore.getState().closeSession('sess-1')
+    expect(useAcpStore.getState().plans['sess-1']).toBeUndefined()
+  })
+
+  it('_onSessionClosed clears cached plan for the session', () => {
+    seedSession('sess-1', 'agent-1', false)
+    useAcpStore.setState({
+      plans: {
+        'sess-1': [{ content: 'old plan', status: 'completed' }]
+      }
+    })
+    useAcpStore.getState()._onSessionClosed({ agentId: 'agent-1', sessionId: 'sess-1' })
+    expect(useAcpStore.getState().plans['sess-1']).toBeUndefined()
   })
 })

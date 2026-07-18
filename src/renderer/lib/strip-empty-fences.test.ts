@@ -46,4 +46,49 @@ describe('stripEmptyFences', () => {
     const md = 'just some text\nwith lines'
     expect(stripEmptyFences(md, false)).toBe(md)
   })
+
+  it('preserves inline backtick sequences', () => {
+    const md = 'Use `code` and ``more code`` inline.'
+    expect(stripEmptyFences(md, false)).toBe(md)
+  })
+
+  it('preserves four-space indented literal backticks', () => {
+    const md = '    ```\n    not a fence\n    ```'
+    expect(stripEmptyFences(md, false)).toBe(md)
+  })
+
+  it('preserves triple-backtick content inside a four-backtick fence', () => {
+    const md = '````md\n```js\nconsole.log(1)\n```\n````'
+    expect(stripEmptyFences(md, false)).toBe(md)
+  })
+
+  it('does not strip a four-backtick fence that only contains an empty triple fence', () => {
+    // Outer fence body is the inner ```…``` lines — not whitespace-only, so keep it.
+    const md = '````text\n```\n```\n````'
+    expect(stripEmptyFences(md, false)).toBe(md)
+  })
+
+  it('stops scanning after an unmatched opening fence', () => {
+    // Nested empty triple fence must stay; continuing the scan would wrongly strip it.
+    const md = 'intro\n\n````outer\n```\n```\nmore text'
+    expect(stripEmptyFences(md, true)).toBe(md)
+    expect(stripEmptyFences(md, false)).toBe(md)
+  })
+
+  it('rejects backtick fences whose info string contains a backtick', () => {
+    // CommonMark does not treat ```foo` as an opener. A following empty fence
+    // is therefore stripped on its own, while the invalid opener line remains.
+    const md = '```foo`\n\n```bash\n```\n\nafter'
+    for (const streaming of [false, true]) {
+      const out = stripEmptyFences(md, streaming)
+      expect(out).toContain('```foo`')
+      expect(out).not.toContain('```bash')
+      expect(out).toContain('after')
+    }
+  })
+
+  it('still allows backticks in tilde-fence info strings', () => {
+    const md = '~~~foo`bar\n\n~~~'
+    expect(stripEmptyFences(md, false).trim()).toBe('')
+  })
 })
