@@ -14,7 +14,16 @@ use agent_client_protocol::schema::{
     SessionMode, SessionModeId, SessionModelState, StopReason, ToolCall, ToolCallUpdate,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+
+/// Re-export the transport-neutral fan-out helper so the `acp` dispatcher emits
+/// through `Vec<Arc<dyn EventSink>>` instead of `AppHandle::emit` directly
+/// (Story 1.1 / architecture D2). Call sites read `events::fan_out(sinks, sid,
+/// events::EVENT_*, &payload)` — the `events::` namespace is preserved, the
+/// `app` parameter is gone.
+///
+/// The ONLY place that still calls `AppHandle::emit` for `acp:*` events is
+/// `crate::web::TauriEventSink::emit` (the desktop's sink). See AC7.
+pub(crate) use crate::web::fan_out;
 
 /// Event name: an agent subprocess was spawned and `initialize` completed.
 pub const EVENT_AGENT_SPAWNED: &str = "acp:agent_spawned";
@@ -40,6 +49,11 @@ pub const EVENT_PERMISSION_REQUEST: &str = "acp:permission_request";
 pub const EVENT_PROMPT_COMPLETE: &str = "acp:prompt_complete";
 /// Event name: a non-fatal error occurred while talking to the agent.
 pub const EVENT_AGENT_ERROR: &str = "acp:agent_error";
+/// Event name: the agent subprocess crashed (Story 1.9 FR26) — a typed crash
+/// event distinct from `agent_error` (non-fatal) + `agent_disconnected`
+/// (always). Emitted BEFORE `agent_disconnected` so the renderer can
+/// distinguish "crash" from a clean disconnect + set `status: 'error'`.
+pub const EVENT_AGENT_CRASHED: &str = "acp:agent_crashed";
 /// Event name: a session was closed (explicitly, or because its agent
 /// disconnected/crashed).
 pub const EVENT_SESSION_CLOSED: &str = "acp:session_closed";
@@ -170,12 +184,37 @@ pub struct PromptCompleteEvent {
     pub agent_id: AgentId,
     pub session_id: SessionId,
     pub stop_reason: StopReason,
+    /// Story 1.8 T3.2 (FR11): the client turn-id echoed back so the renderer's
+    /// `seenTurnIds` dedup fires (no duplicate completion on reconnect replay).
+    /// `None` for the desktop path + older clients (dedup is a no-op). Serialized
+    /// as `turnId` (camelCase payload); absent on the wire when `None`
+    /// (`skip_serializing_if = "Option::is_none"` — byte-identical to pre-1.8
+    /// desktop payloads when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// `acp:agent_error`
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentErrorEvent {
+    pub agent_id: AgentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub message: String,
+}
+
+/// `acp:agent_crashed` (Story 1.9 FR26)
+///
+/// Emitted when the agent subprocess crashes mid-turn (the supervisor — i.e.
+/// the `run_agent` teardown — detects child exit via the SDK connection
+/// resolving with `Err`). Outstanding turn oneshots fail with this event;
+/// `acp-store` sets `status: 'error'` + the UI shows a manual-restart action
+/// (no silent respawn, honoring ADR-003). Emitted BEFORE `agent_disconnected`.
+/// `session_id` is `None` (the crash is agent-level, `sid = None`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCrashedEvent {
     pub agent_id: AgentId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
@@ -238,15 +277,11 @@ pub struct UsageUpdateEvent {
     pub cost: Option<UsageCostEvent>,
 }
 
-/// Emit a payload to the renderer, logging (but not propagating) any error.
-///
-/// Emission failures are non-fatal: they only mean no renderer is listening, so
-/// we must never let them tear down the agent driver thread.
-pub fn emit<P: Serialize + Clone>(app: &AppHandle, event: &str, payload: P) {
-    if let Err(e) = app.emit(event, payload) {
-        log::error!("[acp] failed to emit event {event}: {e}");
-    }
-}
+// Story 1.1 (AC7): the legacy `events::emit(app, event, payload)` free function
+// was REMOVED. All emission now goes through [`fan_out`] against the
+// dispatcher's `Vec<Arc<dyn EventSink>>`. The `AppHandle`-aware path lives
+// exclusively in `crate::web::TauriEventSink::emit` (the desktop's sink), so no
+// new `app.emit("acp:..")` call sites may be introduced outside that sink.
 
 #[cfg(test)]
 mod tests {
@@ -317,9 +352,57 @@ mod tests {
             agent_id: AgentId("a".to_string()),
             session_id: SessionId::new("s"),
             stop_reason: StopReason::EndTurn,
+            turn_id: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["stopReason"], "end_turn");
+        // Story 1.8 T3.2: `turnId` is absent when `None` (byte-identical to
+        // pre-1.8 desktop payloads — `skip_serializing_if = "Option::is_none"`).
+        assert!(value.get("turnId").is_none(), "turnId must be absent when None");
+    }
+
+    #[test]
+    fn prompt_complete_serializes_turn_id_when_set() {
+        let event = PromptCompleteEvent {
+            agent_id: AgentId("a".to_string()),
+            session_id: SessionId::new("s"),
+            stop_reason: StopReason::EndTurn,
+            turn_id: Some("turn-123".to_string()),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["turnId"], "turn-123");
+    }
+
+    /// Story 1.9 FR26: `AgentCrashedEvent` serializes camelCase, omits
+    /// `sessionId` when `None` (agent-level crash, `sid = None` on the wire).
+    #[test]
+    fn agent_crashed_serializes_camel_case() {
+        let event = AgentCrashedEvent {
+            agent_id: AgentId("a1".to_string()),
+            session_id: None,
+            message: "child exited: signal 11".to_string(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["agentId"], "a1");
+        assert_eq!(value["message"], "child exited: signal 11");
+        assert!(
+            value.get("sessionId").is_none(),
+            "sessionId must be absent when None (byte-identical to pre-1.9)"
+        );
+        assert_eq!(EVENT_AGENT_CRASHED, "acp:agent_crashed");
+    }
+
+    /// Story 1.9 FR26: `AgentCrashedEvent` with a session id (turn-scoped
+    /// crash) serializes the `sessionId` field.
+    #[test]
+    fn agent_crashed_serializes_session_id_when_set() {
+        let event = AgentCrashedEvent {
+            agent_id: AgentId("a1".to_string()),
+            session_id: Some(SessionId::new("sess-1")),
+            message: "turn timed out".to_string(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["sessionId"], "sess-1");
     }
 
     #[test]

@@ -8,6 +8,18 @@
  * P1 scope: text conversations. `toolCalls`, `plans`, `commands`,
  * `pendingPermissions`, and config/mode state are tracked here; tool, plan,
  * permission, and slash-command UI render them when present.
+ *
+ * ## Architecture D6 reconciliation (Story 1.5)
+ *
+ * Architecture asked for "`acp-store`: single-session per tab" **without** a
+ * store refactor. This store remains intentionally **global multi-session**
+ * (`sessions: Record<SessionId, …>` + `activeSessionId`). D6's "one focused
+ * session per browser tab" is honored by the external tab↔session mapping in
+ * `@/lib/web-tab-session` (sessionStorage per tab), not by reshaping Zustand
+ * to a single-session store.
+ *
+ * `activeSessionId` is an in-process UI convenience (especially desktop /
+ * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
 import { toast } from 'sonner'
@@ -22,6 +34,7 @@ import {
   ACP_EVENTS,
   type AgentCapabilities,
   type AgentConfig,
+  type AgentCrashedEvent,
   type AgentDisconnectedEvent,
   type AgentErrorEvent,
   type AgentId,
@@ -89,6 +102,17 @@ export type { QueuedPrompt } from './prompt-queue-orchestration'
 export type AgentStatus = 'idle' | 'spawning' | 'connected' | 'error'
 export type SessionStatus = 'initializing' | 'active' | 'error' | 'closed'
 export type MessageRole = 'user' | 'agent' | 'thought'
+
+/**
+ * Last-known model/mode/config options for an agent config id (in-memory only).
+ * Used as stale-while-revalidate paint while `prepareChat` / `session/new` catch up.
+ */
+export interface AgentOptionsCacheEntry {
+  models: SessionModelState | null
+  modes: SessionModeState | null
+  configOptions: SessionConfigOption[]
+  updatedAt: number
+}
 
 export interface ChatMessage {
   id: string
@@ -174,6 +198,12 @@ interface AcpState {
   preparingChatKeys: Record<string, true>
   /** Last background prepare error keyed by prepare key. */
   prepareChatErrors: Record<string, string>
+  /**
+   * In-memory last-known models/modes/configOptions keyed by agent config id.
+   * Invalidated only when cmd/args/env (identity) change — not on launcher close
+   * or cwd-only navigation.
+   */
+  agentOptionsCache: Record<string, AgentOptionsCacheEntry>
   /** The agent the warm-session pool targets (drives refill-on-consume +
    * agent-switch drain). Null = no active pool (no refill, no drain). */
   selectedAgentConfigId: string | null
@@ -183,6 +213,11 @@ interface AcpState {
 
   /** Session ids whose `openHistorySession` is in flight (drives UI loading states). */
   openingHistoryIds: Record<string, true>
+  /**
+   * Placeholder session ids created for instant launcher→chat handoff while
+   * `startChat` / first send still run in the background.
+   */
+  launchingSessionIds: Record<string, true>
 
   // Discovered (agent-native) sessions via `session/list` — ephemeral, not persisted.
   // Keyed by `discoveryKey(agentId, cwd)` so each (agent, cwd) pair owns its own
@@ -260,6 +295,63 @@ interface AcpState {
     mcpServers: McpServer[] | undefined,
     projectId: string
   ) => Promise<SessionId>
+  /**
+   * Take ownership of a prepared session so launcher unmount cleanup cannot
+   * reap it after the chat tab is already open. Promotes ephemeral pooled
+   * sessions into persisted history.
+   */
+  claimPreparedChat: (key: string, projectId: string) => SessionId | null
+  /**
+   * Local-only initializing session so the chat tab can open before ACP
+   * `session/new` finishes. Painted from options cache (+ pending overlays).
+   */
+  createLaunchPlaceholder: (args: {
+    cwd: string
+    projectId: string
+    models?: SessionModelState | null
+    modes?: SessionModeState | null
+    configOptions?: SessionConfigOption[]
+    /** Optimistic first-turn content so the chat looks like a normal send. */
+    initialUserBlocks?: ContentBlock[]
+  }) => SessionId
+  /** Drop a launch placeholder that will not be remapped (e.g. after fatal error). */
+  discardLaunchPlaceholder: (sessionId: SessionId) => void
+  /** Paint an optimistic user turn on an already-live session (prepared-path launch). */
+  seedLaunchUserMessage: (sessionId: SessionId, blocks: ContentBlock[]) => void
+  /** Clear the launching indicator once the first turn is handed off. */
+  clearLaunchingSession: (sessionId: SessionId) => void
+  /**
+   * Complete an instant launch: `startChat`, apply pending options, send the
+   * first turn, and tear down the placeholder when the real session id differs.
+   */
+  finalizeChatLaunch: (args: {
+    placeholderId: SessionId
+    configId: string
+    cwd: string
+    projectId: string
+    mcpServers?: McpServer[]
+    pending?: {
+      modelId?: string
+      modeId?: string
+      configValues: Record<string, string>
+    } | null
+    initialText?: string | null
+    initialBlocks?: ContentBlock[] | null
+    /** Remap the workspace tab as soon as the real session exists (before send). */
+    adoptSession?: (fromSessionId: SessionId, toSessionId: SessionId) => void
+  }) => Promise<SessionId>
+  /** Apply launcher pending model/mode/config selections to a live session. */
+  applyPendingLauncherOptions: (
+    sessionId: SessionId,
+    pending:
+      | {
+          modelId?: string
+          modeId?: string
+          configValues: Record<string, string>
+        }
+      | null
+      | undefined
+  ) => Promise<void>
   /** Set the agent the warm-session pool targets (reactive driver for retarget + refill gate). */
   setSelectedAgentConfigId: (configId: string | null) => void
   /** Drain stale pooled sessions for `cwd` (other agents) and seed `configId`'s pool. */
@@ -289,7 +381,11 @@ interface AcpState {
   // Actions — conversation
   sendPrompt: (sessionId: SessionId, text: string) => Promise<void>
   /** Send a prompt turn carrying structured content blocks (text + image/resource). */
-  sendPromptBlocks: (sessionId: SessionId, blocks: ContentBlock[]) => Promise<void>
+  sendPromptBlocks: (
+    sessionId: SessionId,
+    blocks: ContentBlock[],
+    options?: { skipUserAppend?: boolean }
+  ) => Promise<void>
   cancelPrompt: (sessionId: SessionId) => Promise<void>
   removeQueuedPrompt: (sessionId: SessionId, queueId: string) => void
   /** Cancel the active turn if needed, then send a queued prompt immediately. */
@@ -318,6 +414,8 @@ interface AcpState {
   _onPermissionRequest: (e: PermissionRequestEvent) => void
   _onPromptComplete: (e: PromptCompleteEvent) => void
   _onAgentError: (e: AgentErrorEvent) => void
+  /** Story 1.9 FR26: typed crash event → `status: 'error'` + manual restart. */
+  _onAgentCrashed: (e: AgentCrashedEvent) => void
   _onAgentDisconnected: (e: AgentDisconnectedEvent) => void
   _onSessionClosed: (e: SessionClosedEvent) => void
 }
@@ -891,6 +989,133 @@ export function prepareChatKey(
 /** In-flight `session/new` for a prepare key. */
 const inFlightPrepared = new Map<string, Promise<SessionId | null>>()
 
+/** Test-only: clear module-level prepare dedupe maps between tests. */
+export function _resetInFlightPreparedForTesting(): void {
+  inFlightPrepared.clear()
+}
+
+/**
+ * Identity fingerprint for options-cache invalidation: cmd / args / env /
+ * allowTerminal (path and install identity are reflected in `command` + `args`).
+ * Env keys are sorted so insertion-order differences do not spuriously invalidate.
+ */
+export function agentConfigIdentityKey(
+  config: Pick<StoredAgentConfig, 'command' | 'args' | 'env' | 'allowTerminal'>
+): string {
+  const envKeys = Object.keys(config.env).sort()
+  const env: Record<string, string> = {}
+  for (const key of envKeys) {
+    env[key] = config.env[key]
+  }
+  return JSON.stringify({
+    command: config.command,
+    args: config.args,
+    env,
+    allowTerminal: Boolean(config.allowTerminal)
+  })
+}
+
+export function agentConfigIdentityChanged(
+  prev: StoredAgentConfig | undefined,
+  next: StoredAgentConfig
+): boolean {
+  if (!prev) return false
+  return agentConfigIdentityKey(prev) !== agentConfigIdentityKey(next)
+}
+
+type AcpSet = (fn: (s: AcpState) => Partial<AcpState> | AcpState) => void
+type AcpGet = () => AcpState
+
+function configIdForAgentId(state: AcpState, agentId: AgentId): string | null {
+  for (const [key, id] of Object.entries(state.configToLiveAgent)) {
+    if (id === agentId) return configIdFromReuseKey(key)
+  }
+  return null
+}
+
+function writeAgentOptionsCache(
+  set: AcpSet,
+  configId: string,
+  patch: {
+    models?: SessionModelState | null
+    modes?: SessionModeState | null
+    configOptions?: SessionConfigOption[]
+  }
+): void {
+  set((s) => {
+    const prev = s.agentOptionsCache[configId]
+    const next: AgentOptionsCacheEntry = {
+      models: patch.models !== undefined ? patch.models : (prev?.models ?? null),
+      modes: patch.modes !== undefined ? patch.modes : (prev?.modes ?? null),
+      configOptions:
+        patch.configOptions !== undefined ? patch.configOptions : (prev?.configOptions ?? []),
+      updatedAt: Date.now()
+    }
+    // Avoid writing empty shells that would look like a real cache hit.
+    const hasContent =
+      next.models != null ||
+      next.modes != null ||
+      (next.configOptions != null && next.configOptions.length > 0)
+    if (!hasContent) {
+      if (!prev) return s
+      const agentOptionsCache = { ...s.agentOptionsCache }
+      delete agentOptionsCache[configId]
+      return { agentOptionsCache }
+    }
+    return {
+      agentOptionsCache: { ...s.agentOptionsCache, [configId]: next }
+    }
+  })
+}
+
+function invalidateAgentOptionsCache(set: AcpSet, configId: string): void {
+  set((s) => {
+    if (!(configId in s.agentOptionsCache)) return s
+    const agentOptionsCache = { ...s.agentOptionsCache }
+    delete agentOptionsCache[configId]
+    return { agentOptionsCache }
+  })
+}
+
+function cacheOptionsFromSession(set: AcpSet, get: AcpGet, sessionId: SessionId): void {
+  const state = get()
+  const session = state.sessions[sessionId]
+  if (!session) return
+  const configId = configIdForAgentId(state, session.agentId)
+  if (!configId) return
+  writeAgentOptionsCache(set, configId, {
+    models: session.models ?? null,
+    modes: session.modes ?? null,
+    configOptions: session.configOptions ?? []
+  })
+}
+
+/** Best-effort tear-down for a session created by a cancelled/stale prepare. */
+function reapOrphanPreparedSession(get: AcpGet, set: AcpSet, sessionId: SessionId): void {
+  // createSession may have set activeSessionId as a side effect; that must not
+  // block reaping a session that never became a published preparedSessions entry.
+  set((s) => (s.activeSessionId === sessionId ? { activeSessionId: null } : s))
+  void get()
+    .closeSession(sessionId)
+    .catch(() => {
+      /* best-effort: backend may already be gone */
+    })
+    .finally(() => {
+      void get().deleteHistorySession(sessionId)
+    })
+}
+
+/** True when cache has model-relevant content (native models or model config option). */
+export function hasModelRelevantOptionsCache(
+  entry: AgentOptionsCacheEntry | null | undefined
+): boolean {
+  if (!entry) return false
+  if (entry.models && entry.models.availableModels.length > 0) return true
+  return entry.configOptions.some(
+    (option) => option.category === 'model' && option.options.length > 0
+  )
+}
+
 /**
  * Session ids created via `createSession({ ephemeral: true })` (warm-pool seeds)
  * that have NOT yet been promoted to a real chat by `startChat`. Tracked so the
@@ -1003,6 +1228,8 @@ function cancelPreparedChatEntry(
   key: string,
   set: (fn: (s: AcpState) => Partial<AcpState> | AcpState) => void
 ): void {
+  // Drop the in-flight promise identity so a stale task cannot write results
+  // or clear a newer prepare's preparingChatKeys in `finally`.
   inFlightPrepared.delete(key)
   set((s) => {
     if (
@@ -1263,7 +1490,8 @@ async function runPromptTurn(
   sessionId: SessionId,
   userBlocks: ContentBlock[],
   dispatch: (session: AcpSession) => Promise<StopReason>,
-  queuedOrigin?: QueuedPrompt
+  queuedOrigin?: QueuedPrompt,
+  options?: { skipUserAppend?: boolean }
 ): Promise<void> {
   const session = get().sessions[sessionId]
   if (!session) throw new Error(`unknown session ${sessionId}`)
@@ -1274,13 +1502,15 @@ async function runPromptTurn(
   let userMessage: ChatMessage | null = null
   let openTurnId = ''
   const previousOpenTurnId = session.openTurnId
+  const skipUserAppend = Boolean(options?.skipUserAppend)
 
   // Atomically decide enqueue vs start so rapid sends cannot both reach the backend.
   set((s) => {
     const current = s.sessions[sessionId]
     if (!current || current.status === 'closed') return {}
 
-    if (sessionTurnBusy(current)) {
+    // Launch handoff already painted the user message + active turn; don't re-queue.
+    if (sessionTurnBusy(current) && !skipUserAppend) {
       enqueued = true
       if (queuedOrigin) {
         return {
@@ -1296,6 +1526,38 @@ async function runPromptTurn(
     }
 
     openTurnId = newId('turn')
+    if (skipUserAppend) {
+      userMessage =
+        [...(s.messages[sessionId] ?? [])].reverse().find((m) => m.role === 'user') ?? null
+      if (!userMessage) {
+        userMessage = {
+          id: newId('msg'),
+          role: 'user',
+          blocks: userBlocks,
+          streaming: false,
+          timestamp: Date.now(),
+          seq: nextSeq()
+        }
+        return {
+          messages: {
+            ...s.messages,
+            [sessionId]: [...(s.messages[sessionId] ?? []), userMessage]
+          },
+          plans: dropPlanForSession(s.plans, sessionId),
+          sessions: {
+            ...s.sessions,
+            [sessionId]: { ...current, activeTurn: true, openTurnId, lastError: null }
+          }
+        }
+      }
+      return {
+        sessions: {
+          ...s.sessions,
+          [sessionId]: { ...current, activeTurn: true, openTurnId, lastError: null }
+        }
+      }
+    }
+
     userMessage = {
       id: newId('msg'),
       role: 'user',
@@ -1368,9 +1630,11 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   preparedSessions: {},
   preparingChatKeys: {},
   prepareChatErrors: {},
+  agentOptionsCache: {},
   selectedAgentConfigId: null,
   sessionIndex: [],
   openingHistoryIds: {},
+  launchingSessionIds: {},
   discoveredSessions: {},
   discoveringKeys: {},
   mcpServers: [],
@@ -1484,6 +1748,16 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       const st = get()
       persistSession(st, sessionId, (entries) => set({ sessionIndex: entries }))
     }
+    // Cache models/modes even for ephemeral prepares so the launcher can paint
+    // instantly from the warm pool.
+    const configId = configIdForAgentId(get(), agentId)
+    if (configId) {
+      writeAgentOptionsCache(set, configId, {
+        models: outcome.models ?? null,
+        modes: outcome.modes ?? null,
+        configOptions: outcome.configOptions ?? []
+      })
+    }
     return sessionId
   },
 
@@ -1543,6 +1817,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   saveAgentConfig: async (config) => {
     const list = get().agentConfigs
     const idx = list.findIndex((c) => c.id === config.id)
+    const prev = idx === -1 ? undefined : list[idx]
     const next = idx === -1 ? [...list, config] : list.map((c) => (c.id === config.id ? config : c))
     set({ agentConfigs: next })
     try {
@@ -1551,6 +1826,11 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       // roll back the in-memory change on persistence failure
       set({ agentConfigs: list })
       throw err
+    }
+    // Invalidate options cache only on identity-changing fields (cmd/args/env).
+    // Do not kill warm agents here — that remains deleteAgentConfig's job.
+    if (agentConfigIdentityChanged(prev, config)) {
+      invalidateAgentOptionsCache(set, config.id)
     }
   },
 
@@ -1606,6 +1886,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       if (configIdFromReuseKey(key) !== id) continue
       get().cancelPreparedChat(key)
     }
+    invalidateAgentOptionsCache(set, id)
   },
 
   prewarmAgent: async (configId, cwd) => {
@@ -1648,10 +1929,36 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       }
     })
 
-    const task = (async (): Promise<SessionId | null> => {
+    // Register the promise before any await so cancel/reopen can replace it
+    // atomically and stale tasks can detect they are no longer current.
+    let settle!: (value: SessionId | null) => void
+    const task = new Promise<SessionId | null>((resolve) => {
+      settle = resolve
+    })
+    inFlightPrepared.set(key, task)
+
+    void (async (): Promise<void> => {
       try {
         const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
-        if (!agentId) return null
+        if (inFlightPrepared.get(key) !== task) {
+          settle(null)
+          return
+        }
+        if (!agentId) {
+          if (inFlightPrepared.get(key) === task) {
+            const config = get().agentConfigs.find((c) => c.id === configId)
+            const message = formatAcpSpawnError(
+              new Error(`failed to spawn agent for config ${configId}`),
+              config
+            )
+            set((s) => ({
+              prepareChatErrors: { ...s.prepareChatErrors, [key]: message }
+            }))
+            toast.error(message)
+          }
+          settle(null)
+          return
+        }
         const sessionId = await get().createSession(agentId, trimmedCwd, mcpServers, projectId, {
           ephemeral: true
         })
@@ -1668,21 +1975,31 @@ export const useAcpStore = create<AcpState>((set, get) => ({
               return { sessions }
             })
           }
-          return null
+          settle(null)
+          return
+        }
+        // Task-identity guard: cancel deletes the map entry; a newer prepare
+        // replaces it. Either way the stale task must not write results.
+        if (inFlightPrepared.get(key) !== task) {
+          reapOrphanPreparedSession(get, set, sessionId)
+          settle(null)
+          return
         }
         if (prepareChatKey(configId, trimmedCwd, mcpServers) !== key) {
-          return null
-        }
-        if (!inFlightPrepared.has(key)) {
-          return null
+          reapOrphanPreparedSession(get, set, sessionId)
+          settle(null)
+          return
         }
         set((s) => ({
           preparedSessions: { ...s.preparedSessions, [key]: sessionId }
         }))
-        return sessionId
+        // createSession already wrote the options cache when possible; refresh
+        // from the live session in case events enriched modes/models.
+        cacheOptionsFromSession(set, get, sessionId)
+        settle(sessionId)
       } catch (err) {
         console.warn('[acp] prepareChat failed', configId, err)
-        if (inFlightPrepared.has(key)) {
+        if (inFlightPrepared.get(key) === task) {
           const config = get().agentConfigs.find((c) => c.id === configId)
           const message = formatAcpSpawnError(err, config)
           set((s) => ({
@@ -1692,17 +2009,19 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           // user-initiated prepares so a failing agent doesn't spam on startup.
           if (!opts?.silent) toast.error(message)
         }
-        return null
+        settle(null)
       } finally {
-        inFlightPrepared.delete(key)
-        set((s) => {
-          const preparingChatKeys = { ...s.preparingChatKeys }
-          delete preparingChatKeys[key]
-          return { preparingChatKeys }
-        })
+        // Only this task may clear preparing / in-flight state.
+        if (inFlightPrepared.get(key) === task) {
+          inFlightPrepared.delete(key)
+          set((s) => {
+            const preparingChatKeys = { ...s.preparingChatKeys }
+            delete preparingChatKeys[key]
+            return { preparingChatKeys }
+          })
+        }
       }
     })()
-    inFlightPrepared.set(key, task)
   },
 
   testConnection: async (config) => {
@@ -1760,22 +2079,297 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const config = get().agentConfigs.find((c) => c.id === configId)
     if (!config) throw new Error(`unknown agent config ${configId}`)
     const key = prepareChatKey(configId, trimmedCwd, mcpServers)
-    const prepared = get().preparedSessions[key]
-    if (prepared) {
-      promotePreparedSession(key, prepared, projectId, get, set)
-      return prepared
-    }
-    const inFlight = inFlightPrepared.get(key)
-    if (inFlight) {
+    // Loop so a cancelled in-flight prepare that returns null can pick up a
+    // newer prepare that started during the await (cancel+reopen race).
+    for (;;) {
+      const prepared = get().preparedSessions[key]
+      if (prepared) {
+        promotePreparedSession(key, prepared, projectId, get, set)
+        return prepared
+      }
+      const inFlight = inFlightPrepared.get(key)
+      if (!inFlight) break
       const sessionId = await inFlight
       if (sessionId) {
         promotePreparedSession(key, sessionId, projectId, get, set)
         return sessionId
       }
+      // null: cancelled or failed — re-check for a newer prepare before spawning.
     }
     const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
     if (!agentId) throw new Error(`failed to spawn agent for config ${configId}`)
     return get().createSession(agentId, trimmedCwd, mcpServers, projectId)
+  },
+
+  claimPreparedChat: (key, projectId) => {
+    const sessionId = get().preparedSessions[key]
+    if (!sessionId) return null
+    promotePreparedSession(key, sessionId, projectId, get, set)
+    return sessionId
+  },
+
+  createLaunchPlaceholder: ({
+    cwd,
+    projectId,
+    models,
+    modes,
+    configOptions,
+    initialUserBlocks
+  }) => {
+    const sessionId = newId('launch')
+    const blocks = initialUserBlocks ?? []
+    const openTurnId = blocks.length > 0 ? newId('turn') : null
+    const userMessage: ChatMessage | null =
+      blocks.length > 0
+        ? {
+            id: newId('msg'),
+            role: 'user',
+            blocks,
+            streaming: false,
+            timestamp: Date.now(),
+            seq: nextSeq()
+          }
+        : null
+    set((s) => ({
+      sessions: {
+        ...s.sessions,
+        [sessionId]: {
+          id: sessionId,
+          agentId: '',
+          cwd,
+          projectId,
+          status: 'initializing',
+          title: null,
+          activeTurn: Boolean(userMessage),
+          openTurnId,
+          modes: modes ?? null,
+          models: models ?? null,
+          configOptions: configOptions ?? [],
+          lastError: null,
+          createdAt: Date.now(),
+          replaying: null
+        }
+      },
+      messages: {
+        ...s.messages,
+        [sessionId]: userMessage ? [userMessage] : (s.messages[sessionId] ?? [])
+      },
+      launchingSessionIds: { ...s.launchingSessionIds, [sessionId]: true }
+    }))
+    return sessionId
+  },
+
+  discardLaunchPlaceholder: (sessionId) => {
+    set((s) => {
+      if (!s.launchingSessionIds[sessionId] && !s.sessions[sessionId]) return s
+      const sessions = { ...s.sessions }
+      const messages = { ...s.messages }
+      const launchingSessionIds = { ...s.launchingSessionIds }
+      delete sessions[sessionId]
+      delete messages[sessionId]
+      delete launchingSessionIds[sessionId]
+      return {
+        sessions,
+        messages,
+        launchingSessionIds,
+        activeSessionId: s.activeSessionId === sessionId ? null : s.activeSessionId
+      }
+    })
+  },
+
+  seedLaunchUserMessage: (sessionId, blocks) => {
+    if (blocks.length === 0) return
+    set((s) => {
+      const current = s.sessions[sessionId]
+      if (!current || current.status === 'closed') return s
+      if ((s.messages[sessionId] ?? []).some((m) => m.role === 'user')) {
+        return {
+          launchingSessionIds: { ...s.launchingSessionIds, [sessionId]: true },
+          sessions: {
+            ...s.sessions,
+            [sessionId]: {
+              ...current,
+              activeTurn: true,
+              openTurnId: current.openTurnId ?? newId('turn'),
+              lastError: null
+            }
+          }
+        }
+      }
+      const userMessage: ChatMessage = {
+        id: newId('msg'),
+        role: 'user',
+        blocks,
+        streaming: false,
+        timestamp: Date.now(),
+        seq: nextSeq()
+      }
+      return {
+        messages: {
+          ...s.messages,
+          [sessionId]: [...(s.messages[sessionId] ?? []), userMessage]
+        },
+        sessions: {
+          ...s.sessions,
+          [sessionId]: {
+            ...current,
+            activeTurn: true,
+            openTurnId: newId('turn'),
+            lastError: null
+          }
+        },
+        launchingSessionIds: { ...s.launchingSessionIds, [sessionId]: true }
+      }
+    })
+  },
+
+  clearLaunchingSession: (sessionId) => {
+    set((s) => {
+      if (!s.launchingSessionIds[sessionId]) return s
+      const launchingSessionIds = { ...s.launchingSessionIds }
+      delete launchingSessionIds[sessionId]
+      return { launchingSessionIds }
+    })
+  },
+
+  applyPendingLauncherOptions: async (sessionId, pending) => {
+    if (!pending) return
+    const session = get().sessions[sessionId]
+    if (!session || session.status === 'closed') return
+    if (pending.modeId) {
+      await get().setMode(sessionId, pending.modeId)
+    }
+    if (pending.modelId) {
+      const hasNative =
+        session.models?.availableModels.some((m) => m.modelId === pending.modelId) ?? false
+      if (hasNative) {
+        await get().setModel(sessionId, pending.modelId)
+      } else {
+        const modelOpt = session.configOptions.find((o) => o.category === 'model')
+        if (modelOpt) {
+          await get().setConfigOption(sessionId, modelOpt.id, pending.modelId)
+        }
+      }
+    }
+    for (const [configId, valueId] of Object.entries(pending.configValues)) {
+      await get().setConfigOption(sessionId, configId, valueId)
+    }
+  },
+
+  finalizeChatLaunch: async ({
+    placeholderId,
+    configId,
+    cwd,
+    projectId,
+    mcpServers,
+    pending,
+    initialText,
+    initialBlocks,
+    adoptSession
+  }) => {
+    try {
+      const sessionId = await get().startChat(configId, cwd, mcpServers, projectId)
+
+      // Move optimistic UI onto the real session, then remap the tab before send
+      // so the user stays on one chat (never a blank disconnected placeholder).
+      const hadOptimisticUser = (get().messages[placeholderId] ?? []).some((m) => m.role === 'user')
+      if (sessionId !== placeholderId) {
+        set((s) => {
+          const placeholder = s.sessions[placeholderId]
+          const real = s.sessions[sessionId]
+          if (!real) return s
+          const placeholderMessages = s.messages[placeholderId] ?? []
+          const realMessages = s.messages[sessionId] ?? []
+          const messages = { ...s.messages }
+          const sessions = { ...s.sessions }
+          const launchingSessionIds = { ...s.launchingSessionIds }
+          messages[sessionId] = realMessages.length > 0 ? realMessages : placeholderMessages
+          if (placeholder) {
+            sessions[sessionId] = {
+              ...real,
+              activeTurn: placeholder.activeTurn || real.activeTurn,
+              openTurnId: real.openTurnId ?? placeholder.openTurnId,
+              title: real.title ?? placeholder.title,
+              modes: real.modes ?? placeholder.modes,
+              models: real.models ?? placeholder.models,
+              configOptions:
+                real.configOptions.length > 0
+                  ? real.configOptions
+                  : (placeholder.configOptions ?? [])
+            }
+          }
+          delete sessions[placeholderId]
+          delete messages[placeholderId]
+          delete launchingSessionIds[placeholderId]
+          return {
+            sessions,
+            messages,
+            launchingSessionIds,
+            activeSessionId: s.activeSessionId === placeholderId ? sessionId : s.activeSessionId
+          }
+        })
+        adoptSession?.(placeholderId, sessionId)
+      } else {
+        set((s) => {
+          if (!s.launchingSessionIds[placeholderId]) return s
+          const launchingSessionIds = { ...s.launchingSessionIds }
+          delete launchingSessionIds[placeholderId]
+          return { launchingSessionIds }
+        })
+      }
+
+      await get().applyPendingLauncherOptions(sessionId, pending)
+
+      const blocks =
+        initialBlocks && initialBlocks.length > 0
+          ? initialBlocks
+          : initialText && initialText.trim().length > 0
+            ? ([{ type: 'text', text: initialText }] as ContentBlock[])
+            : null
+      if (blocks) {
+        await runPromptTurn(
+          set,
+          get,
+          sessionId,
+          blocks,
+          (session) => {
+            const only = blocks.length === 1 ? blocks[0] : null
+            if (only?.type === 'text' && typeof only.text === 'string') {
+              return acpApi.sendPrompt(session.agentId, sessionId, only.text)
+            }
+            return acpApi.sendPromptBlocks(session.agentId, sessionId, blocks)
+          },
+          undefined,
+          { skipUserAppend: hadOptimisticUser }
+        )
+      }
+      return sessionId
+    } catch (err) {
+      set((s) => {
+        const targetId = s.sessions[placeholderId]
+          ? placeholderId
+          : (s.activeSessionId ?? placeholderId)
+        const target = s.sessions[targetId]
+        if (!target) return s
+        return {
+          sessions: {
+            ...s.sessions,
+            [targetId]: {
+              ...target,
+              status: 'error',
+              activeTurn: false,
+              openTurnId: null,
+              lastError: err instanceof Error ? err.message : String(err)
+            }
+          },
+          launchingSessionIds: dropRecordKey(
+            dropRecordKey(s.launchingSessionIds, placeholderId),
+            targetId
+          )
+        }
+      })
+      throw err
+    }
   },
 
   setSelectedAgentConfigId: (configId) => set({ selectedAgentConfigId: configId }),
@@ -2069,9 +2663,15 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       acpApi.sendPrompt(session.agentId, sessionId, text)
     ),
 
-  sendPromptBlocks: (sessionId, blocks) =>
-    runPromptTurn(set, get, sessionId, blocks, (session) =>
-      acpApi.sendPromptBlocks(session.agentId, sessionId, blocks)
+  sendPromptBlocks: (sessionId, blocks, options) =>
+    runPromptTurn(
+      set,
+      get,
+      sessionId,
+      blocks,
+      (session) => acpApi.sendPromptBlocks(session.agentId, sessionId, blocks),
+      undefined,
+      options
     ),
 
   cancelPrompt: async (sessionId) => {
@@ -2142,6 +2742,10 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     set((s) => ({
       sessions: { ...s.sessions, [sessionId]: { ...s.sessions[sessionId], configOptions: updated } }
     }))
+    const agentConfigId = configIdForAgentId(get(), session.agentId)
+    if (agentConfigId) {
+      writeAgentOptionsCache(set, agentConfigId, { configOptions: updated })
+    }
   },
 
   setMode: async (sessionId, modeId) => {
@@ -2161,6 +2765,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       }
     })
+    cacheOptionsFromSession(set, get, sessionId)
   },
 
   setModel: async (sessionId, modelId) => {
@@ -2180,6 +2785,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       }
     })
+    cacheOptionsFromSession(set, get, sessionId)
   },
 
   respondPermission: async (requestId, optionId) => {
@@ -2212,7 +2818,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       }
     })),
 
-  _onSessionCreated: (e) =>
+  _onSessionCreated: (e) => {
     set((s) => {
       if (s.sessions[e.sessionId]) {
         // already created via createSession(); enrich with capability data
@@ -2250,7 +2856,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         },
         messages: { ...s.messages, [e.sessionId]: s.messages[e.sessionId] ?? [] }
       }
-    }),
+    })
+    cacheOptionsFromSession(set, get, e.sessionId)
+  },
 
   _onMessageChunk: (e) =>
     set((s) => {
@@ -2370,7 +2978,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       return { commands: { ...s.commands, [e.sessionId]: e.availableCommands ?? [] } }
     }),
 
-  _onModeUpdate: (e) =>
+  _onModeUpdate: (e) => {
     set((s) => {
       const session = s.sessions[e.sessionId]
       if (!session) return {}
@@ -2387,16 +2995,20 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           }
         }
       }
-    }),
+    })
+    cacheOptionsFromSession(set, get, e.sessionId)
+  },
 
-  _onConfigOptionsUpdate: (e) =>
+  _onConfigOptionsUpdate: (e) => {
     set((s) => {
       const session = s.sessions[e.sessionId]
       if (!session) return {}
       return {
         sessions: { ...s.sessions, [e.sessionId]: { ...session, configOptions: e.configOptions } }
       }
-    }),
+    })
+    cacheOptionsFromSession(set, get, e.sessionId)
+  },
 
   _onSessionInfoUpdate: (e) => {
     // `title` is `undefined` when the field is absent (no change), `null` when
@@ -2502,7 +3114,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   _onAgentError: (e) => {
     set((s) => {
       const agentStatus = { ...s.agentStatus, [e.agentId]: 'error' as AgentStatus }
-      if (e.sessionId && s.sessions[e.sessionId]) {
+      if (e.sessionId && s.sessions[e.sessionId] && s.sessions[e.sessionId].status !== 'closed') {
         return {
           agentStatus,
           // Finalize streaming markers: the turn is over (errored), and the
@@ -2512,6 +3124,12 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             ...s.sessions,
             [e.sessionId]: {
               ...s.sessions[e.sessionId],
+              // Story 1.9 NFR7: a turn-scoped error (incl. the bounded turn
+              // timeout) sets `status: 'error'` so the UI shows the Error state
+              // (the agent may be wedged — the user should see an error, not
+              // a perpetually-active turn). The `_onAgentDisconnected` reducer
+              // now preserves the 'error' status (it skips 'error' sessions).
+              status: 'error' as SessionStatus,
               lastError: e.message,
               activeTurn: false,
               openTurnId: null
@@ -2544,6 +3162,56 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
   },
 
+  // Story 1.9 FR26: the agent subprocess crashed mid-turn. Mirrors
+  // `_onAgentError` (sets `agentStatus[agentId]='error'`, finalizes streaming,
+  // sets `lastError`, persists) but is the typed crash event emitted BEFORE
+  // `agent_error` + `agent_disconnected`. The UI shows a manual-restart action
+  // (no silent respawn, honoring ADR-003).
+  _onAgentCrashed: (e) => {
+    set((s) => {
+      const agentStatus = { ...s.agentStatus, [e.agentId]: 'error' as AgentStatus }
+      // Story 1.9 review: don't resurrect a closed session to 'error' (a late
+      // crash event for an already-closed session should not overwrite its
+      // terminal status).
+      if (e.sessionId && s.sessions[e.sessionId] && s.sessions[e.sessionId].status !== 'closed') {
+        return {
+          agentStatus,
+          messages: finalizeStreaming(s.messages, e.sessionId),
+          sessions: {
+            ...s.sessions,
+            [e.sessionId]: {
+              ...s.sessions[e.sessionId],
+              status: 'error' as SessionStatus,
+              lastError: e.message,
+              activeTurn: false,
+              openTurnId: null
+            }
+          }
+        }
+      }
+      const sessions = { ...s.sessions }
+      for (const id of Object.keys(sessions)) {
+        if (sessions[id].agentId === e.agentId && sessions[id].status !== 'closed') {
+          sessions[id] = {
+            ...sessions[id],
+            status: 'error' as SessionStatus,
+            lastError: e.message,
+            activeTurn: false,
+            openTurnId: null
+          }
+        }
+      }
+      return { agentStatus, sessions }
+    })
+    if (
+      e.sessionId &&
+      get().sessions[e.sessionId] &&
+      get().sessionIndex.some((entry) => entry.id === e.sessionId)
+    ) {
+      persistSession(get(), e.sessionId, (entries) => set({ sessionIndex: entries }))
+    }
+  },
+
   _onAgentDisconnected: (e) => {
     const affected: SessionId[] = []
     const dropTranscriptIds: SessionId[] = []
@@ -2559,7 +3227,11 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             delete sessions[id]
             ephemeralSessionIds.delete(id)
             dropTranscriptIds.push(id)
-          } else {
+          } else if (sessions[id].status !== 'error') {
+            // Story 1.9 review: a session already in 'error' status (set by the
+            // preceding _onAgentCrashed event) must NOT be overwritten to 'closed'
+            // — the crash's distinguishing Error state must survive the always-
+            // following disconnect event so the UI can show a manual-restart action.
             sessions[id] = {
               ...sessions[id],
               status: 'closed',
@@ -2726,6 +3398,10 @@ export function initAcpEventListeners(): () => void {
     acpApi.onEvent<PromptCompleteEvent>(ACP_EVENTS.promptComplete, (e) =>
       useAcpStore.getState()._onPromptComplete(e)
     ),
+    acpApi.onEvent<AgentCrashedEvent>(ACP_EVENTS.agentCrashed, (e) => {
+      useAcpStore.getState()._onAgentCrashed(e)
+      toast.error(e.message || 'Agent crashed')
+    }),
     acpApi.onEvent<AgentErrorEvent>(ACP_EVENTS.agentError, (e) => {
       useAcpStore.getState()._onAgentError(e)
       toast.error(e.message || 'Agent error')

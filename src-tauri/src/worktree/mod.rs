@@ -1187,10 +1187,7 @@ impl WorktreeManager {
 
         // Deduplicate suggestions by (strategy, reason) key
         let mut seen = std::collections::HashSet::new();
-        suggestions.retain(|s| {
-            let key = (s.strategy.as_str(), s.reason.as_str());
-            seen.insert(key)
-        });
+        suggestions.retain(|s| seen.insert((s.strategy.clone(), s.reason.clone())));
 
         // If no auto-resolution suggestions, provide manual guidance
         if suggestions.is_empty() {
@@ -1315,8 +1312,9 @@ impl WorktreeManager {
 struct ConflictBlock {
     ours: String,
     theirs: String,
+    /// Diff3 common-ancestor section when present; reserved for future suggestions.
+    #[allow(dead_code)]
     base: String,
-}
 }
 
 /// Get an ISO 8601 timestamp string for the current time.
