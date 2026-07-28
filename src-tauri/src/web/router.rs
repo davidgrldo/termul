@@ -18,6 +18,8 @@ use axum::{
 
 use crate::acp::AcpManager;
 use crate::web::fs_api;
+use crate::web::project_registry::ProjectRegistry;
+use crate::web::projects_api;
 use crate::web::sink::WsRelaySink;
 use crate::web::ws::{ws_upgrade, AppState};
 
@@ -39,11 +41,16 @@ use super::assets;
 pub fn router(
     acp: Arc<AcpManager>,
     ws_relay: Arc<WsRelaySink>,
+    registry: Arc<ProjectRegistry>,
     project_root: PathBuf,
 ) -> Router {
     let mut r = Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(ws_upgrade))
+        // Project list mirror (Epic-4 bridge): the web client reads the
+        // desktop's non-archived + archived projects here. Registered AHEAD of
+        // the static fallback so the SPA mount cannot shadow it.
+        .route("/projects", get(projects_api::list))
         // Project-creation fs/git/shell routes (Story: Web/remote project
         // creation). Registered AHEAD of the static fallback so `/health` +
         // `/ws` keep priority and the SPA fallback cannot shadow them.
@@ -64,6 +71,7 @@ pub fn router(
     r.with_state(AppState {
         acp,
         relay: ws_relay,
+        registry,
         project_root: Arc::new(project_root),
     })
 }
@@ -72,12 +80,14 @@ pub fn router(
 pub fn router_with_static(
     acp: Arc<AcpManager>,
     ws_relay: Arc<WsRelaySink>,
+    registry: Arc<ProjectRegistry>,
     static_dir: &Path,
     project_root: PathBuf,
 ) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(ws_upgrade))
+        .route("/projects", get(projects_api::list))
         .route("/fs/mkdir", post(fs_api::mkdir))
         .route("/fs/write", post(fs_api::write))
         .route("/fs/ls", get(fs_api::ls))
@@ -88,6 +98,7 @@ pub fn router_with_static(
         .with_state(AppState {
             acp,
             relay: ws_relay,
+            registry,
             project_root: Arc::new(project_root),
         })
 }
@@ -142,6 +153,7 @@ mod tests {
         router_with_static(
             Arc::new(AcpManager::new(vec![])),
             Arc::new(WsRelaySink::new()),
+            Arc::new(crate::web::project_registry::ProjectRegistry::new()),
             dir,
             std::env::temp_dir(),
         )

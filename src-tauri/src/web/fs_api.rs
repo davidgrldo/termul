@@ -338,8 +338,8 @@ fn check_within_root(
         let resolved_str = resolved.to_string_lossy();
         let root_str = canonical_root.to_string_lossy();
         (
-            PathBuf::from(strip_verbatim_prefix(resolved_str.as_ref()).into_owned()),
-            PathBuf::from(strip_verbatim_prefix(root_str.as_ref()).into_owned()),
+            PathBuf::from(crate::strip_verbatim_prefix(resolved_str.as_ref()).into_owned()),
+            PathBuf::from(crate::strip_verbatim_prefix(root_str.as_ref()).into_owned()),
         )
     };
     #[cfg(not(windows))]
@@ -597,8 +597,8 @@ pub async fn shells(State(_state): State<AppState>) -> impl IntoResponse {
 /// still included with conservative defaults (`size: 0`, `modified_at: 0`),
 /// matching the desktop path (`tauri-filesystem-api.ts:206-218`) which stats
 /// per-entry with try/catch and keeps the entry on stat failure.
-fn list_dir(path: &str) -> std::io::Result<Vec<DirectoryEntryDto>> {
-    let dir = Path::new(path);
+fn list_dir(path: &Path) -> std::io::Result<Vec<DirectoryEntryDto>> {
+    let dir = path;
     let read = fs::read_dir(dir)?;
     let mut entries: Vec<DirectoryEntryDto> = Vec::new();
     let parent_buf = dir.to_path_buf();
@@ -657,6 +657,7 @@ mod tests {
     use super::*;
     use crate::acp::AcpManager;
     use crate::web::sink::WsRelaySink;
+    use crate::web::project_registry::ProjectRegistry;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use std::path::PathBuf;
@@ -709,6 +710,7 @@ mod tests {
         AppState {
             acp: Arc::new(AcpManager::new(vec![])),
             relay: Arc::new(WsRelaySink::new()),
+            registry: Arc::new(ProjectRegistry::new()),
             project_root: Arc::new(
                 root.canonicalize()
                     .unwrap_or_else(|_| root.to_path_buf()),

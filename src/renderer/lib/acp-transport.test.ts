@@ -29,6 +29,8 @@ class FakeWebSocket {
   /** When true, `send_prompt` emits streaming message_chunk + prompt_complete
    * events (echoing the client turnId) — used by the AC3 chat-flow test. */
   streamOnSendPrompt = false
+  /** When true, do not auto-reply to `send_prompt` (for timeout tests). */
+  holdSendPrompt = false
   /** Live agent ids for spawn_agent / list_agents / kill_agent stubs. */
   liveAgents = new Set<string>()
 
@@ -88,6 +90,7 @@ class FakeWebSocket {
       return
     }
     if (req.type === 'send_prompt') {
+      if (this.holdSendPrompt) return
       // Story 1.8 AC3 chat-flow test: stream message_chunk events + a
       // prompt_complete (echoing the client turnId) so the transport's event
       // subscribers + seenTurnIds dedup are exercised end-to-end.
@@ -234,6 +237,26 @@ describe('WsAcpTransport', () => {
         allowTerminal: false
       })
     ).rejects.toBeInstanceOf(AcpTransportError)
+
+    transport.dispose()
+  })
+
+  it('switchProject sends a switch_project request with { projectId }', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    // FakeWebSocket replies `not_implemented` for unknown request types — the
+    // point here is the request frame shape (type + payload), not the reply.
+    await expect(transport.switchProject('p-2')).rejects.toBeInstanceOf(AcpTransportError)
+
+    const sent = sock.sent.map((s) => JSON.parse(s) as { type: string; payload: unknown })
+    const switchReq = sent.find((r) => r.type === 'switch_project')
+    expect(switchReq).toBeTruthy()
+    expect(switchReq?.payload).toEqual({ projectId: 'p-2' })
 
     transport.dispose()
   })
@@ -603,6 +626,181 @@ describe('WsAcpTransport', () => {
     expect(first.dispose).toHaveBeenCalledOnce()
     _resetAcpTransportForTests(null)
     expect(second.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('keeps send_prompt pending past the 60s default (matches server turn budget)', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.holdSendPrompt = true
+
+    const pending = transport.sendPrompt('a1', 's1', 'long turn')
+    let settled: unknown
+    void pending.then(
+      (v) => {
+        settled = { ok: v }
+      },
+      (err) => {
+        settled = { err }
+      }
+    )
+
+    // Still well under the 10-minute turn budget — must not time out at 60s.
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(settled).toBeUndefined()
+
+    await vi.advanceTimersByTimeAsync(540_000) // total 600s — server turn budget elapsed
+    // Client budget = server budget + grace, so the generic timeout must NOT
+    // fire yet (the server's typed `turn timeout` reply should win the race).
+    expect(settled).toBeUndefined()
+
+    await vi.advanceTimersByTimeAsync(10_000) // total 610s — client grace fires
+    await Promise.resolve()
+    expect(settled).toMatchObject({
+      err: expect.objectContaining({
+        name: 'AcpTransportError',
+        code: 'timeout',
+        message: 'Request send_prompt timed out'
+      })
+    })
+    transport.dispose()
+    vi.useRealTimers()
+  })
+
+  it('still times out quick commands at 60s', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    const origSend = sock.send.bind(sock)
+    sock.send = (data: string) => {
+      const req = JSON.parse(data) as { type: string }
+      if (req.type === 'set_mode') return // hold — no reply
+      origSend(data)
+    }
+
+    try {
+      const pending = transport.setMode('a1', 's1', 'agent')
+      let settled: unknown
+      void pending.then(
+        (v) => {
+          settled = { ok: v }
+        },
+        (err) => {
+          settled = { err }
+        }
+      )
+
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(settled).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(1)
+      await Promise.resolve()
+      expect(settled).toMatchObject({
+        err: expect.objectContaining({
+          code: 'timeout',
+          message: 'Request set_mode timed out'
+        })
+      })
+    } finally {
+      sock.send = origSend // restore the monkeypatched socket method
+    }
+    transport.dispose()
+    vi.useRealTimers()
+  })
+})
+
+// Story 5.3 (AC3, T6) — transport-level reconnect listener.
+// Verifies the `setReconnectListener` callback fires `true` on
+// `scheduleReconnect` (WS drop) and `false` on `reconnect` success.
+describe('WsAcpTransport reconnect listener (Story 5.3)', () => {
+  afterEach(() => {
+    _resetAcpTransportForTests(null)
+  })
+
+  it('fires onReconnectStateChange(true) when the socket closes (drop detected)', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const states: boolean[] = []
+    transport.setReconnectListener((reconnecting) => states.push(reconnecting))
+
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.close()
+
+    // `scheduleReconnect` runs synchronously inside `ws.onclose` — the
+    // listener should fire `true` immediately.
+    expect(states).toContain(true)
+
+    // Cleanup: clear the reconnect timer so it doesn't fire after the test.
+    const timerField = transport as unknown as {
+      reconnectTimer: ReturnType<typeof setTimeout> | null
+    }
+    if (timerField.reconnectTimer) {
+      clearTimeout(timerField.reconnectTimer)
+      timerField.reconnectTimer = null
+    }
+    transport.dispose()
+    vi.useRealTimers()
+  })
+
+  it('fires onReconnectStateChange(false) after a successful reconnect', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const states: boolean[] = []
+    transport.setReconnectListener((reconnecting) => states.push(reconnecting))
+
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.close()
+    // Drop detected → true
+    expect(states[0]).toBe(true)
+
+    // Advance past the reconnect backoff (RECONNECT_BASE_MS=500, first
+    // attempt: 500ms). The `reconnect()` method re-opens the socket and
+    // re-subscribes sessions; on success it fires `false`.
+    await vi.advanceTimersByTimeAsync(600)
+    await Promise.resolve() // flush microtasks (reconnect's await chain)
+
+    // Reconnect succeeded → false fired. The FakeWebSocket auto-opens on
+    // construction, so `connect()` resolves immediately.
+    expect(states).toContain(false)
+    expect(states[states.length - 1]).toBe(false)
+
+    const timerField = transport as unknown as {
+      reconnectTimer: ReturnType<typeof setTimeout> | null
+    }
+    if (timerField.reconnectTimer) {
+      clearTimeout(timerField.reconnectTimer)
+      timerField.reconnectTimer = null
+    }
+    transport.dispose()
+    vi.useRealTimers()
+  })
+
+  it('does not fire the listener on the initial connect()', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    const states: boolean[] = []
+    transport.setReconnectListener((reconnecting) => states.push(reconnecting))
+    await transport.connect()
+    // Initial connect must NOT fire the listener — only reconnect transitions.
+    expect(states).toEqual([])
+    transport.dispose()
   })
 })
 

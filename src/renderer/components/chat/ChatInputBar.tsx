@@ -17,6 +17,8 @@ import {
   useAgentSkills
 } from '@/hooks/use-agent-skills'
 import { useMentionRecents } from '@/hooks/use-mention-recents'
+import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
+import { useOskViewport } from '@/hooks/use-osk-viewport'
 import type {
   AvailableCommand,
   ContentBlock,
@@ -37,6 +39,7 @@ import {
   partitionConfigOptions,
   resolveModelOption
 } from './chat-input-bar-config'
+import { CHAT_GUTTER_X, useComposerToolbarMode } from './chat-layout'
 import { iconPop } from './chat-motion'
 import { FileMentionMenu } from './FileMentionMenu'
 import { LoadedSkillChip } from './LoadedSkillChip'
@@ -144,6 +147,15 @@ export function ChatInputBar({
   const [dragActive, setDragActive] = useState(false)
   const dragDepth = useRef(0)
   const reduced = useReducedMotion() ?? false
+  // Story 5.3: OSK awareness on mobile web. On Tauri desktop, the hook returns
+  // a no-OSK default (no `visualViewport` thrash — desktop non-regression).
+  const osk = useOskViewport()
+  const isMobileShell = useMobileWebShell()
+  // OSK-open transition: scroll the textarea into view exactly once per
+  // OSK-open window. The OSK state can lag the focus event (focus fires
+  // before `osk.isOskOpen` flips true), so a closed→open transition effect
+  // is more reliable than reading `osk.isOskOpen` in onFocus.
+  const prevOskOpenRef = useRef(false)
   const {
     attachments,
     addFiles,
@@ -156,6 +168,8 @@ export function ChatInputBar({
     canPick,
     canDropPaste
   } = useComposerAttachments({ imageCapable, embedCapable, disabled })
+  const rootRef = useRef<HTMLDivElement>(null)
+  const toolbarMode = useComposerToolbarMode(rootRef)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const slashMenuRef = useRef<SlashMenuHandle>(null)
   const { recents: mentionRecents, pushRecent: pushMentionRecent } = useMentionRecents(
@@ -372,8 +386,64 @@ export function ChatInputBar({
     })
   }, [seedNonce, updateMentions, clampHeight])
 
+  // Story 5.3 (T2.3): on mobile web, scroll the textarea into view once per
+  // OSK-open window so iOS Safari doesn't leave the input under the keyboard.
+  // Moved from onFocus (where `osk.isOskOpen` may still be false at focus
+  // time) to a closed→open transition effect — mirrors AgentChatPanel. rAF-
+  // deferred to let layout settle; fires once per OSK-open window.
+  useEffect(() => {
+    const wasOpen = prevOskOpenRef.current
+    prevOskOpenRef.current = osk.isOskOpen
+    if (!wasOpen && osk.isOskOpen && isMobileShell) {
+      const el = textareaRef.current
+      if (el) {
+        requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }))
+      }
+    }
+  }, [osk.isOskOpen, isMobileShell])
+
+  const modelChip = modelOption ? (
+    <ConfigChip
+      key={modelOption.id}
+      option={modelOption}
+      disabled={disabled}
+      searchable
+      maxVisibleOptions={5}
+      onSelect={(valueId) =>
+        modelSource === 'models' ? onSetModel(valueId) : onSetConfig(modelOption.id, valueId)
+      }
+    />
+  ) : null
+
+  const thoughtChip = thoughtLevel ? (
+    <ConfigChip
+      key={thoughtLevel.id}
+      option={thoughtLevel}
+      disabled={disabled}
+      promoted
+      onSelect={(valueId) => onSetConfig(thoughtLevel.id, valueId)}
+    />
+  ) : null
+
+  const genericChips = hasConfigOptions
+    ? visibleGenericConfigOptions.map((option) => (
+        <ConfigChip
+          key={option.id}
+          option={option}
+          disabled={disabled}
+          onSelect={(valueId) => onSetConfig(option.id, valueId)}
+        />
+      ))
+    : null
+
+  const agentModeChip = (
+    <ModeChip session={session} disabled={disabled} onSelect={onSetMode} label="Agent" />
+  )
+
+  const mcpBadge = <McpBadge count={mcpCount} />
+
   return (
-    <div className="px-5 pb-3.5 pt-3">
+    <div ref={rootRef} className={cn(CHAT_GUTTER_X, 'pb-3.5 pt-3')}>
       <div className="relative mx-auto w-full max-w-3xl">
         {queue.length > 0 && onRemoveQueued && onSendQueuedNow && (
           <PromptQueuePanel items={queue} onRemove={onRemoveQueued} onSendNow={onSendQueuedNow} />
@@ -434,8 +504,24 @@ export function ChatInputBar({
                 onKeyUp={onKeyUp}
                 onSelect={onSelect}
                 onPaste={handlePaste}
-                onFocus={() => setFocused(true)}
+                // Story 5.3 (T2.3): on mobile web when the OSK is open, scroll
+                // the textarea into view once per OSK-open window so iOS Safari
+                // doesn't leave the input under the keyboard. rAF-deferred to
+                // let layout settle. Guarded against focus-loop thrash (the OSK
+                // can re-focus the textarea as it animates; only the first
+                // focus per OSK-open window triggers the scroll).
+                onFocus={() => {
+                  setFocused(true)
+                  // OSK-open scroll is handled by the `osk.isOskOpen`
+                  // transition effect above (the OSK state can lag the focus
+                  // event, so reading it here was unreliable).
+                }}
                 onBlur={() => setFocused(false)}
+                // Story 5.3 (T2.4): mobile keyboards show a "send" affordance.
+                // Do NOT change Enter keyboard semantics — handleKeyDown still
+                // routes Enter→send only when the slash menu is closed.
+                inputMode="text"
+                enterKeyHint="send"
                 disabled={disabled || sending}
                 rows={1}
                 placeholder={
@@ -452,52 +538,63 @@ export function ChatInputBar({
                 )}
               />
             </div>
-            <div className="flex items-center justify-between gap-3 px-2.5 pb-2.5">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                {modelOption && (
-                  <ConfigChip
-                    key={modelOption.id}
-                    option={modelOption}
-                    disabled={disabled}
-                    searchable
-                    maxVisibleOptions={5}
-                    onSelect={(valueId) =>
-                      modelSource === 'models'
-                        ? onSetModel(valueId)
-                        : onSetConfig(modelOption.id, valueId)
-                    }
-                  />
+            <div
+              className="flex items-center justify-between gap-3 px-2.5 pb-2.5"
+              data-composer-toolbar={toolbarMode}
+            >
+              {toolbarMode === 'narrow' ? (
+                (() => {
+                  // Use the underlying availability conditions, not JSX-element
+                  // truthiness — a chip element is always truthy even when it
+                  // renders null internally, which made this empty-row guard
+                  // unreachable in narrow mode.
+                  const agentModesAvailable =
+                    session.modes != null && session.modes.availableModes.length > 0
+                  const hasRow1 = agentModesAvailable || Boolean(modelChip)
+                  const hasRow2 = hasConfigOptions || mcpCount > 0
+                  if (!hasRow1 && !hasRow2) return null
+                  return (
+                    <div className="flex min-w-0 flex-1 flex-col gap-2">
+                      {hasRow1 && (
+                        <div
+                          className="flex min-w-0 flex-wrap items-center gap-2"
+                          data-composer-toolbar-row="1"
+                        >
+                          {agentModeChip}
+                          {modelChip}
+                        </div>
+                      )}
+                      {hasRow2 && (
+                        <div
+                          className="flex min-w-0 flex-wrap items-center gap-2"
+                          data-composer-toolbar-row="2"
+                        >
+                          {thoughtChip}
+                          {genericChips}
+                          {mcpBadge}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()
+              ) : (
+                <div
+                  className="flex min-w-0 flex-wrap items-center gap-2"
+                  data-composer-toolbar-row="single"
+                >
+                  {modelChip}
+                  {thoughtChip}
+                  {genericChips}
+                  {agentModeChip}
+                  {mcpBadge}
+                </div>
+              )}
+              <div
+                className={cn(
+                  'flex shrink-0 items-center gap-2',
+                  toolbarMode === 'narrow' && 'self-end'
                 )}
-                {hasConfigOptions ? (
-                  <>
-                    {thoughtLevel && (
-                      <ConfigChip
-                        key={thoughtLevel.id}
-                        option={thoughtLevel}
-                        disabled={disabled}
-                        promoted
-                        onSelect={(valueId) => onSetConfig(thoughtLevel.id, valueId)}
-                      />
-                    )}
-                    {visibleGenericConfigOptions.map((option) => (
-                      <ConfigChip
-                        key={option.id}
-                        option={option}
-                        disabled={disabled}
-                        onSelect={(valueId) => onSetConfig(option.id, valueId)}
-                      />
-                    ))}
-                  </>
-                ) : null}
-                <ModeChip
-                  session={session}
-                  disabled={disabled}
-                  onSelect={onSetMode}
-                  label="Agent"
-                />
-                <McpBadge count={mcpCount} />
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
+              >
                 <ContextUsageIndicator usage={sessionUsage} messages={messages} />
                 {canPick && <AttachFilesButton onClick={() => void pickFiles()} />}
                 <div className="relative size-[34px] shrink-0 overflow-visible">

@@ -79,7 +79,8 @@ const FRESH = {
   commands: {},
   pendingPermissions: {},
   promptQueues: {},
-  suppressQueueFlush: {}
+  suppressQueueFlush: {},
+  transportReconnecting: false
 }
 
 /**
@@ -2318,6 +2319,31 @@ describe('acp-store', () => {
     expect(useAcpStore.getState().sessions['s-reopen'].status).toBe('active')
   })
 
+  it('spawnAgent keeps capabilities delivered by acp:agent_spawned during its own await', async () => {
+    // Real backend ordering: `acp:agent_spawned` (carrying capabilities) is
+    // emitted BEFORE `acp_spawn_agent` returns, so `_onAgentSpawned` runs while
+    // `spawnAgent` is still awaiting. Resetting the entry to
+    // `capabilities: null` here stranded `openHistorySession` in a capability
+    // wait whose event had already fired -> 3s timeout -> read-only 'local'.
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_spawn_agent') {
+        useAcpStore
+          .getState()
+          ._onAgentSpawned({ agentId: 'agent-caps', capabilities: { loadSession: true } })
+        return 'agent-caps'
+      }
+      throw new Error(`unexpected invoke command in spawn-capabilities test: ${cmd}`)
+    })
+
+    await useAcpStore.getState().spawnAgent({ name: 'Caps', command: 'caps', args: [], env: {} })
+
+    expect(useAcpStore.getState().agents['agent-caps']?.capabilities).toEqual({
+      loadSession: true
+    })
+    expect(useAcpStore.getState().agentStatus['agent-caps']).toBe('connected')
+    vi.mocked(invoke).mockReset()
+  })
+
   it('openHistorySession waits for spawned-agent capabilities before resuming', async () => {
     // No prewarmed agent for cfg-spawn+/w -> ensureLiveAgent spawns one. Its
     // capabilities arrive asynchronously via _onAgentSpawned; the session must
@@ -2807,6 +2833,24 @@ describe('acp-store', () => {
       cwd: '/work',
       mcpServers: servers
     })
+  })
+
+  // Story 5.3 (AC3): transportReconnecting flag is additive state — verify
+  // it starts false and can be flipped via setState (the store init wires the
+  // WS transport listener to call setState; here we just verify the state
+  // shape and the setter contract, not the listener wiring which needs the
+  // real WsAcpTransport — covered in acp-transport.test.ts).
+  it('initializes transportReconnecting to false', () => {
+    expect(useAcpStore.getState().transportReconnecting).toBe(false)
+  })
+
+  it('flips transportReconnecting true/false via setState (additive, no AgentStatus change)', () => {
+    useAcpStore.setState({ transportReconnecting: true })
+    expect(useAcpStore.getState().transportReconnecting).toBe(true)
+    // AgentStatus enum is unchanged — transportReconnecting is a separate flag.
+    expect(useAcpStore.getState().agentStatus).toEqual({})
+    useAcpStore.setState({ transportReconnecting: false })
+    expect(useAcpStore.getState().transportReconnecting).toBe(false)
   })
 })
 

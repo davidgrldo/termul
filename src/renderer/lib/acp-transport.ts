@@ -83,11 +83,24 @@ export interface AcpTransport {
   respondPermission(agentId: AgentId, requestId: string, optionId?: string): Promise<void>
   /** Agent ACP auth (methodId) — NOT the WS relay token gate. */
   authenticate(agentId: AgentId, methodId: string): Promise<void>
+  /**
+   * Web/remote only (Epic-4 bridge): switch the shared session to a project's
+   * cwd. Returns the NEW session id at that cwd; the caller points its
+   * tab-focused session id at it + re-subscribes. Absent on the Tauri desktop
+   * transport (desktop switches via the project store).
+   */
+  switchProject?(projectId: string): Promise<{ sessionId: string }>
   onEvent<T>(eventName: string, callback: (payload: T) => void): () => void
   /** Web: open socket + placeholder authenticate. No-op on Tauri. */
   connect(): Promise<void>
   /** Web: subscribe to a session with cursor for reconnect/gap-fill. */
   subscribeSession?(sessionId: SessionId, lastSeq?: number | null, force?: boolean): Promise<void>
+  /**
+   * Story 5.3 (AC3): register a listener for transport-level reconnect state.
+   * Only on the WS transport — absent on Tauri IPC (desktop). The store
+   * checks for the method before calling it.
+   */
+  setReconnectListener?(listener: (reconnecting: boolean) => void): void
   dispose(): void
 }
 
@@ -205,8 +218,33 @@ export function resolveWsUrl(
 }
 
 const REQUEST_TIMEOUT_MS = 60_000
+/**
+ * Grace margin added on top of the server turn budget so the server's typed
+ * `turn timeout` reply wins the race instead of the client's generic timeout.
+ * Rust `CANCEL_GRACE` is 5s (`src-tauri/src/acp/manager.rs`), so 10s leaves
+ * headroom for that plus reply latency.
+ */
+const SEND_PROMPT_GRACE_MS = 10_000
+/**
+ * Timeout for `send_prompt`, which awaits the full agent turn on the server.
+ * Stays slightly above Rust `TURN_TIMEOUT` (600s / `TERMUL_ACP_TURN_TIMEOUT_SECS`)
+ * plus {@link SEND_PROMPT_GRACE_MS} so the server's specific `turn timeout`
+ * error reaches the client before this generic timeout fires. A 60s client
+ * budget caused `AcpTransportError: Request send_prompt timed out` on
+ * mobile/ngrok whenever a turn (tools, thinking, slow models) exceeded a
+ * minute — even while streaming events were still arriving.
+ *
+ * NOTE: if a deployment raises `TERMUL_ACP_TURN_TIMEOUT_SECS` above 600s,
+ * this constant must be raised to match (ideally the server would publish its
+ * turn budget to the client — tracked separately).
+ */
+const SEND_PROMPT_TIMEOUT_MS = 600_000 + SEND_PROMPT_GRACE_MS
 const RECONNECT_BASE_MS = 500
 const RECONNECT_MAX_MS = 8_000
+
+function requestTimeoutMs(type: WsRequestType): number {
+  return type === 'send_prompt' ? SEND_PROMPT_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+}
 
 type Pending = {
   resolve: (value: unknown) => void
@@ -241,11 +279,30 @@ export class WsAcpTransport implements AcpTransport {
   private readonly seenTurnIds = new Set<string>()
   private readonly wsUrl: string
   private readonly webSocketCtor: typeof WebSocket
+  /**
+   * Story 5.3 (AC3): transport-level reconnect listener. Fired `true` when
+   * `scheduleReconnect` runs (WS drop detected) and `false` when `reconnect`
+   * succeeds (socket re-opened + sessions re-subscribed). The store subscribes
+   * to flip its `transportReconnecting` flag, which drives the non-blocking
+   * `AgentConnectionLamp` overlay in `AgentChatPanel`. Desktop Tauri never
+   * uses the WS transport, so the listener stays unset there.
+   */
+  private onReconnectStateChange?: (reconnecting: boolean) => void
 
   constructor(opts?: { url?: string; WebSocketImpl?: typeof WebSocket }) {
     this.wsUrl =
       opts?.url ?? (typeof window !== 'undefined' ? resolveWsUrl() : 'ws://127.0.0.1:8080/ws')
     this.webSocketCtor = opts?.WebSocketImpl ?? WebSocket
+  }
+
+  /**
+   * Story 5.3 (AC3): register a listener for transport-level reconnect state.
+   * Fired `true` on WS drop (before the reconnect timer is set) and `false`
+   * on successful reconnect (after sessions are re-subscribed). Does NOT fire
+   * on the initial `connect()` — only on reconnect transitions.
+   */
+  setReconnectListener(listener: (reconnecting: boolean) => void): void {
+    this.onReconnectStateChange = listener
   }
 
   async connect(): Promise<void> {
@@ -366,6 +423,17 @@ export class WsAcpTransport implements AcpTransport {
       agentId,
       cwd,
       mcpServers
+    })
+    if (outcome?.sessionId) {
+      await this.subscribeSession(outcome.sessionId, null)
+    }
+    return outcome
+  }
+
+  /** Web/remote (Epic-4 bridge): `switch_project` → new session at the project cwd. */
+  async switchProject(projectId: string): Promise<{ sessionId: string }> {
+    const outcome = await this.request<{ sessionId: string }>('switch_project', {
+      projectId
     })
     if (outcome?.sessionId) {
       await this.subscribeSession(outcome.sessionId, null)
@@ -532,6 +600,11 @@ export class WsAcpTransport implements AcpTransport {
     if (this.disposed || this.reconnectTimer) return
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS)
     this.reconnectAttempt += 1
+    // Story 5.3 (AC3): fire the reconnect listener BEFORE setting the timer so
+    // the store can flip `transportReconnecting` immediately — the UI overlay
+    // should appear as soon as the WS drop is detected, not after the backoff
+    // delay. The listener is a no-op on Tauri desktop (never set).
+    this.onReconnectStateChange?.(true)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       void this.reconnect()
@@ -547,6 +620,10 @@ export class WsAcpTransport implements AcpTransport {
         // Force re-subscribe after reconnect; pass cursor when known.
         await this.subscribeSession(sid, last ?? null, true)
       }
+      // Story 5.3 (AC3): fire `false` AFTER the socket re-opens and all
+      // sessions are re-subscribed so the overlay stays visible for the
+      // full reconnect window (drop → backoff → reopen → resubscribe).
+      this.onReconnectStateChange?.(false)
     } catch (err) {
       console.error('[acp-transport] reconnect failed', err)
       this.scheduleReconnect()
@@ -710,7 +787,7 @@ export class WsAcpTransport implements AcpTransport {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new AcpTransportError('timeout', `Request ${type} timed out`))
-      }, REQUEST_TIMEOUT_MS)
+      }, requestTimeoutMs(type))
       this.pending.set(id, {
         resolve: (v) => resolve(v as T),
         reject,
