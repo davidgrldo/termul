@@ -39,7 +39,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # unstable is required for child/multi-webview support used by BrowserTabManager
-tauri = { version = "2.0", features = ["unstable", "devtools"] }
+tauri = { version = "2.0", features = ["unstable", "devtools", "tray-icon"] }
 tauri-plugin-os = "2"
 tauri-plugin-store = "2"
 tauri-plugin-fs = { version = "2", features = ["watch"] }
@@ -52,6 +52,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
@@ -145,7 +146,6 @@ ssh2 = "0.9"
 # don't require a system OpenSSL/Perl build toolchain.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust"] }
-
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
