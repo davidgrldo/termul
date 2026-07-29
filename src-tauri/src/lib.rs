@@ -122,7 +122,7 @@ fn resolve_executable_from_path(command: &str) -> Option<String> {
 }
 
 // Re-exports for commands
-pub use acp::AcpManager;
+pub use acp::{AcpManager, FileProjectRegistry, SessionPersistence};
 pub use pty::PtyManager;
 pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker};
 // Re-export only where `web::fs_api` uses the Windows-specific boundary

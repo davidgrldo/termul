@@ -22,6 +22,11 @@
  * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
+import type {
+  ProjectSwitchCompletedEvent,
+  ProjectSwitchFailedEvent,
+  SwitchProjectReply
+} from '@shared/types/web-projects.types'
 import { toast } from 'sonner'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
@@ -67,7 +72,8 @@ import {
   type ToolCall,
   type ToolCallEvent,
   type ToolCallUpdateEvent,
-  type UsageUpdateEvent
+  type UsageUpdateEvent,
+  type UserPromptEvent
 } from '@/lib/acp-api'
 import {
   deleteSessionPayload,
@@ -93,6 +99,8 @@ import { decideResume } from '@/lib/acp-resume-policy'
 import { getAcpTransport } from '@/lib/acp-transport'
 import { formatAcpSpawnError } from '@/lib/agents/acp-spawn-errors'
 import { deleteSessionTempFiles } from '@/lib/attachment-temp-cleanup'
+import { getTabFocusedSessionId, setTabFocusedSessionId } from '@/lib/web-tab-session'
+import { useProjectStore } from '@/stores/project-store'
 import {
   appendQueuedPrompt,
   buildRecoverPromptToQueuePatch,
@@ -149,6 +157,8 @@ export interface AcpSession {
   title: string | null
   /** True while a prompt turn is in flight (UI spinners, cancel). */
   activeTurn: boolean
+  /** Project-scoped MCP attachments active for this session when known. */
+  mcpServerCount?: number
   /**
    * Non-null while this session may still accept streamed chunks for the
    * current turn. Cleared on a deferred macrotask after completion so chunk
@@ -272,6 +282,8 @@ interface AcpState {
    * (which fires when `openHistorySession` is in flight — both can show).
    */
   transportReconnecting: boolean
+  /** Target project waiting for the current turn to finish, if any. */
+  queuedProjectSwitchId: string | null
 
   // Actions — lifecycle
   spawnAgent: (config: Parameters<typeof acpApi.spawnAgent>[0]) => Promise<AgentId>
@@ -285,6 +297,7 @@ interface AcpState {
   ) => Promise<SessionId>
   closeSession: (sessionId: SessionId) => Promise<void>
   setActiveSession: (sessionId: SessionId | null) => void
+  switchProject: (projectId: string) => Promise<SwitchProjectReply>
 
   // Actions — configured agents (P4)
   loadAgentConfigs: () => Promise<void>
@@ -426,6 +439,7 @@ interface AcpState {
   // Internal event reducers (exposed for tests)
   _onAgentSpawned: (e: AgentSpawnedEvent) => void
   _onSessionCreated: (e: SessionCreatedEvent) => void
+  _onUserPrompt: (e: UserPromptEvent) => void
   _onMessageChunk: (e: MessageChunkEvent) => void
   _onToolCall: (e: ToolCallEvent) => void
   _onToolCallUpdate: (e: ToolCallUpdateEvent) => void
@@ -1314,6 +1328,7 @@ function ensureLiveAgent(
   const spawnPromise = (async (): Promise<AgentId | null> => {
     try {
       const agentId = await get().spawnAgent({
+        configId,
         name: config.name,
         command: config.command,
         args: config.args,
@@ -1842,6 +1857,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   promptQueues: {},
   suppressQueueFlush: {},
   transportReconnecting: false,
+  queuedProjectSwitchId: null,
 
   spawnAgent: async (config) => {
     const tempKey = config.name
@@ -1932,6 +1948,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             status: existing?.status === 'closed' ? 'closed' : 'active',
             title: existing?.title ?? null,
             activeTurn: existing?.activeTurn ?? false,
+            mcpServerCount: mcpServers?.length ?? existing?.mcpServerCount ?? 0,
             openTurnId: existing?.openTurnId ?? null,
             modes: outcome.modes ?? existing?.modes ?? null,
             models: outcome.models ?? existing?.models ?? null,
@@ -1965,6 +1982,53 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       })
     }
     return sessionId
+  },
+
+  switchProject: async (projectId) => {
+    const transport = getAcpTransport()
+    if (!transport.switchProject) {
+      throw new Error('Project switching is only available in web/remote mode')
+    }
+    const focusedSessionId = getTabFocusedSessionId() ?? get().activeSessionId
+    const currentSession = focusedSessionId ? get().sessions[focusedSessionId] : null
+    const outcome = await transport.switchProject(projectId)
+    if (outcome.status === 'queued') {
+      set({ queuedProjectSwitchId: outcome.projectId })
+      return outcome
+    }
+    const agentId = currentSession?.agentId
+    if (!agentId) throw new Error('Completed project switch has no tracked agent')
+    set((s) => {
+      const existing = s.sessions[outcome.sessionId]
+      return {
+        queuedProjectSwitchId: null,
+        activeSessionId: outcome.sessionId,
+        sessions: {
+          ...s.sessions,
+          [outcome.sessionId]: {
+            id: outcome.sessionId,
+            agentId,
+            cwd: outcome.cwd,
+            projectId: outcome.projectId,
+            status: 'active',
+            title: existing?.title ?? currentSession.title,
+            activeTurn: false,
+            mcpServerCount: outcome.mcpServerCount,
+            openTurnId: null,
+            modes: existing?.modes ?? currentSession.modes,
+            models: existing?.models ?? currentSession.models ?? null,
+            configOptions: existing?.configOptions ?? currentSession.configOptions,
+            lastError: existing?.lastError ?? null,
+            createdAt: existing?.createdAt ?? Date.now(),
+            replaying: null
+          }
+        },
+        messages: { ...s.messages, [outcome.sessionId]: s.messages[outcome.sessionId] ?? [] }
+      }
+    })
+    setTabFocusedSessionId(outcome.sessionId)
+    useProjectStore.getState().selectProject(outcome.projectId)
+    return outcome
   },
 
   closeSession: async (sessionId) => {
@@ -3123,6 +3187,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             status: 'active',
             title: null,
             activeTurn: false,
+            mcpServerCount: 0,
             openTurnId: null,
             modes: e.modes ?? null,
             models: e.models ?? null,
@@ -3137,6 +3202,31 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })
     cacheOptionsFromSession(set, get, e.sessionId)
   },
+
+  _onUserPrompt: (e) =>
+    set((s) => {
+      const session = s.sessions[e.sessionId]
+      if (!session) return {}
+      const list = s.messages[e.sessionId] ?? []
+      const sameBlocks = (left: ContentBlock[], right: ContentBlock[]): boolean =>
+        JSON.stringify(left) === JSON.stringify(right)
+      const trailingUser = [...list].reverse().find((message) => message.role === 'user')
+      if (
+        (e.turnId && list.some((message) => message.id === `turn:${e.turnId}`)) ||
+        (trailingUser && sameBlocks(trailingUser.blocks, e.content))
+      ) {
+        return {}
+      }
+      const message: ChatMessage = {
+        id: e.turnId ? `turn:${e.turnId}` : newId('msg'),
+        role: 'user',
+        blocks: e.content,
+        streaming: false,
+        timestamp: Date.now(),
+        seq: nextSeq()
+      }
+      return { messages: { ...s.messages, [e.sessionId]: [...list, message] } }
+    }),
 
   _onMessageChunk: (e) =>
     set((s) => {
@@ -3650,12 +3740,61 @@ export function initAcpEventListeners(): () => void {
       useAcpStore.setState({ transportReconnecting: reconnecting })
     })
   }
+  const applyCompletedProjectSwitch = (event: ProjectSwitchCompletedEvent): void => {
+    const state = useAcpStore.getState()
+    const previous = state.sessions[event.previousSessionId]
+    if (!previous) return
+    useAcpStore.setState((s) => {
+      const existing = s.sessions[event.sessionId]
+      return {
+        queuedProjectSwitchId: null,
+        activeSessionId: event.sessionId,
+        sessions: {
+          ...s.sessions,
+          [event.sessionId]: {
+            id: event.sessionId,
+            agentId: previous.agentId,
+            cwd: event.cwd,
+            projectId: event.projectId,
+            status: 'active',
+            title: existing?.title ?? previous.title,
+            activeTurn: false,
+            mcpServerCount: event.mcpServerCount,
+            openTurnId: null,
+            modes: existing?.modes ?? previous.modes,
+            models: existing?.models ?? previous.models ?? null,
+            configOptions: existing?.configOptions ?? previous.configOptions,
+            lastError: existing?.lastError ?? null,
+            createdAt: existing?.createdAt ?? Date.now(),
+            replaying: null
+          }
+        },
+        messages: { ...s.messages, [event.sessionId]: s.messages[event.sessionId] ?? [] }
+      }
+    })
+    setTabFocusedSessionId(event.sessionId)
+    useProjectStore.getState().selectProject(event.projectId)
+  }
+  const applyFailedProjectSwitch = (event: ProjectSwitchFailedEvent): void => {
+    const state = useAcpStore.getState()
+    if (state.queuedProjectSwitchId !== event.projectId) return
+    useAcpStore.setState({ queuedProjectSwitchId: null })
+    toast.error(event.message || 'Project switch failed')
+  }
   teardown = [
+    transport.onEvent<ProjectSwitchCompletedEvent>(
+      'project_switch_completed',
+      applyCompletedProjectSwitch
+    ),
+    transport.onEvent<ProjectSwitchFailedEvent>('project_switch_failed', applyFailedProjectSwitch),
     acpApi.onEvent<AgentSpawnedEvent>(ACP_EVENTS.agentSpawned, (e) =>
       useAcpStore.getState()._onAgentSpawned(e)
     ),
     acpApi.onEvent<SessionCreatedEvent>(ACP_EVENTS.sessionCreated, (e) =>
       useAcpStore.getState()._onSessionCreated(e)
+    ),
+    acpApi.onEvent<UserPromptEvent>(ACP_EVENTS.userPrompt, (e) =>
+      useAcpStore.getState()._onUserPrompt(e)
     ),
     acpApi.onEvent<MessageChunkEvent>(ACP_EVENTS.messageChunk, (e) =>
       useAcpStore.getState()._onMessageChunk(e)

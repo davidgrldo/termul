@@ -221,6 +221,8 @@ export type McpServerConfig = McpStdioServer | McpHttpServer | McpSseServer
 export type McpServer = McpServerConfig
 
 export interface AgentConfig {
+  /** Stable configured-agent identity used for standalone durable history matching. */
+  configId?: string
   name: string
   command: string
   args: string[]
@@ -266,6 +268,13 @@ export interface SessionCreatedEvent {
   models?: SessionModelState | null
   configOptions?: SessionConfigOption[] | null
 }
+export interface UserPromptEvent {
+  agentId: AgentId
+  sessionId: SessionId
+  turnId?: string
+  content: ContentBlock[]
+}
+
 export interface MessageChunkEvent {
   agentId: AgentId
   sessionId: SessionId
@@ -373,6 +382,7 @@ export interface SessionUsage {
 export const ACP_EVENTS = {
   agentSpawned: 'acp:agent_spawned',
   sessionCreated: 'acp:session_created',
+  userPrompt: 'acp:user_prompt',
   messageChunk: 'acp:message_chunk',
   toolCall: 'acp:tool_call',
   toolCallUpdate: 'acp:tool_call_update',

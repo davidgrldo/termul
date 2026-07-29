@@ -26,12 +26,15 @@ pub mod ws;
 
 pub use config::ServerConfig;
 pub use permissions::PermissionRendezvous;
-pub use project_registry::{ProjectListPayload, ProjectRegistry, ProjectSummary, ProjectsChangedPayload};
-pub use sink::{broadcast_projects_changed, EventSink, TauriEventSink, WsRelaySink, fan_out};
-pub use ws::{AppState, ReliabilityTier, SequencedEvent, WsErrorCode};
+pub use project_registry::{
+    seed_from_file, ProjectListPayload, ProjectRegistry, ProjectSummary, ProjectsChangedPayload,
+};
+pub use sink::{broadcast_projects_changed, fan_out, EventSink, TauriEventSink, WsRelaySink};
+pub use ws::{AppState, HistoryMode, ReliabilityTier, SequencedEvent, WsErrorCode};
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -48,18 +51,30 @@ use crate::acp::AcpManager;
 /// agent subprocesses via [`AcpManager::kill_all`]. Bind failures are returned
 /// to the caller. On serve error, agents are still killed before returning.
 ///
+/// `registry` is the in-memory [`ProjectRegistry`] the router reads for
+/// `GET /projects` + `switch_project` cwd resolution. The standalone binary
+/// seeds it from the file-backed [`crate::acp::project_registry::FileProjectRegistry`]
+/// at startup (VPS mode); the desktop host seeds it via `remote_sync_projects`
+/// and calls [`serve_router`] directly (it never reaches this `serve`
+/// wrapper).
+///
 /// The standalone binary owns its agent lifetime end-to-end, so it kills agents
 /// on exit. The desktop-hosted shared-live path calls [`serve_router`] directly
 /// and must NOT kill the desktop's live agents — see [`serve_router`].
 pub async fn serve(
     acp: Arc<AcpManager>,
     ws_relay: Arc<WsRelaySink>,
+    registry: Arc<crate::web::project_registry::ProjectRegistry>,
+    registry_persistence: Option<Arc<parking_lot::Mutex<crate::acp::FileProjectRegistry>>>,
+    projects_file: Option<PathBuf>,
     cfg: ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_addr, handle) = serve_router(
         acp.clone(),
         ws_relay,
-        Arc::new(crate::web::project_registry::ProjectRegistry::new()),
+        registry,
+        registry_persistence,
+        projects_file,
         cfg,
         shutdown_signal_future(),
     )
@@ -69,7 +84,12 @@ pub async fn serve(
 
     // Kill agents after Axum has drained (or failed) — the standalone binary
     // owns its agents' lifecycle. The desktop-hosted path never reaches here.
-    acp.kill_all().await;
+    acp.kill_all_checked()
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+    acp.shutdown_persistence()
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
     match serve_result {
         Ok(()) => {
@@ -101,6 +121,8 @@ pub async fn serve_router(
     acp: Arc<AcpManager>,
     ws_relay: Arc<WsRelaySink>,
     registry: Arc<crate::web::project_registry::ProjectRegistry>,
+    registry_persistence: Option<Arc<parking_lot::Mutex<crate::acp::FileProjectRegistry>>>,
+    projects_file: Option<PathBuf>,
     cfg: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
@@ -127,7 +149,12 @@ pub async fn serve_router(
         Arc::clone(&acp),
         Arc::clone(&ws_relay),
         Arc::clone(&registry),
+        registry_persistence,
+        projects_file,
         cfg.project_root.clone(),
+        ws_relay
+            .persistence()
+            .map_or(HistoryMode::LiveOnly, |_| HistoryMode::Server),
     );
 
     let handle = tokio::spawn(async move {
