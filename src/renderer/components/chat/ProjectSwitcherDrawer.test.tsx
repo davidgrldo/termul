@@ -2,14 +2,30 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectSwitcherDrawer } from './ProjectSwitcherDrawer'
 
-const { mockSwitchProject, queuedRef } = vi.hoisted(() => ({
-  mockSwitchProject: vi.fn(),
-  queuedRef: { current: null as string | null }
-}))
+const { mockSwitchProject, queuedRef, failedRef, setFailedProjectSwitch, toastError } = vi.hoisted(
+  () => ({
+    mockSwitchProject: vi.fn(),
+    queuedRef: { current: null as string | null },
+    failedRef: { current: null as string | null },
+    setFailedProjectSwitch: vi.fn((projectId: string | null) => {
+      failedRef.current = projectId
+    }),
+    toastError: vi.fn()
+  })
+)
 
 vi.mock('@/stores/acp-store', () => ({
   useAcpStore: (selector: (state: unknown) => unknown) =>
-    selector({ switchProject: mockSwitchProject, queuedProjectSwitchId: queuedRef.current })
+    selector({
+      switchProject: mockSwitchProject,
+      queuedProjectSwitchId: queuedRef.current,
+      failedProjectSwitchId: failedRef.current,
+      setFailedProjectSwitch
+    })
+}))
+
+vi.mock('sonner', () => ({
+  toast: { error: toastError }
 }))
 
 const projects = [
@@ -62,6 +78,7 @@ describe('ProjectSwitcherDrawer', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     queuedRef.current = null
+    failedRef.current = null
   })
 
   it('renders the mirrored list, marks the active project, disables archived + active entries', async () => {
@@ -123,5 +140,81 @@ describe('ProjectSwitcherDrawer', () => {
     rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
     expect(await screen.findByText('Queued')).toBeInTheDocument()
     expect(screen.getByText('Gamma').closest('button')).toBeDisabled()
+  })
+
+  it('surfaces a rejected switch as an inline "Failed" badge + toast and stays open', async () => {
+    mockSwitchProject.mockRejectedValue(
+      new Error('switch_project requires a live agent; open a chat first')
+    )
+    const onOpenChange = vi.fn()
+    const { rerender } = render(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+
+    fireEvent.click(await screen.findByText('Gamma'))
+
+    await waitFor(() => expect(mockSwitchProject).toHaveBeenCalledWith('p3'))
+    // The drawer marks the failed project on the store so the inline badge can
+    // render (mirrors how `applyFailedProjectSwitch` sets it for the event path).
+    await waitFor(() => expect(setFailedProjectSwitch).toHaveBeenCalledWith('p3'))
+    expect(toastError).toHaveBeenCalledWith(
+      'switch_project requires a live agent; open a chat first'
+    )
+    // A failed switch does not close the drawer.
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+
+    failedRef.current = 'p3'
+    rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+    expect(await screen.findByText('Failed')).toBeInTheDocument()
+    // The failed row stays retryable (not disabled) so the user can retry.
+    expect(screen.getByText('Gamma').closest('button')).not.toBeDisabled()
+  })
+
+  it('replaces the Queued badge with a Failed badge when a queued switch fails', async () => {
+    const onOpenChange = vi.fn()
+    const { rerender } = render(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+
+    // Queued switch in flight: badge shows + row disabled.
+    queuedRef.current = 'p3'
+    rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    expect(screen.getByText('Gamma').closest('button')).toBeDisabled()
+
+    // Server emits `project_switch_failed`: store clears queued + sets failed.
+    queuedRef.current = null
+    failedRef.current = 'p3'
+    rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+    expect(screen.queryByText('Queued')).not.toBeInTheDocument()
+    expect(await screen.findByText('Failed')).toBeInTheDocument()
+    // Retryable again now that the turn is idle.
+    expect(screen.getByText('Gamma').closest('button')).not.toBeDisabled()
+  })
+
+  it('clears a failure that arrives while the drawer is closed (no stale badge on reopen)', async () => {
+    const onOpenChange = vi.fn()
+    const { rerender } = render(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+
+    // Queued switch in flight while the drawer is open.
+    queuedRef.current = 'p3'
+    rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+
+    // User closes the drawer while the queued switch is still pending server-side.
+    rerender(<ProjectSwitcherDrawer open={false} onOpenChange={onOpenChange} />)
+
+    // The queued switch fails AFTER closure: store clears queued + sets failed.
+    queuedRef.current = null
+    failedRef.current = 'p3'
+    setFailedProjectSwitch.mockClear()
+    rerender(<ProjectSwitcherDrawer open={false} onOpenChange={onOpenChange} />)
+
+    // The cleanup effect must react to the late failure (its deps include
+    // `failedProjectSwitchId`) and clear it so it can't resurface on reopen.
+    await waitFor(() => expect(setFailedProjectSwitch).toHaveBeenCalledWith(null))
+
+    // Store honored the clear → reopening shows no stale "Failed"/"Queued" badge.
+    await waitFor(() => expect(failedRef.current).toBeNull())
+    rerender(<ProjectSwitcherDrawer open onOpenChange={onOpenChange} />)
+    expect(await screen.findByText('Gamma')).toBeInTheDocument()
+    expect(screen.queryByText('Failed')).not.toBeInTheDocument()
+    expect(screen.queryByText('Queued')).not.toBeInTheDocument()
   })
 })
