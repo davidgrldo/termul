@@ -156,6 +156,79 @@ pub struct QuickTunnel {
     pub child: Child,
 }
 
+/// Deadline for the post-URL reachability probe (see [`probe_tunnel_ready`]).
+/// cloudflared prints the trycloudflare URL *before* the edge route is live;
+/// this bounds how long we wait for the edge → origin path to return 2xx before
+/// giving up + surfacing a "not reachable" error so the popover never offers a
+/// dead QR.
+const TUNNEL_READY_PROBE_TIMEOUT_SECS: u64 = 10;
+/// Probe interval — balances responsiveness against edge/request load.
+const TUNNEL_READY_PROBE_INTERVAL_MS: u64 = 500;
+
+/// HTTP-probe the public trycloudflare URL until the edge routes to the origin
+/// (2xx) or [`TUNNEL_READY_PROBE_TIMEOUT_SECS`] elapses. The probe round-trips
+/// desktop → trycloudflare edge → cloudflared → localhost origin, exercising
+/// the full path the phone will use — so a 2xx here is the only signal that the
+/// QR will actually load (vs. cloudflared's "URL created" log line, which
+/// fires before the edge route + phone-DNS converge and yields "This site
+/// can't be reached" for an eager scan).
+///
+/// `reqwest` (rustls, already a dep) is the client — no new crate.
+async fn probe_tunnel_ready(url: &str) -> Result<(), String> {
+    probe_tunnel_ready_with(
+        url,
+        std::time::Duration::from_secs(TUNNEL_READY_PROBE_TIMEOUT_SECS),
+        std::time::Duration::from_millis(TUNNEL_READY_PROBE_INTERVAL_MS),
+    )
+    .await
+}
+
+/// Parameterized probe core so tests can run a short deadline against a
+/// definitely-unreachable URL without waiting the full 10s.
+async fn probe_tunnel_ready_with(
+    url: &str,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+) -> Result<(), String> {
+    // No global client timeout — each request is capped to the *remaining*
+    // deadline budget inside the loop, so a straggler near the deadline can't
+    // push total wait past `timeout`. A hung send() still yields: reqwest errors
+    // on the per-request timeout → reachable=false → the loop re-checks the
+    // deadline + exits.
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("tunnel probe client build failed: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        // Cap each GET to the remaining budget (≤3s) so the probe can't
+        // overshoot the documented `timeout` bound by a full request's duration.
+        let per_request_timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(std::time::Duration::from_secs(3));
+        // Any 2xx means the edge is routing to the origin. Non-2xx / network
+        // errors (edge not yet routing, NXDOMAIN, origin refused, per-request
+        // timeout) → retry until the deadline.
+        let reachable = client
+            .get(url)
+            .timeout(per_request_timeout)
+            .send()
+            .await
+            .map(|resp| resp.status().is_success())
+            .unwrap_or(false);
+        if reachable {
+            return Ok(());
+        }
+        // Cap the retry sleep by the remaining deadline so a sleep started near
+        // the deadline can't push total wait past `timeout` by a full interval.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+    Err(format!(
+        "tunnel URL not reachable within {}s",
+        timeout.as_secs()
+    ))
+}
+
 /// Spawn `cloudflared tunnel --url http://localhost:{port}` and wait (up to
 /// [`TUNNEL_URL_TIMEOUT_SECS`]) for the ephemeral trycloudflare URL.
 ///
@@ -181,7 +254,14 @@ pub async fn start_quick_tunnel(port: u16) -> Result<QuickTunnel, String> {
 
     let mut child = command
         .spawn()
-        .map_err(|e| format!("cloudflared binary not found at {path}: {e}"))?;
+        .map_err(|e| {
+            log::error!("cloudflared failed to spawn at {path}: {e}");
+            format!("cloudflared binary not found at {path}: {e}")
+        })?;
+    log::info!(
+        "cloudflared spawned (pid={:?}) from {path}; waiting for tunnel URL…",
+        child.id()
+    );
 
     let stdout = child
         .stdout
@@ -204,14 +284,31 @@ pub async fn start_quick_tunnel(port: u16) -> Result<QuickTunnel, String> {
     )
     .await
     {
-        Ok(Ok(url)) => Ok(QuickTunnel { url, child }),
+        Ok(Ok(url)) => {
+            log::info!(
+                "cloudflared tunnel URL obtained ({url}); probing edge reachability…"
+            );
+            // cloudflared prints the URL before the edge route is live; an
+            // eager QR yields "This site can't be reached" in the first few
+            // seconds. Probe the public URL end-to-end until it returns 2xx —
+            // the only signal proving the phone will succeed.
+            if let Err(e) = probe_tunnel_ready(&url).await {
+                let _ = child.kill().await;
+                log::warn!("cloudflared tunnel probe failed: {e}");
+                return Err(e);
+            }
+            log::info!("cloudflared tunnel reachable — edge routes to origin");
+            Ok(QuickTunnel { url, child })
+        }
         // Sender dropped without sending → cloudflared exited before printing.
         Ok(Err(_)) => {
             let _ = child.kill().await;
+            log::warn!("cloudflared exited before producing a tunnel URL");
             Err("cloudflared exited before producing a tunnel URL".to_string())
         }
         Err(_) => {
             let _ = child.kill().await;
+            log::warn!("tunnel URL not received within {TUNNEL_URL_TIMEOUT_SECS}s");
             Err(format!(
                 "tunnel URL not received within {TUNNEL_URL_TIMEOUT_SECS}s"
             ))
@@ -306,5 +403,73 @@ mod tests {
         assert!(TRY_TUNNEL_URL_RE
             .find("redirect to https://example.com/path")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_returns_err_for_unreachable_url_near_deadline() {
+        // Port 1 on loopback → connection refused (fast), so each GET returns
+        // immediately; the 2s deadline bounds total elapsed time. Asserts the
+        // probe gives up near the deadline (never hangs) + surfaces the error.
+        let start = std::time::Instant::now();
+        let result = probe_tunnel_ready_with(
+            "http://127.0.0.1:1/",
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+        assert!(result.is_err(), "unreachable URL must not be reported ready");
+        // Tight bound: the deadline + capped retry sleep can't overshoot by a
+        // full interval, so ~2s + small epsilon — well under 3s.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "probe must give up near the deadline, not hang; took {:?}",
+            start.elapsed()
+        );
+        assert!(result.unwrap_err().contains("not reachable within 2s"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_bounded_by_deadline_against_hanging_listener() {
+        // A listener that accepts the TCP connection but never sends an HTTP
+        // response — so the only thing that unblocks each GET is the probe's
+        // per-request timeout. This exercises the timeout + capped-retry-sleep
+        // path the port-1 (instant-refuse) test can't.
+        let addr = spawn_hanging_listener().await;
+        let url = format!("http://{addr}/");
+        let start = std::time::Instant::now();
+        let result = probe_tunnel_ready_with(
+            &url,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        assert!(result.is_err(), "hanging listener must not be reported ready");
+        // The per-request timeout is capped to the remaining deadline, so total
+        // wait must hug the 2s bound — not the 3s per-request default.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "probe overshot the deadline: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A local TCP listener that accepts connections but never sends an HTTP
+    /// response, so a probe client's per-request timeout is the only unblock.
+    async fn spawn_hanging_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // Accept connections but never send an HTTP response — a probe
+            // client's per-request timeout is the only unblock.
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    drop(stream);
+                });
+            }
+        });
+        addr
     }
 }
