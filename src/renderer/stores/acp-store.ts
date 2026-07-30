@@ -3430,11 +3430,32 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         timestamp: typeof e.toolCall.timestamp === 'number' ? e.toolCall.timestamp : Date.now(),
         seq: typeof e.toolCall.seq === 'number' ? e.toolCall.seq : nextSeq()
       }
-      return {
-        toolCalls: {
-          ...s.toolCalls,
-          [e.sessionId]: [...(s.toolCalls[e.sessionId] ?? []), stamped]
+      // Upsert by toolCallId (replace-or-append) so reconnect-replay overlap
+      // can't double-render a tool card — the latest call wins. The transport's
+      // `seq <= last` drop is the seq-level guard; this upsert is the
+      // toolCallId-level guard (a same-toolCallId re-emission carries a
+      // different seq, so only the store can dedup it). Mirrors the merge-by-id
+      // pattern in `_onToolCallUpdate` below.
+      const list = s.toolCalls[e.sessionId] ?? []
+      const idx = list.findIndex((t) => t.toolCallId === e.toolCall.toolCallId)
+      if (idx === -1) {
+        return {
+          toolCalls: { ...s.toolCalls, [e.sessionId]: [...list, stamped] }
         }
+      }
+      // Preserve the original timeline placement: a replay (reconnect overlap)
+      // must not move the card to a later position. The latest call fields
+      // (title/status/content/...) win; the arrival-stamped seq + timestamp stay.
+      const merged: ToolCall = {
+        ...list[idx],
+        ...stamped,
+        timestamp: list[idx].timestamp,
+        seq: list[idx].seq
+      }
+      const next = [...list]
+      next[idx] = merged
+      return {
+        toolCalls: { ...s.toolCalls, [e.sessionId]: next }
       }
     }),
 
