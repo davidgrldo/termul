@@ -23,6 +23,7 @@ import {
   watchImmediate,
   writeTextFile
 } from '@tauri-apps/plugin-fs'
+import { sortDirectoryEntries } from './filesystem-sort'
 import { cleanupTauriListener, isTauriContext } from './tauri-runtime'
 import { webServerFilesystem } from './web-server-api'
 
@@ -99,26 +100,6 @@ function shouldIgnore(name: string): boolean {
   return ALWAYS_IGNORE.includes(name)
 }
 
-/**
- * Sort directory entries: directories first (A-Z), then files (A-Z)
- */
-function sortDirectoryEntries(entries: DirectoryEntry[]): DirectoryEntry[] {
-  return [...entries].sort((a, b) => {
-    // Directories come before files
-    if (a.type === 'directory' && b.type === 'file') return -1
-    if (a.type === 'file' && b.type === 'directory') return 1
-
-    // Within same type, non-ignored entries come before ignored ones
-    if (!a.ignored && b.ignored) return -1
-    if (a.ignored && !b.ignored) return 1
-
-    // Within same type/ignored group, sort alphabetically by name (case-insensitive)
-    const nameA = a.name.toLowerCase()
-    const nameB = b.name.toLowerCase()
-    return nameA.localeCompare(nameB)
-  })
-}
-
 function isBinaryFile(content: string): boolean {
   // Check for null bytes in first 512 chars
   const sample = content.slice(0, 512)
@@ -193,7 +174,23 @@ export function createTauriFilesystemApi(): FilesystemApi {
       // Web/remote mode: route through the same-origin server (Story: Web/
       // remote project creation). Desktop stays on @tauri-apps/plugin-fs.
       if (!isTauriContext()) {
-        return webServerFilesystem.readDirectory(dirPath)
+        // The web server (fs_api.rs `ls`) returns OS-native entry paths — on
+        // Windows that is backslash separators. The file-explorer store keys
+        // `expandedDirs`/`directoryContents` by normalizePath (`\`→`/`) but
+        // FileTreeNode reads them by raw `entry.path`, so backslash paths
+        // break subdir expansion at level 2+. Normalize to forward slashes to
+        // match the Tauri branch below.
+        const result = await webServerFilesystem.readDirectory(dirPath)
+        if (result.success) {
+          return {
+            success: true,
+            data: result.data.map((entry) => ({
+              ...entry,
+              path: entry.path.replace(/\\/g, '/')
+            }))
+          }
+        }
+        return result
       }
       try {
         const normalizedDirPath = dirPath.replace(/\\/g, '/')
