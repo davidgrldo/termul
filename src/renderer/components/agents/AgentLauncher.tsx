@@ -46,9 +46,9 @@ import {
 } from '@/hooks/use-agent-skills'
 import { useMentionRecents } from '@/hooks/use-mention-recents'
 import type { StoredAgentConfig } from '@/lib/acp-agents-persistence'
-import { acpApi, type ContentBlock } from '@/lib/acp-api'
+import { type AuthMethod, acpApi, type ContentBlock } from '@/lib/acp-api'
 import { currentPlatformArch } from '@/lib/agents/acp-registry'
-import { formatAcpSpawnError } from '@/lib/agents/acp-spawn-errors'
+import type { PrepareChatError } from '@/lib/agents/acp-spawn-errors'
 import { findBundledIconByKey } from '@/lib/agents/agent-icon-catalog'
 import { sanitizeInlineAgentSvg } from '@/lib/agents/sanitize-agent-icon'
 import {
@@ -67,6 +67,7 @@ import { cn } from '@/lib/utils'
 import { getDefaultCwdForProject } from '@/lib/worktree-context'
 import {
   type AcpSession,
+  agentReuseKey,
   hasModelRelevantOptionsCache,
   prepareChatKey,
   useAcpSession,
@@ -81,6 +82,7 @@ interface AgentLauncherProps {
 }
 
 const EMPTY_COMMANDS: [] = []
+const EMPTY_AUTH_METHODS: AuthMethod[] = []
 
 /** Survives overlay unmount so the new-thread picker does not flash the default. */
 let cachedConfigId: string | null = null
@@ -144,13 +146,21 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const prepareError = useAcpStore((s) =>
     preparedKey ? (s.prepareChatErrors[preparedKey] ?? null) : null
   )
+  // Resolve the live agent for this config+cwd so an auth failure can offer a
+  // Sign-in action driven by the agent's advertised method metadata. A Sign-in
+  // button is only meaningful when exactly one method is advertised (P6).
+  const reuseKey = activeConfigId && projectRoot ? agentReuseKey(activeConfigId, projectRoot) : null
+  const liveAgentId = useAcpStore((s) =>
+    reuseKey ? (s.configToLiveAgent?.[reuseKey] ?? null) : null
+  )
+  const authMethods = useAcpStore((s) =>
+    liveAgentId ? (s.agents?.[liveAgentId]?.authMethods ?? EMPTY_AUTH_METHODS) : EMPTY_AUTH_METHODS
+  )
+  const signInMethod = authMethods.length === 1 ? authMethods[0] : null
+  const [signingInMethodId, setSigningInMethodId] = useState<string | null>(null)
   const cachedOptions = useAcpStore((s) =>
     activeConfigId ? (s.agentOptionsCache[activeConfigId] ?? null) : null
   )
-  const displayPrepareError = useMemo(() => {
-    if (!prepareError) return null
-    return formatAcpSpawnError(prepareError, selectedConfig ?? undefined)
-  }, [prepareError, selectedConfig])
   const draftSession = useAcpSession(preparedSessionId)
   const promptCaps = useAcpStore((s) =>
     draftSession?.agentId
@@ -504,6 +514,39 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     store.prepareChat(activeConfigId, projectRoot, undefined, activeProjectId)
   }, [activeConfigId, preparedKey, projectRoot, activeProjectId])
 
+  // Run the agent-advertised authenticate for a chosen method, then re-prepare
+  // so the session is created now that the provider login is complete. The
+  // provider owns the login UX (often opening its own browser); Termul never
+  // invents a redirect URL or stores credentials. Mirrors Zed's
+  // ThreadState::Unauthenticated → authenticate → reset flow.
+  const runAuthenticate = useCallback(
+    async (methodId: string) => {
+      if (!liveAgentId) {
+        toast.error('Agent is not connected. Use Retry to reconnect, then sign in again.')
+        return
+      }
+      if (signingInMethodId) return
+      setSigningInMethodId(methodId)
+      try {
+        await useAcpStore.getState().authenticateAgent(liveAgentId, methodId)
+        handleRetryPrepare()
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Sign-in failed')
+      } finally {
+        setSigningInMethodId(null)
+      }
+    },
+    [liveAgentId, signingInMethodId, handleRetryPrepare]
+  )
+
+  const handleSignIn = useCallback(() => {
+    if (!signInMethod) {
+      toast.error('No sign-in method is available for this agent yet.')
+      return
+    }
+    void runAuthenticate(signInMethod.id)
+  }, [signInMethod, runAuthenticate])
+
   const handleSetMode = useCallback(
     async (modeId: string) => {
       if (!preparedSessionId) {
@@ -837,6 +880,17 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                   'This ACP agent is not available on this platform.'}
               </div>
             )}
+            {prepareError &&
+              (prepareError.category === 'auth' || prepareError.category === 'multi-auth') && (
+                <AuthRequiredBanner
+                  agentName={selectedEntry?.agent.name ?? 'Agent'}
+                  setupError={prepareError}
+                  authMethods={authMethods}
+                  signingInMethodId={signingInMethodId}
+                  onAuthenticate={(methodId) => void runAuthenticate(methodId)}
+                  onRetry={handleRetryPrepare}
+                />
+              )}
             {loadedSkill && (
               <LoadedSkillChip skill={loadedSkill} onRemove={() => setLoadedSkill(null)} />
             )}
@@ -881,12 +935,14 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                   modelOption={modelOption}
                   loading={showModelLoading}
                   connecting={false}
-                  stale={Boolean(displayPrepareError && hasCachedModels)}
-                  errorMessage={displayPrepareError}
+                  stale={Boolean(prepareError && hasCachedModels)}
+                  setupError={prepareError}
+                  signInMethod={signInMethod}
+                  onSignIn={() => void handleSignIn()}
                   disabled={
                     Boolean(installingConfigId) ||
                     savingManualPath ||
-                    (!optionsInteractive && !displayPrepareError)
+                    (!optionsInteractive && !prepareError)
                   }
                   onRetry={handleRetryPrepare}
                   onSelectModel={handleSetModel}
@@ -953,6 +1009,71 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
               </div>
             </button>
           ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Zed-style auth callout: visible without opening the model picker popover. */
+function AuthRequiredBanner({
+  agentName,
+  setupError,
+  authMethods,
+  signingInMethodId,
+  onAuthenticate,
+  onRetry
+}: {
+  agentName: string
+  setupError: PrepareChatError
+  authMethods: AuthMethod[]
+  signingInMethodId: string | null
+  onAuthenticate: (methodId: string) => void
+  onRetry: () => void
+}): React.JSX.Element {
+  const signingInMethod = authMethods.find((m) => m.id === signingInMethodId)
+  const actionableMethods = authMethods.filter((m) => m.id.trim().length > 0)
+
+  return (
+    <div className="border-b border-border/60 px-5 py-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-medium text-foreground">
+            {signingInMethod ? `Authenticating to ${agentName}…` : `Authenticate to ${agentName}`}
+          </div>
+          <p className="mt-0.5 line-clamp-4 break-words text-xs text-muted-foreground">
+            {setupError.detail}
+          </p>
+          {setupError.category === 'multi-auth' && actionableMethods.length > 1 ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Choose one of the following authentication options:
+            </p>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {signingInMethod ? (
+            <Button type="button" size="sm" disabled>
+              <Loader2 size={14} className="mr-1.5 animate-spin" />
+              {`Signing in with ${signingInMethod.name}…`}
+            </Button>
+          ) : actionableMethods.length > 0 ? (
+            actionableMethods.map((method, index) => (
+              <Button
+                key={method.id}
+                type="button"
+                size="sm"
+                variant={index === actionableMethods.length - 1 ? 'default' : 'outline'}
+                title={method.description ?? undefined}
+                onClick={() => onAuthenticate(method.id)}
+              >
+                {method.name}
+              </Button>
+            ))
+          ) : (
+            <Button type="button" size="sm" variant="outline" onClick={onRetry}>
+              Retry
+            </Button>
+          )}
         </div>
       </div>
     </div>
@@ -1201,7 +1322,9 @@ function AcpModelPicker({
   loading,
   connecting = false,
   stale = false,
-  errorMessage,
+  setupError,
+  signInMethod,
+  onSignIn,
   disabled,
   onRetry,
   onSelectModel
@@ -1211,7 +1334,9 @@ function AcpModelPicker({
   loading: boolean
   connecting?: boolean
   stale?: boolean
-  errorMessage: string | null
+  setupError: PrepareChatError | null
+  signInMethod: AuthMethod | null
+  onSignIn: () => void
   disabled: boolean
   onRetry: () => void
   onSelectModel: (valueId: string) => void | Promise<void>
@@ -1223,12 +1348,15 @@ function AcpModelPicker({
     onSelectModel
   )
   const currentModel = modelOption?.options.find((o) => o.value === displayValue)
+  // Category-specific label so only a genuine empty-model state reads as a
+  // neutral "Model" pill — setup failures get an actionable label instead of a
+  // misleading "Model unavailable".
   const label = loading
     ? 'Loading model…'
-    : errorMessage
-      ? 'Model unavailable'
+    : setupError
+      ? setupError.label
       : (currentModel?.name ?? 'Model')
-  const showSearch = Boolean(modelOption && modelOption.options.length > 5 && !errorMessage)
+  const showSearch = Boolean(modelOption && modelOption.options.length > 5 && !setupError)
   const normalizedQuery = query.trim().toLowerCase()
   const filteredModels =
     modelOption?.options.filter((value) => {
@@ -1251,9 +1379,9 @@ function AcpModelPicker({
         <ComposerPill
           disabled={disabled}
           aria-label={`Select model: ${label}`}
-          className={cn('max-w-[220px]', (connecting || stale) && !errorMessage && 'opacity-80')}
+          className={cn('max-w-[220px]', (connecting || stale) && !setupError && 'opacity-80')}
           chevron
-          pending={pending || (connecting && !errorMessage)}
+          pending={pending || (connecting && !setupError)}
         >
           <span className="truncate">{label}</span>
         </ComposerPill>
@@ -1261,10 +1389,10 @@ function AcpModelPicker({
       <PopoverContent align="end" side="top" className="w-72 p-1">
         <div className="px-2 py-1 text-3xs font-semibold uppercase tracking-wide text-muted-foreground/70">
           Model
-          {connecting && !errorMessage && (
+          {connecting && !setupError && (
             <span className="ml-1 font-normal normal-case tracking-normal">· Connecting…</span>
           )}
-          {stale && !connecting && !errorMessage && (
+          {stale && !connecting && !setupError && (
             <span className="ml-1 font-normal normal-case tracking-normal">· Cached</span>
           )}
         </div>
@@ -1278,23 +1406,7 @@ function AcpModelPicker({
                   ? 'Install this agent manually before loading model options.'
                   : 'This ACP agent is not available on this platform.'}
           </div>
-        ) : errorMessage ? (
-          <div className="space-y-2 px-2 py-1.5 text-xs text-muted-foreground">
-            <div>
-              <div className="font-medium text-foreground/85">Could not load model options.</div>
-              <div className="mt-1 line-clamp-3 break-words">{errorMessage}</div>
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 text-xs"
-              onClick={onRetry}
-            >
-              Retry
-            </Button>
-          </div>
-        ) : modelOption ? (
+        ) : !setupError && modelOption ? (
           <>
             {showSearch && (
               <input
@@ -1340,6 +1452,33 @@ function AcpModelPicker({
               )}
             </div>
           </>
+        ) : setupError ? (
+          <div className="space-y-2 px-2 py-1.5 text-xs text-muted-foreground">
+            <div>
+              <div className="font-medium text-foreground/85">
+                {setupError.category === 'auth' || setupError.category === 'multi-auth'
+                  ? setupError.label
+                  : 'Could not load model options.'}
+              </div>
+              <div className="mt-1 line-clamp-3 break-words">{setupError.detail}</div>
+            </div>
+            {setupError.category === 'multi-auth' ? null : setupError.category === 'auth' &&
+              signInMethod ? (
+              <Button type="button" size="sm" className="h-7 text-xs" onClick={onSignIn}>
+                {`Sign in with ${signInMethod.name}`}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={onRetry}
+              >
+                Retry
+              </Button>
+            )}
+          </div>
         ) : (
           <div className="px-2 py-1.5 text-xs text-muted-foreground">
             {loading

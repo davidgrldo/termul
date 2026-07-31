@@ -81,6 +81,7 @@ import {
 import {
   _flushCoalescedForTesting,
   _isCoalescePendingForTesting,
+  _resetAcpAuthForTesting,
   _resetCoalesceForTesting,
   _resetEphemeralSessionIdsForTesting,
   _resetInFlightHistoryOpensForTesting,
@@ -248,6 +249,7 @@ describe('acp-store', () => {
     ;(invoke as ReturnType<typeof vi.fn>).mockReset()
     _resetAcpTransportForTests(null)
     _resetInFlightHistoryOpensForTesting()
+    _resetAcpAuthForTesting()
     _resetInFlightPreparedForTesting()
     _resetCoalesceForTesting()
     useAcpStore.setState(FRESH)
@@ -1724,7 +1726,11 @@ describe('acp-store', () => {
     useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
     const key = prepareChatKey('cfg-1', '/work', undefined)
     await vi.waitFor(() => {
-      expect(useAcpStore.getState().prepareChatErrors[key]).toBe('session/new timed out after 30s')
+      expect(useAcpStore.getState().prepareChatErrors[key]).toEqual({
+        category: 'timeout',
+        label: 'Session setup timed out',
+        detail: 'session/new timed out after 30s'
+      })
     })
     expect(useAcpStore.getState().preparingChatKeys[key]).toBeUndefined()
     expect(useAcpStore.getState().preparedSessions[key]).toBeUndefined()
@@ -3472,6 +3478,7 @@ describe('acp-store', () => {
 describe('acp-store multi-project isolation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    _resetAcpAuthForTesting()
     _resetAcpTransportForTests(null)
     useAcpStore.setState(FRESH)
   })
@@ -3798,6 +3805,7 @@ describe('acp-store multi-project isolation', () => {
 describe('session discovery (gh-407)', () => {
   beforeEach(() => {
     vi.mocked(invoke).mockReset()
+    _resetAcpAuthForTesting()
     useAcpStore.setState({
       ...FRESH,
       agents: {},
@@ -4874,5 +4882,215 @@ describe('warm session pool', () => {
     expect(useAcpStore.getState().preparedSessions[key]).toBeUndefined()
     // No orphan "Untitled Chat" is persisted to the history index on disconnect.
     expect(useAcpStore.getState().sessionIndex.find((e) => e.id === 'sess-prep')).toBeUndefined()
+  })
+})
+
+describe('acp provider authentication & recovery', () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset()
+    _resetAcpAuthForTesting()
+    useAcpStore.setState(FRESH)
+  })
+
+  /** Register a live agent as if it were spawned + `acp:agent_spawned` reduced. */
+  function seedLiveAgent(
+    agentId: string,
+    authMethods: Array<{ id: string; name: string; description?: string | null }>,
+    capabilities: Record<string, unknown> | null = {}
+  ): void {
+    useAcpStore.setState((s) => ({
+      agents: { ...s.agents, [agentId]: { id: agentId, capabilities, authMethods } },
+      agentStatus: { ...s.agentStatus, [agentId]: 'connected' }
+    }))
+  }
+
+  it('waits for a delayed spawn event, then authenticates the single method before session/new (P1)', async () => {
+    // Freshly spawned agent: capabilities null + authMethods empty until the
+    // `acp:agent_spawned` event lands. authenticate must not run against the
+    // empty seed; it must wait for the advertised method.
+    useAcpStore.setState((s) => ({
+      agents: { ...s.agents, 'agent-1': { id: 'agent-1', capabilities: null, authMethods: [] } },
+      agentStatus: { ...s.agentStatus, 'agent-1': 'connected' }
+    }))
+    const order: string[] = []
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      order.push(cmd)
+      if (cmd === 'acp_authenticate') return undefined
+      if (cmd === 'acp_new_session') return { sessionId: 's1' }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    const p = useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    // The spawn event (with a single advertised method) arrives during the wait.
+    useAcpStore.getState()._onAgentSpawned({
+      agentId: 'agent-1',
+      capabilities: {},
+      authMethods: [{ id: 'cursor_login', name: 'Sign in with Cursor' }]
+    })
+    await p
+    expect(order).toEqual(['acp_authenticate', 'acp_new_session'])
+    const authCall = vi.mocked(invoke).mock.calls.find(([cmd]) => cmd === 'acp_authenticate')
+    expect(authCall?.[1]).toEqual({ agentId: 'agent-1', methodId: 'cursor_login' })
+  })
+
+  it('treats an agent that advertises no methods as no-auth (session/new only)', async () => {
+    seedLiveAgent('agent-1', [])
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_new_session') return { sessionId: 's1' }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(0)
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_new_session')).toHaveLength(1)
+  })
+
+  it('ignores a method with an empty/whitespace id and does not authenticate (P5)', async () => {
+    seedLiveAgent('agent-1', [{ id: '   ', name: 'Broken' }])
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_new_session') return { sessionId: 's1' }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(0)
+  })
+
+  it('rejects a multi-method agent without choosing one, surfacing a multi-auth error (P6)', async () => {
+    await useAcpStore
+      .getState()
+      .saveAgentConfig({ id: 'cfg-1', name: 'Cursor', command: 'cursor', args: [], env: {} })
+    seedLiveAgent('agent-9', [
+      { id: 'cursor_login', name: 'Cursor' },
+      { id: 'api_key', name: 'API key' }
+    ])
+    useAcpStore.setState((s) => ({
+      configToLiveAgent: { ...s.configToLiveAgent, [agentReuseKey('cfg-1', '/work')]: 'agent-9' }
+    }))
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
+    const key = prepareChatKey('cfg-1', '/work', undefined)
+    await vi.waitFor(() => {
+      expect(useAcpStore.getState().prepareChatErrors[key]?.category).toBe('multi-auth')
+    })
+    const err = useAcpStore.getState().prepareChatErrors[key]
+    expect(err?.label).toBe('Multiple sign-in methods')
+    expect(err?.detail).toContain('Cursor')
+    expect(err?.detail).toContain('API key')
+    // Never authenticated nor created a session.
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(0)
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_new_session')).toHaveLength(0)
+  })
+
+  it('dedupes concurrent authenticate for the same agent (P2)', async () => {
+    seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Cursor' }])
+    let sessionCounter = 0
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_authenticate') return undefined
+      if (cmd === 'acp_new_session') {
+        sessionCounter += 1
+        return { sessionId: `s${sessionCounter}` }
+      }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await Promise.all([
+      useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1'),
+      useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    ])
+    // One shared authenticate, two independent session/new calls.
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(1)
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_new_session')).toHaveLength(2)
+  })
+
+  it('clears the authenticated flag on an auth-category session/new failure so retry re-authenticates (P3)', async () => {
+    seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Cursor' }])
+    let newSessionCalls = 0
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_authenticate') return undefined
+      if (cmd === 'acp_new_session') {
+        newSessionCalls += 1
+        if (newSessionCalls === 1) throw 'authentication required: run cursor login'
+        return { sessionId: 's1' }
+      }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await expect(
+      useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    ).rejects.toBeDefined()
+    // Retry: because the auth failure cleared the authenticated flag, authenticate runs again.
+    await useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(2)
+  })
+
+  it('evicts a live agent after a transport-destroyed session/new (kills + drops reuse)', async () => {
+    await useAcpStore
+      .getState()
+      .saveAgentConfig({ id: 'cfg-1', name: 'Pi', command: 'pi', args: [], env: {} })
+    seedLiveAgent('agent-9', [])
+    useAcpStore.setState((s) => ({
+      configToLiveAgent: { ...s.configToLiveAgent, [agentReuseKey('cfg-1', '/work')]: 'agent-9' }
+    }))
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_new_session') throw 'the stream was destroyed'
+      if (cmd === 'acp_kill_agent') return undefined
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await expect(
+      useAcpStore.getState().createSession('agent-9', '/work', undefined, 'p1')
+    ).rejects.toBeDefined()
+    // The broken process was killed and dropped from reuse so a retry spawns fresh.
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_kill_agent')).toHaveLength(1)
+    expect(useAcpStore.getState().agents['agent-9']).toBeUndefined()
+    expect(
+      useAcpStore.getState().configToLiveAgent[agentReuseKey('cfg-1', '/work')]
+    ).toBeUndefined()
+  })
+
+  it('warns but does not mask the setup error when the eviction kill fails (P8)', async () => {
+    seedLiveAgent('agent-9', [])
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_new_session') throw 'connection reset by peer'
+      if (cmd === 'acp_kill_agent') throw 'kill failed'
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await expect(
+      useAcpStore.getState().createSession('agent-9', '/work', undefined, 'p1')
+    ).rejects.toBe('connection reset by peer')
+    expect(warn).toHaveBeenCalledWith(
+      '[acp] failed to kill agent during transport eviction',
+      'agent-9',
+      'kill failed'
+    )
+    warn.mockRestore()
+  })
+
+  it('does NOT evict the agent on an auth or timeout failure', async () => {
+    seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Cursor' }])
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_authenticate') return undefined
+      if (cmd === 'acp_new_session') throw 'session/new timed out after 60s'
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await expect(
+      useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    ).rejects.toBeDefined()
+    // A timeout leaves the (alive) agent in place — no kill.
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_kill_agent')).toHaveLength(0)
+    expect(useAcpStore.getState().agents['agent-1']).toBeDefined()
+  })
+
+  it('authenticateAgent runs authenticate and lets the next createSession skip re-auth', async () => {
+    seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Cursor' }])
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === 'acp_authenticate') return undefined
+      if (cmd === 'acp_new_session') return { sessionId: 's1' }
+      throw new Error(`unexpected invoke command: ${cmd}`)
+    })
+    await useAcpStore.getState().authenticateAgent('agent-1', 'cursor_login')
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(1)
+    // The subsequent prepare/session must not authenticate again.
+    await useAcpStore.getState().createSession('agent-1', '/work', undefined, 'p1')
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(1)
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_new_session')).toHaveLength(1)
   })
 })
