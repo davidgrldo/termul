@@ -33,8 +33,10 @@ import { stripEmptyFences } from '@/lib/strip-empty-fences'
 import { cn } from '@/lib/utils'
 import type { ChatMessage as ChatMessageType } from '@/stores/acp-store'
 import {
+  blockData,
   blockDisplayName,
   blockMimeType,
+  blockResource,
   blockToAttachmentData,
   blockUri,
   fileUrlToPath,
@@ -123,16 +125,80 @@ function MediaGridItem({ block, id }: { block: ContentBlock; id: string }): Reac
   return attachment
 }
 
-/** Render image / resource blocks as grid attachment thumbnails. */
-function MediaBlocks({ blocks }: { blocks: ContentBlock[] }): React.JSX.Element | null {
+const MAX_INLINE_RESOURCE_TEXT = 32 * 1024
+const MAX_INLINE_AUDIO_BYTES = 20 * 1024 * 1024
+
+/** Return only bounded inline audio sources; remote URLs must not auto-load. */
+function inlineAudioUrl(block: ContentBlock): string | null {
+  if (block.type !== 'audio' || !blockMimeType(block)?.startsWith('audio/')) return null
+  const data = blockData(block)
+  if (!data) return null
+  if (data.startsWith('blob:')) return data
+  if (data.startsWith('data:audio/')) {
+    return data.length <= MAX_INLINE_AUDIO_BYTES * 1.4 ? data : null
+  }
+  if (data.startsWith('data:')) return null
+  if (data.length > MAX_INLINE_AUDIO_BYTES * 1.4) return null
+  return `data:${blockMimeType(block)};base64,${data}`
+}
+
+function ResourceText({ block }: { block: ContentBlock }): React.JSX.Element | null {
+  const text = blockResource(block)?.text
+  if (typeof text !== 'string') return null
+  const boundedText =
+    text.length > MAX_INLINE_RESOURCE_TEXT ? `${text.slice(0, MAX_INLINE_RESOURCE_TEXT)}\n…` : text
+  return (
+    <pre
+      data-embedded-resource={blockDisplayName(block)}
+      className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-border/40 bg-background/60 px-2 py-1.5 font-mono text-xs leading-relaxed text-foreground/90"
+    >
+      {boundedText}
+    </pre>
+  )
+}
+
+function InlineAudio({ block }: { block: ContentBlock }): React.JSX.Element | null {
+  const src = inlineAudioUrl(block)
+  if (!src) return null
+  return (
+    // biome-ignore lint/a11y/useMediaCaption: ACP audio blocks do not provide caption tracks.
+    <audio
+      aria-label={`Play ${blockDisplayName(block)}`}
+      className="max-w-full"
+      controls
+      preload="metadata"
+      src={src}
+    />
+  )
+}
+
+/** Render media blocks with safe inline previews and bounded embedded text. */
+export function MediaBlocks({ blocks }: { blocks: ContentBlock[] }): React.JSX.Element | null {
   const media = mediaBlocks(blocks)
   if (media.length === 0) return null
+  const resources = media.filter((block) => block.type === 'resource')
+  const attachments = media.filter(
+    (block) =>
+      (block.type !== 'audio' || !inlineAudioUrl(block)) &&
+      !(block.type === 'resource' && typeof blockResource(block)?.text === 'string')
+  )
+  const audio = media.filter((block) => block.type === 'audio')
   return (
-    <Attachments variant="grid" className="ml-0 w-fit py-0.5">
-      {media.map((block, i) => (
-        <MediaGridItem key={`${block.type}-${i}`} block={block} id={`${block.type}-${i}`} />
+    <>
+      {attachments.length > 0 && (
+        <Attachments variant="grid" className="ml-0 w-fit py-0.5">
+          {attachments.map((block, i) => (
+            <MediaGridItem key={`${block.type}-${i}`} block={block} id={`${block.type}-${i}`} />
+          ))}
+        </Attachments>
+      )}
+      {audio.map((block, i) => (
+        <InlineAudio key={`audio-${i}`} block={block} />
       ))}
-    </Attachments>
+      {resources.map((block, i) => (
+        <ResourceText key={`resource-${i}`} block={block} />
+      ))}
+    </>
   )
 }
 
