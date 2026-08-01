@@ -67,6 +67,7 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'set_mode',
       'set_model',
       'respond_permission',
+      'answer_question',
       'create_session',
       'load_session',
       'resume_session',
