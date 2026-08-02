@@ -40,8 +40,9 @@ import {
 import { matchesShortcut, useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
 import { useActiveProject } from '@/stores/project-store'
 import { useTerminalStore } from '@/stores/terminal-store'
-import type { TerminalSpawnOptions } from '../../../shared/types/ipc.types'
+import type { TerminalModes, TerminalSpawnOptions } from '../../../shared/types/ipc.types'
 import {
+  buildRehydrateSequences,
   captureScrollPosition,
   registerTerminal,
   restoreScrollback,
@@ -144,6 +145,12 @@ export interface ConnectedTerminalProps {
   className?: string
   autoFocus?: boolean
   initialScrollback?: string[]
+  /**
+   * R3: captured DEC private-mode snapshot to replay before `initialScrollback`
+   * on terminal mount, so an alt-screen TUI (vim/tmux/less) restores its
+   * screen/modes. Optional — absence degrades to content-only restore.
+   */
+  initialModes?: TerminalModes | null
   searchRef?: React.Ref<TerminalSearchHandle>
   isVisible?: boolean
 }
@@ -169,6 +176,7 @@ function ConnectedTerminalComponent({
   className = '',
   autoFocus = true,
   initialScrollback,
+  initialModes,
   searchRef,
   isVisible = true
 }: ConnectedTerminalProps): React.JSX.Element {
@@ -241,6 +249,10 @@ function ConnectedTerminalComponent({
   spawnOptionsRef.current = spawnOptions
   const initialScrollbackRef = useRef(initialScrollback)
   initialScrollbackRef.current = initialScrollback
+  // R3: keep the latest captured modes in a ref so the second init path
+  // (window-recovery spawnTerminal) reads the current value.
+  const initialModesRef = useRef(initialModes)
+  initialModesRef.current = initialModes
   const currentLineRef = useRef<string>('')
   const continuityProjectIdRef = useRef<string | undefined>(
     getInstrumentationProjectId(spawnOptions)
@@ -962,12 +974,14 @@ function ConnectedTerminalComponent({
             try {
               if (transcript) {
                 if (transcriptLooksPartial) {
-                  if (!transcript.startsWith('\u001b[?1049h')) {
-                    terminal.write('\u001b[?1049h')
-                  }
+                  // R3: replay the full captured DEC mode set (alt-screen + bracketed-paste
+                  // + cursor + mouse), not just alt-screen — a partial/trimmed transcript
+                  // may miss the initial mode sequences. Idempotent with modes in the stream.
+                  terminal.write(buildRehydrateSequences(initialModesRef.current))
                   terminal.write(transcript)
                   terminal.write(PARTIAL_RESTORE_NOTE)
                 } else {
+                  terminal.write(buildRehydrateSequences(initialModesRef.current))
                   terminal.write(transcript)
                 }
                 terminalStoreState.consumeTranscript(result.data.id)
@@ -986,12 +1000,14 @@ function ConnectedTerminalComponent({
                   result.data.id
                 )
               } else if (initialScrollback && initialScrollback.length > 0) {
-                restoreScrollback(terminal, initialScrollback)
+                restoreScrollback(terminal, initialScrollback, initialModes)
                 recordReplayEvent(
                   'restore-replay-succeeded',
                   {
                     mode: 'scrollback',
                     initialScrollbackLineCount: initialScrollback.length,
+                    // R3: whether DEC mode rehydrate sequences were emitted.
+                    modesReplayed: Boolean(initialModes),
                     source: 'spawned-terminal'
                   },
                   storeTerminalId,
@@ -1108,12 +1124,12 @@ function ConnectedTerminalComponent({
             )
           } else if (transcript) {
             if (transcriptLooksPartial) {
-              if (!transcript.startsWith('\u001b[?1049h')) {
-                terminal.write('\u001b[?1049h')
-              }
+              // R3: replay the full captured DEC mode set, not just alt-screen.
+              terminal.write(buildRehydrateSequences(initialModesRef.current))
               terminal.write(transcript)
               terminal.write(PARTIAL_RESTORE_NOTE)
             } else {
+              terminal.write(buildRehydrateSequences(initialModesRef.current))
               terminal.write(transcript)
             }
             terminalStoreState.consumeTranscript(externalTerminalId)
@@ -1132,12 +1148,14 @@ function ConnectedTerminalComponent({
               externalTerminalId
             )
           } else if (initialScrollback && initialScrollback.length > 0) {
-            restoreScrollback(terminal, initialScrollback)
+            restoreScrollback(terminal, initialScrollback, initialModes)
             recordReplayEvent(
               'restore-replay-succeeded',
               {
                 mode: 'scrollback',
                 initialScrollbackLineCount: initialScrollback.length,
+                // R3: whether DEC mode rehydrate sequences were emitted.
+                modesReplayed: Boolean(initialModes),
                 source: 'external-terminal'
               },
               storeTerminalId,
@@ -1673,10 +1691,12 @@ function ConnectedTerminalComponent({
             registerTerminal(result.data.id, terminal)
             const transcript = useTerminalStore.getState().peekTranscript(result.data.id)
             if (transcript) {
+              // R3: replay captured modes before the (possibly trimmed) transcript.
+              terminal.write(buildRehydrateSequences(initialModesRef.current))
               terminal.write(transcript)
               useTerminalStore.getState().consumeTranscript(result.data.id)
             } else if (initialScrollbackRef.current?.length)
-              restoreScrollback(terminal, initialScrollbackRef.current)
+              restoreScrollback(terminal, initialScrollbackRef.current, initialModesRef.current)
             if (onSpawnedRef.current) onSpawnedRef.current(result.data.id)
             if (onBoundToStoreTerminalRef.current) onBoundToStoreTerminalRef.current(result.data.id)
           } else if (onErrorRef.current) onErrorRef.current(result.error)
@@ -1691,10 +1711,12 @@ function ConnectedTerminalComponent({
         registerTerminal(externalTerminalId, terminal)
         const transcript = useTerminalStore.getState().peekTranscript(externalTerminalId)
         if (transcript) {
+          // R3: replay captured modes before the (possibly trimmed) transcript.
+          terminal.write(buildRehydrateSequences(initialModesRef.current))
           terminal.write(transcript)
           useTerminalStore.getState().consumeTranscript(externalTerminalId)
         } else if (initialScrollbackRef.current?.length)
-          restoreScrollback(terminal, initialScrollbackRef.current)
+          restoreScrollback(terminal, initialScrollbackRef.current, initialModesRef.current)
         if (onBoundToStoreTerminalRef.current) onBoundToStoreTerminalRef.current(externalTerminalId)
       }
     }
