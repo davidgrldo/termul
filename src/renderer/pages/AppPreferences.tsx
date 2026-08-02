@@ -34,12 +34,14 @@ import {
   useResetShortcut,
   useUpdateShortcut
 } from '@/hooks/use-keyboard-shortcuts'
-import { logApi, shellApi, terminalApi } from '@/lib/api'
+import { acpApi, logApi, shellApi, terminalApi } from '@/lib/api'
 import { availableColors, getColorClasses } from '@/lib/colors'
 import type { SettingsSearchEntry } from '@/lib/settings-search'
+import { isTauriContext } from '@/lib/tauri-runtime'
 import { isAurUpdateMode } from '@/lib/tauri-updater-api'
 import { cn } from '@/lib/utils'
 import {
+  useAcpTurnTimeout,
   useConfirmTerminalClose,
   useDefaultProjectColor,
   useDefaultShell,
@@ -57,6 +59,7 @@ import { useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
 import { useUpdaterActions, useUpdaterState } from '@/stores/updater-store'
 import type { ProjectColor } from '@/types/project'
 import {
+  ACP_TURN_TIMEOUT_OPTIONS,
   BUFFER_SIZE_OPTIONS,
   FONT_FAMILY_OPTIONS,
   MAX_TERMINALS_OPTIONS,
@@ -157,6 +160,12 @@ const APP_PREF_SEARCH_INDEX: SettingsSearchEntry[] = [
     keywords: ['acp', 'agent', 'coding assistant']
   },
   {
+    categoryId: 'ai-agents',
+    label: 'Turn Timeout',
+    description: 'Maximum wall-clock duration for a single agent turn (hard cap).',
+    keywords: ['acp', 'timeout', 'turn', 'hard cap', 'unlimited', 'wedge']
+  },
+  {
     categoryId: 'mcp-servers',
     label: 'MCP Servers',
     description: 'Manage global stdio, HTTP, and SSE servers for new agent sessions.',
@@ -209,6 +218,7 @@ export default function AppPreferences(): React.JSX.Element {
   const orphanDetectionTimeout = useOrphanDetectionTimeout()
   const _confirmTerminalClose = useConfirmTerminalClose()
   const terminalUrlOpenMode = useTerminalUrlOpenMode()
+  const acpTurnTimeoutSecs = useAcpTurnTimeout()
   const updateSetting = useUpdateAppSetting()
   const resetSettings = useResetAppSettings()
 
@@ -320,6 +330,16 @@ export default function AppPreferences(): React.JSX.Element {
       await terminalApi.updateOrphanDetection(orphanDetectionEnabled, value)
     } catch (error) {
       console.error('Failed to update orphan detection timeout:', error)
+    }
+  }
+
+  const handleAcpTurnTimeoutChange = async (value: number | null) => {
+    await updateSetting('acpTurnTimeoutSecs', value)
+    // Push to the Rust core so the next turn picks up the new hard cap.
+    try {
+      await acpApi.setTurnTimeout(value)
+    } catch (error) {
+      console.error('Failed to apply ACP turn timeout:', error)
     }
   }
 
@@ -739,8 +759,38 @@ export default function AppPreferences(): React.JSX.Element {
                   automatically.
                 </p>
               </div>
-              <div className="w-2/3">
+              <div className="w-2/3 space-y-4">
                 <AcpAgentsSettings />
+                <div>
+                  <label className="block text-sm font-medium text-secondary-foreground mb-2">
+                    Turn Timeout (hard cap)
+                  </label>
+                  <select
+                    value={acpTurnTimeoutSecs === null ? 'null' : String(acpTurnTimeoutSecs)}
+                    onChange={(e) =>
+                      handleAcpTurnTimeoutChange(
+                        e.target.value === 'null' ? null : parseInt(e.target.value, 10)
+                      )
+                    }
+                    disabled={!isTauriContext()}
+                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {ACP_TURN_TIMEOUT_OPTIONS.map((option) => (
+                      <option
+                        key={option.value === null ? 'null' : String(option.value)}
+                        value={option.value === null ? 'null' : String(option.value)}
+                      >
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Maximum wall-clock duration for a single agent turn. Active turns that stream
+                    continuously run until this cap; a silent (wedged) turn errors after ~15min
+                    regardless. The TERMUL_ACP_TURN_TIMEOUT_SECS env var still overrides this
+                    (operator/diagnostic). Desktop only — the standalone server uses the env var.
+                  </p>
+                </div>
               </div>
             </div>
           </SettingsSection>

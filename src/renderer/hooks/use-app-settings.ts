@@ -1,5 +1,5 @@
 import { useCallback, useEffect } from 'react'
-import { persistenceApi, terminalApi } from '@/lib/api'
+import { acpApi, persistenceApi, terminalApi } from '@/lib/api'
 import { getSystemAppearance, normalizeThemeFamilyId } from '@/lib/themes/theme-appearance'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
@@ -191,6 +191,14 @@ export function useAppSettingsLoader(): void {
       } catch (error) {
         console.error('Failed to apply orphan detection settings:', error)
       }
+
+      // Push the ACP turn-timeout override to the Rust core (desktop-only
+      // via the transport; the WS transport no-ops on the standalone server).
+      try {
+        await acpApi.setTurnTimeout(settings.acpTurnTimeoutSecs)
+      } catch (error) {
+        console.error('Failed to apply ACP turn timeout:', error)
+      }
     }
     load()
   }, [setSettings])
@@ -264,6 +272,13 @@ export function useResetAppSettings(): () => Promise<void> {
     const result = await persistenceApi.write(APP_SETTINGS_KEY, DEFAULT_APP_SETTINGS)
     if (result.success) {
       syncPersistedPanelSettingsSnapshot(DEFAULT_APP_SETTINGS)
+    }
+    // Clear the in-process turn-timeout override too (mirrors the load hook's
+    // push, so a reset doesn't leave a stale override in the Rust core).
+    try {
+      await acpApi.setTurnTimeout(DEFAULT_APP_SETTINGS.acpTurnTimeoutSecs)
+    } catch (error) {
+      console.error('Failed to clear ACP turn timeout on reset:', error)
     }
   }, [resetToDefaults])
 }
