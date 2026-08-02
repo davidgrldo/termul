@@ -67,6 +67,7 @@ import { spawnTerminalInPane } from '@/lib/terminal-spawn'
 import { getEffectiveThemeId } from '@/lib/themes'
 import { cn } from '@/lib/utils'
 import { getDefaultCwdForProject } from '@/lib/worktree-context'
+import { useAcpStore } from '@/stores/acp-store'
 import {
   useAppearanceMode,
   useColorTheme,
@@ -407,6 +408,20 @@ export default function WorkspaceLayout(): React.JSX.Element {
       if (!activeProjectId) return
       void saveTerminalLayout(activeProjectId).catch((error) => {
         console.warn('Failed to persist terminal layout before reload:', error)
+      })
+      // R4: force-flush a non-debounced snapshot of every live ACP session's
+      // cached payload on refresh unload so the durable copy is at worst one
+      // turn behind (never truncated by a live-window trim). Best-effort: a
+      // hard refresh may still abort the in-flight async drain (matching
+      // `persistSession`'s never-throw contract) — log on failure, never
+      // throw on unload.
+      try {
+        useAcpStore.getState().flushLiveSessionSaves()
+      } catch (error) {
+        console.warn('Failed to snapshot ACP sessions before reload:', error)
+      }
+      void flushSessionHistory().catch((error) => {
+        console.warn('Failed to flush ACP history before reload:', error)
       })
     }
 

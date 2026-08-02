@@ -13,6 +13,7 @@ import { useAcpAgents } from './hooks/use-acp-agents'
 import { useAcpHistory } from './hooks/use-acp-history'
 import { useAcpListeners } from './hooks/use-acp-listeners'
 import { useAcpMcp } from './hooks/use-acp-mcp'
+import { useAcpSessionResume } from './hooks/use-acp-session-resume'
 import { useAppSettingsLoader } from './hooks/use-app-settings'
 import { useAppliedColorThemeSync } from './hooks/use-color-theme'
 import { useContextBarSettings } from './hooks/use-context-bar-settings'
@@ -84,6 +85,7 @@ function AppEffects(): null {
   useAcpListeners()
   useAcpAgents()
   useAcpHistory()
+  useAcpSessionResume()
   useAcpMcp()
   usePreventFileDropNavigation()
   usePreventDefaultContextMenu()

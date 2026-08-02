@@ -36,6 +36,7 @@ import { useAcpAgents } from './hooks/use-acp-agents'
 import { useAcpHistory } from './hooks/use-acp-history'
 import { useAcpListeners } from './hooks/use-acp-listeners'
 import { useAcpMcp } from './hooks/use-acp-mcp'
+import { useAcpSessionResume } from './hooks/use-acp-session-resume'
 import { useKeyboardShortcutsLoader } from './hooks/use-keyboard-shortcuts'
 import { useMenuUpdaterListener } from './hooks/use-menu-updater-listener'
 import { usePreventFileDropNavigation } from './hooks/use-prevent-file-drop-navigation'
@@ -104,6 +105,7 @@ function AppEffects(): null {
   useAcpListeners()
   useAcpAgents()
   useAcpHistory()
+  useAcpSessionResume()
   useAcpMcp()
   useUpdateCheck()
   useUpdateToast()
