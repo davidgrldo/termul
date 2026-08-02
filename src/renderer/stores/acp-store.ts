@@ -501,11 +501,17 @@ interface AcpState {
 
   // Actions — conversation
   sendPrompt: (sessionId: SessionId, text: string) => Promise<void>
-  /** Send a prompt turn carrying structured content blocks (text + image/resource). */
+  /** Send a prompt turn carrying structured content blocks (text + image/resource).
+   *
+   * `blocks` is the wire payload dispatched to the agent. `options.displayBlocks`
+   * (optional) overrides the optimistic user message's blocks so the timeline
+   * can render inline skill chips (token text) while the agent receives the
+   * path-based wire framing. When omitted, the wire blocks are also used for
+   * the optimistic message (display == wire). */
   sendPromptBlocks: (
     sessionId: SessionId,
     blocks: ContentBlock[],
-    options?: { skipUserAppend?: boolean }
+    options?: { skipUserAppend?: boolean; displayBlocks?: ContentBlock[] }
   ) => Promise<void>
   cancelPrompt: (sessionId: SessionId) => Promise<void>
   removeQueuedPrompt: (sessionId: SessionId, queueId: string) => void
@@ -912,6 +918,7 @@ function recoverPromptToQueue(
   sessionId: SessionId,
   userMessage: ChatMessage,
   blocks: ContentBlock[],
+  displayBlocks: ContentBlock[] | undefined,
   previousOpenTurnId: string | null,
   attemptedTurnId: string,
   queuedOrigin?: QueuedPrompt
@@ -921,6 +928,7 @@ function recoverPromptToQueue(
       sessionId,
       userMessage,
       blocks,
+      displayBlocks,
       previousOpenTurnId,
       attemptedTurnId,
       createQueueId: nextQueueId,
@@ -955,7 +963,8 @@ function flushNextQueuedPrompt(set: TurnEndSetter, sessionId: SessionId): void {
     sessionId,
     next.blocks,
     (s, turnId) => acpApi.sendPromptBlocks(s.agentId, sessionId, next.blocks, turnId),
-    next
+    next,
+    next.displayBlocks ? { displayBlocks: next.displayBlocks } : undefined
   ).catch((err) => {
     // Busy recovery is handled inside runPromptTurn (FIFO restore via queuedOrigin).
     if (isPromptTurnInProgressError(err)) return
@@ -2116,12 +2125,17 @@ async function runPromptTurn(
   userBlocks: ContentBlock[],
   dispatch: (session: AcpSession, turnId: string) => Promise<StopReason>,
   queuedOrigin?: QueuedPrompt,
-  options?: { skipUserAppend?: boolean }
+  options?: { skipUserAppend?: boolean; displayBlocks?: ContentBlock[] }
 ): Promise<void> {
   const session = get().sessions[sessionId]
   if (!session) throw new Error(`unknown session ${sessionId}`)
   if (session.status === 'closed') throw new Error('session is closed')
   if (userBlocks.length === 0) throw new Error('prompt content must not be empty')
+
+  // The optimistic user message stores the display blocks (token text) so the
+  // timeline renders inline chips; the agent receives the wire blocks via
+  // `dispatch`. When no display override is given, display == wire.
+  const displayBlocks = options?.displayBlocks ?? userBlocks
 
   let enqueued = false
   let userMessage: ChatMessage | null = null
@@ -2152,7 +2166,13 @@ async function runPromptTurn(
         }
       }
       return {
-        promptQueues: appendQueuedPrompt(s.promptQueues, sessionId, userBlocks, nextQueueId)
+        promptQueues: appendQueuedPrompt(
+          s.promptQueues,
+          sessionId,
+          userBlocks,
+          nextQueueId,
+          options?.displayBlocks
+        )
       }
     }
 
@@ -2164,7 +2184,7 @@ async function runPromptTurn(
         userMessage = {
           id: `turn:${turnId}`,
           role: 'user',
-          blocks: userBlocks,
+          blocks: displayBlocks,
           streaming: false,
           timestamp: Date.now(),
           seq: nextSeq()
@@ -2192,7 +2212,7 @@ async function runPromptTurn(
     userMessage = {
       id: `turn:${turnId}`,
       role: 'user',
-      blocks: userBlocks,
+      blocks: displayBlocks,
       streaming: false,
       timestamp: Date.now(),
       seq: nextSeq()
@@ -2229,6 +2249,7 @@ async function runPromptTurn(
         sessionId,
         userMessage,
         userBlocks,
+        options?.displayBlocks,
         previousOpenTurnId,
         openTurnId,
         queuedOrigin
@@ -4115,7 +4136,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         sessionId,
         item.blocks,
         (s, turnId) => acpApi.sendPromptBlocks(s.agentId, sessionId, item.blocks, turnId),
-        item
+        item,
+        item.displayBlocks ? { displayBlocks: item.displayBlocks } : undefined
       )
     } catch (err) {
       set((s) => ({
