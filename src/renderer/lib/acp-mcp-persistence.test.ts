@@ -26,7 +26,7 @@ import {
 const registry: StoredMcpServer[] = [
   { id: 'stdio', type: 'stdio', name: 'Files', command: 'npx', enabled: true },
   { id: 'http', type: 'http', name: 'HTTP API', url: 'https://example.com/mcp', enabled: true },
-  { id: 'sse', type: 'sse', name: 'Events', url: 'https://example.com/sse', enabled: false }
+  { id: 'sse', type: 'sse', name: 'Events', url: 'https://example.com/sse', enabled: true }
 ]
 
 describe('MCP registry helpers', () => {
@@ -60,14 +60,22 @@ describe('MCP registry helpers', () => {
     expect(
       selectMcpServersForAgent(registry, { mcpCapabilities: { http: false, acp: true } })
     ).toEqual({
-      servers: [{ type: 'stdio', name: 'Files', command: 'npx' }],
-      skipped: [{ id: 'http', name: 'HTTP API', transport: 'http' }],
+      servers: [{ type: 'stdio', name: 'Files', command: 'npx', args: [], env: [] }],
+      skipped: [
+        { id: 'http', name: 'HTTP API', transport: 'http' },
+        { id: 'sse', name: 'Events', transport: 'sse' }
+      ],
       pending: false
     })
     expect(selectMcpServersForAgent(registry, { mcpCapabilities: { http: true } }).servers).toEqual(
       [
-        { type: 'stdio', name: 'Files', command: 'npx' },
-        { type: 'http', name: 'HTTP API', url: 'https://example.com/mcp' }
+        { type: 'stdio', name: 'Files', command: 'npx', args: [], env: [] },
+        {
+          type: 'http',
+          name: 'HTTP API',
+          url: 'https://example.com/mcp',
+          headers: []
+        }
       ]
     )
   })
@@ -75,8 +83,19 @@ describe('MCP registry helpers', () => {
   it('keeps enabled transports while capabilities are still pending', () => {
     expect(selectMcpServersForAgent(registry, null)).toEqual({
       servers: [
-        { type: 'stdio', name: 'Files', command: 'npx' },
-        { type: 'http', name: 'HTTP API', url: 'https://example.com/mcp' }
+        { type: 'stdio', name: 'Files', command: 'npx', args: [], env: [] },
+        {
+          type: 'http',
+          name: 'HTTP API',
+          url: 'https://example.com/mcp',
+          headers: []
+        },
+        {
+          type: 'sse',
+          name: 'Events',
+          url: 'https://example.com/sse',
+          headers: []
+        }
       ],
       skipped: [],
       pending: true
@@ -84,9 +103,10 @@ describe('MCP registry helpers', () => {
   })
 
   it('strips registry-only fields when building explicit selections', () => {
-    expect(buildMcpServers(registry, ['http', 'stdio'])).toEqual([
-      { type: 'http', name: 'HTTP API', url: 'https://example.com/mcp' },
-      { type: 'stdio', name: 'Files', command: 'npx' }
+    expect(buildMcpServers(registry, ['http', 'stdio', 'sse'])).toEqual([
+      { type: 'http', name: 'HTTP API', url: 'https://example.com/mcp', headers: [] },
+      { type: 'stdio', name: 'Files', command: 'npx', args: [], env: [] },
+      { type: 'sse', name: 'Events', url: 'https://example.com/sse', headers: [] }
     ])
   })
 })
