@@ -13,8 +13,9 @@ interface IconActionButtonProps {
 
 /**
  * Compact chat/streamdown-style icon control: color-only hover, shared
- * tooltip, press scale from global button feedback. Hit area matches
- * Streamdown (`p-1` + 14px icon), not the older size-10 chip.
+ * tooltip, press scale from global button feedback. Layout slot is 44×44
+ * (WCAG touch) with a centered Streamdown-sized glyph so adjacent actions
+ * never share overlapping hit regions.
  */
 export function IconActionButton({
   label,
@@ -32,11 +33,12 @@ export function IconActionButton({
           disabled={disabled}
           onClick={onClick}
           className={cn(
-            // Fixed flex box so Copy (IconSwap) and bare SVGs share one centerline.
-            'inline-flex size-6 shrink-0 items-center justify-center',
+            // 44×44 layout slot; glyph stays Streamdown-sized via [&_svg].
+            'relative inline-flex size-11 shrink-0 items-center justify-center',
             'cursor-pointer text-muted-foreground transition-colors duration-150',
-            'hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50',
-            '[&_svg]:block [&_svg]:size-3.5 [&_svg]:shrink-0',
+            'hover:text-foreground disabled:cursor-not-allowed disabled:text-muted-foreground/50',
+            // Let explicit success/destructive tokens on the glyph win over muted.
+            '[&_svg]:block [&_svg]:size-3.5 [&_svg]:shrink-0 [&_svg.text-success]:text-success',
             className
           )}
         >

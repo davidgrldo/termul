@@ -26,8 +26,8 @@ describe('measureSkillPadding', () => {
   })
 
   it('exposes the chip overhead constant matching SkillChip classes', () => {
-    // px-1.5 (12) + border (2) + gap-1 (4) + Sparkles size 12 (12) = 30
-    expect(SKILL_CHIP_OVERHEAD_PX).toBe(30)
+    // px-2 (16) + border (2) + gap-1 (4) + Sparkles size 12 (12) = 34
+    expect(SKILL_CHIP_OVERHEAD_PX).toBe(34)
   })
 })
 

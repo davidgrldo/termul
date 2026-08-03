@@ -1,43 +1,16 @@
-import { Search, Trash2 } from 'lucide-react'
+import { Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { groupSessionsByRecency, scopeSessionIndex } from '@/lib/acp-history-persistence'
-import { cn } from '@/lib/utils'
-import {
-  configIdFromReuseKey,
-  discoveryKey,
-  useAcpStore,
-  useAgentTemplateId
-} from '@/stores/acp-store'
+import { configIdFromReuseKey, discoveryKey, useAcpStore } from '@/stores/acp-store'
 import { getActiveWorktreeFromStore, useActiveProject } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
-import { AgentGlyph } from './AgentGlyph'
+import { ChatHistoryEntryRow, type ChatHistorySidebarEntry } from './ChatHistoryEntryRow'
 
 /** How many sidebar rows to render per lazy-load page. */
 const SIDEBAR_PAGE_SIZE = 50
 
-/** A unified sidebar entry: either from the local mirror or discovered via session/list. */
-interface SidebarEntry {
-  /** Session id (same as sessionId for discovered entries). */
-  id: string
-  title: string
-  messageCount: number
-  status: string
-  /** True when this entry comes from agent discovery (not the local mirror). */
-  discovered: boolean
-  /** Agent id (used to resolve the icon and, for discovered entries, to open). */
-  agentId?: string
-  /** Owning agent config id, used to resolve the per-CLI icon. */
-  agentConfigId?: string
-  /** Owning agent display name (e.g. "Codex CLI"), for discovered entries. */
-  agentName?: string | null
-  /** Cwd for discovered entries (used to open via load/resume). */
-  cwd?: string
-  /** Last activity timestamp (for grouping). */
-  lastActivityAt: number
-  /** Whether this entry can be opened (agent has load or resume capability). */
-  canOpen: boolean
-}
+type SidebarEntry = ChatHistorySidebarEntry
 
 /** Sidebar tab listing persisted + discovered chat sessions, grouped by recency with search. */
 export function ChatHistoryTab({
@@ -213,8 +186,8 @@ export function ChatHistoryTab({
           // background just like local mirrors.
           const opening = openDiscoveredSession(entry.agentId, entry.id, entry.cwd, activeProjectId)
           addAgentChatTab(entry.id)
-          void opening.catch((err) => {
-            toast.error(`Failed to open chat: ${String(err)}`)
+          void opening.catch(() => {
+            toast.error('Could not open that chat. Try again.')
           })
         } else {
           // Register the restore synchronously before focusing the tab so its
@@ -222,13 +195,13 @@ export function ChatHistoryTab({
           // in the background after the local transcript becomes usable.
           const opening = openHistorySession(entry.id)
           addAgentChatTab(entry.id)
-          void opening.catch((err) => {
-            toast.error(`Failed to reconnect chat: ${String(err)}`)
+          void opening.catch(() => {
+            toast.error('Could not reconnect. Try again.')
           })
         }
         onSessionOpened?.()
-      } catch (err) {
-        toast.error(`Failed to open chat: ${String(err)}`)
+      } catch {
+        toast.error('Could not open that chat. Try again.')
       }
     },
     [addAgentChatTab, openHistorySession, openDiscoveredSession, activeProjectId, onSessionOpened]
@@ -236,8 +209,8 @@ export function ChatHistoryTab({
 
   const handleDelete = useCallback(
     (id: string) => {
-      void deleteHistorySession(id).catch((err) => {
-        toast.error(`Failed to delete chat: ${String(err)}`)
+      void deleteHistorySession(id).catch(() => {
+        toast.error('Could not delete that chat. Try again.')
       })
     },
     [deleteHistorySession]
@@ -272,51 +245,12 @@ export function ChatHistoryTab({
             <div key={group}>
               <div className="label-group px-3 py-1 text-muted-foreground/70">{group}</div>
               {entries.map((entry) => (
-                <div
+                <ChatHistoryEntryRow
                   key={entry.id}
-                  className={cn(
-                    'group flex w-full items-center gap-2 pr-2 hover:bg-sidebar-accent',
-                    entry.status === 'closed' && 'opacity-70',
-                    entry.discovered && !entry.canOpen && 'opacity-50'
-                  )}
-                >
-                  <button
-                    type="button"
-                    disabled={entry.discovered && !entry.canOpen}
-                    onClick={() => void handleOpen(entry)}
-                    title={
-                      entry.discovered && !entry.canOpen
-                        ? 'Agent does not support loading or resuming sessions'
-                        : entry.discovered && entry.agentName
-                          ? `${entry.title} — ${entry.agentName} (resume from CLI history)`
-                          : entry.title
-                    }
-                    className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left text-xs disabled:cursor-not-allowed"
-                  >
-                    <ChatEntryIcon agentId={entry.agentId} agentConfigId={entry.agentConfigId} />
-                    <span className="truncate flex-1 text-sidebar-foreground">{entry.title}</span>
-                    {entry.discovered ? (
-                      entry.agentName ? (
-                        <span className="text-3xs text-muted-foreground/70 shrink-0">
-                          {entry.agentName}
-                        </span>
-                      ) : null
-                    ) : (
-                      <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
-                    )}
-                  </button>
-                  {!entry.discovered && (
-                    <button
-                      type="button"
-                      aria-label="Delete chat"
-                      title="Delete chat"
-                      onClick={() => handleDelete(entry.id)}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded-md hover:bg-background/50"
-                    >
-                      <Trash2 size={11} />
-                    </button>
-                  )}
-                </div>
+                  entry={entry}
+                  onOpen={(e) => void handleOpen(e)}
+                  onDelete={handleDelete}
+                />
               ))}
             </div>
           ))
@@ -335,16 +269,4 @@ export function ChatHistoryTab({
       </div>
     </div>
   )
-}
-
-/** Resolve the agent's bundled registry icon for a history/discovered entry. */
-function ChatEntryIcon({
-  agentId,
-  agentConfigId
-}: {
-  agentId?: string
-  agentConfigId?: string
-}): React.JSX.Element {
-  const templateId = useAgentTemplateId(agentId ?? null, agentConfigId)
-  return <AgentGlyph templateId={templateId} size={12} className="text-muted-foreground" />
 }

@@ -16,10 +16,11 @@
  * The transparent textarea renders the token text as invisible glyphs, so the
  * token's visible width is just the `name` (sentinels are zero-width in most
  * fonts). The overlay's `SkillChip` pill is wider than that — it adds an icon,
- * pill padding, border, and gap, and renders the name at `text-xs` while the
- * textarea uses `text-sm`. Without compensation the textarea caret (placed at
- * the end of the token text) lands to the LEFT of the chip's right edge, so the
- * caret appears "behind" the chip by the chip's overhead.
+ * pill padding, border, and gap, and renders the name at `font-medium` while the
+ * textarea uses regular weight (both share size via `text-inherit`). Without
+ * compensation the textarea caret (placed at the end of the token text) lands
+ * to the LEFT of the chip's right edge, so the caret appears "behind" the chip
+ * by the chip's overhead.
  *
  * To keep the caret aligned, each token may carry an optional PADDING BLOCK
  * (`\uE002<padding>\uE003`) immediately after the name token. The padding is a

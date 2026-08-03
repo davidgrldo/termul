@@ -17,7 +17,8 @@ import { persistenceApi } from '@/lib/api'
 import { registerSessionTempFiles } from '@/lib/attachment-temp-cleanup'
 import { cn } from '@/lib/utils'
 import type { AcpSession, QueuedPrompt } from '@/stores/acp-store'
-import { useAcpMessages, useAcpStore, useSessionUsage } from '@/stores/acp-store'
+import { useAcpMessages, useAcpStore, useAgentIdentity, useSessionUsage } from '@/stores/acp-store'
+import { AgentGlyph } from './AgentGlyph'
 import { ConfigChip, ModeChip } from './AgentHeader'
 import { AttachFilesButton } from './AttachFilesButton'
 import { AttachmentPreviewGroup } from './AttachmentPreviewGroup'
@@ -25,12 +26,14 @@ import { CommandChip } from './CommandChip'
 import { ContextUsageIndicator } from './ContextUsageIndicator'
 import { attachmentToBlock, dedupeAttachmentBlocks } from './chat-attachments'
 import {
+  extractFastModeOption,
   filterDuplicateModeConfigOptions,
   partitionConfigOptions,
   resolveModelOption
 } from './chat-input-bar-config'
 import { CHAT_GUTTER_X, useComposerToolbarMode } from './chat-layout'
 import { iconPop } from './chat-motion'
+import { FastModeToggle } from './FastModeToggle'
 import { FileMentionMenu } from './FileMentionMenu'
 import { McpBadge } from './McpBadge'
 import { PromptQueuePanel } from './PromptQueuePanel'
@@ -124,9 +127,13 @@ export function ChatInputBar({
   } = partitionConfigOptions(usableConfigOptions)
   const { option: modelOption, source: modelSource } = resolveModelOption(model, session.models)
   const visibleGenericConfigOptions = filterDuplicateModeConfigOptions(genericConfigOptions, modes)
+  const { fastMode, rest: nonFastGenericOptions } = extractFastModeOption(
+    visibleGenericConfigOptions
+  )
   const { skills: availableSkills } = useAgentSkills(projectRoot ?? session.cwd)
   const sessionUsage = useSessionUsage(session.id)
   const messages = useAcpMessages(session.id)
+  const { templateId: agentTemplateId } = useAgentIdentity(session.agentId)
   // Prefer project/session-scoped MCP context. Older/local sessions without a
   // recorded count retain the existing global-registry fallback.
   const globalMcpCount = useAcpStore((s) => s.mcpServers.length)
@@ -204,6 +211,20 @@ export function ChatInputBar({
     }, 400)
     return () => clearTimeout(handle)
   }, [value, draftKey, seedNonce, canPersistDraft])
+
+  // Flush the latest draft on unmount only (AskUserQuestion replaces the
+  // composer). Keep a ref so we do not defeat the debounce on every keystroke.
+  const draftValueRef = useRef(value)
+  draftValueRef.current = value
+  useEffect(() => {
+    return () => {
+      if (seedNonce !== undefined) return
+      if (!canPersistDraft) return
+      const latest = draftValueRef.current
+      if (!latest) return
+      void persistenceApi.write(draftKey, latest).catch(() => {})
+    }
+  }, [draftKey, seedNonce, canPersistDraft])
   const [sending, setSending] = useState(false)
   const [focused, setFocused] = useState(false)
   const [dragActive, setDragActive] = useState(false)
@@ -378,7 +399,9 @@ export function ChatInputBar({
       resetMentions()
       resetHeight()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to send message')
+      // Skill path resolution throws a specific user-facing message — keep it.
+      const msg = err instanceof Error ? err.message : ''
+      toast.error(msg.includes('missing a path') ? msg : 'Could not send your message. Try again.')
     } finally {
       setSending(false)
     }
@@ -465,6 +488,9 @@ export function ChatInputBar({
       disabled={disabled}
       searchable
       maxVisibleOptions={5}
+      leading={
+        <AgentGlyph templateId={agentTemplateId} size={13} className="text-muted-foreground" />
+      }
       onSelect={(valueId) =>
         modelSource === 'models' ? onSetModel(valueId) : onSetConfig(modelOption.id, valueId)
       }
@@ -481,16 +507,26 @@ export function ChatInputBar({
     />
   ) : null
 
-  const genericChips = hasConfigOptions
-    ? visibleGenericConfigOptions.map((option) => (
-        <ConfigChip
-          key={option.id}
-          option={option}
-          disabled={disabled}
-          onSelect={(valueId) => onSetConfig(option.id, valueId)}
-        />
-      ))
-    : null
+  const fastModeToggle = fastMode ? (
+    <FastModeToggle
+      key={fastMode.id}
+      option={fastMode}
+      disabled={disabled}
+      onSelect={(valueId) => onSetConfig(fastMode.id, valueId)}
+    />
+  ) : null
+
+  const genericChips =
+    nonFastGenericOptions.length > 0
+      ? nonFastGenericOptions.map((option) => (
+          <ConfigChip
+            key={option.id}
+            option={option}
+            disabled={disabled}
+            onSelect={(valueId) => onSetConfig(option.id, valueId)}
+          />
+        ))
+      : null
 
   const agentModeChip = (
     <ModeChip session={session} disabled={disabled} onSelect={onSetMode} label="Agent" />
@@ -516,6 +552,14 @@ export function ChatInputBar({
   return (
     <div ref={rootRef} className={cn(CHAT_GUTTER_X, 'pb-2 pt-3')}>
       <div className="relative mx-auto w-full max-w-3xl">
+        {disabled && (
+          <div
+            role="status"
+            className="mb-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
+          >
+            Session closed
+          </div>
+        )}
         {queue.length > 0 && onRemoveQueued && onSendQueuedNow && (
           <PromptQueuePanel items={queue} onRemove={onRemoveQueued} onSendNow={onSendQueuedNow} />
         )}
@@ -536,18 +580,12 @@ export function ChatInputBar({
             inputRef={textareaRef}
           />
         )}
-        <BorderBeam
-          size="md"
-          colorVariant="colorful"
-          theme="dark"
-          borderRadius={16}
-          active={busy}
-          className="w-full"
-        >
+        <ComposerBeamShell busy={busy} reduced={reduced}>
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             className={cn(
-              'relative rounded-2xl border border-border/60 bg-card transition-colors focus-within:border-border',
+              'relative rounded-2xl border border-border/60 bg-card transition-[border-color,box-shadow]',
+              'focus-within:border-border focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring',
               dragActive && 'border-primary/70'
             )}
             onDragEnter={handleDragEnter}
@@ -608,16 +646,17 @@ export function ChatInputBar({
                   rows={1}
                   placeholder={
                     disabled
-                      ? 'Session closed'
+                      ? 'Composer unavailable'
                       : activeCommand
                         ? 'Add a message (optional)…'
                         : 'Ask anything… (/ for commands, @ for files)'
                   }
                   className={cn(
-                    'relative z-10 min-h-[52px] w-full resize-none bg-transparent text-sm leading-relaxed',
+                    // text-base (16px): floor for iOS Safari — sub-16px inputs zoom on focus.
+                    'relative z-10 min-h-[52px] w-full resize-none bg-transparent text-base leading-relaxed',
                     hasSkillToken ? 'text-transparent caret-foreground' : 'text-foreground',
                     'placeholder:text-muted-foreground focus:outline-none',
-                    'disabled:cursor-not-allowed disabled:opacity-50 max-h-40'
+                    'disabled:cursor-not-allowed disabled:text-muted-foreground disabled:placeholder:text-muted-foreground/70 max-h-40'
                   )}
                 />
               </div>
@@ -654,6 +693,7 @@ export function ChatInputBar({
                           data-composer-toolbar-row="2"
                         >
                           {thoughtChip}
+                          {fastModeToggle}
                           {genericChips}
                           {mcpBadge}
                         </div>
@@ -668,6 +708,7 @@ export function ChatInputBar({
                 >
                   {modelChip}
                   {thoughtChip}
+                  {fastModeToggle}
                   {genericChips}
                   {agentModeChip}
                   {mcpBadge}
@@ -681,7 +722,7 @@ export function ChatInputBar({
               >
                 <ContextUsageIndicator usage={sessionUsage} messages={messages} />
                 {canPick && <AttachFilesButton onClick={() => void pickFiles()} />}
-                <div className="relative size-[34px] shrink-0 overflow-visible">
+                <div className="relative size-8 shrink-0 overflow-visible">
                   <AnimatePresence initial={false} mode="popLayout">
                     {showStop ? (
                       <motion.button
@@ -693,14 +734,14 @@ export function ChatInputBar({
                         aria-label="Cancel turn"
                         initial={iconMotion.initial}
                         animate={iconMotion.animate}
-                        exit={iconMotion.initial}
+                        exit={iconMotion.exit}
                         transition={iconMotion.transition}
                         className={cn(
-                          'absolute inset-0 flex items-center justify-center rounded-lg bg-foreground text-background transition-transform hover:bg-foreground/90 active:scale-[0.96]',
+                          'absolute inset-0 flex items-center justify-center rounded-md bg-foreground text-background transition-transform hover:bg-foreground/90 active:scale-[0.97]',
                           EMBOSSED_BUTTON
                         )}
                       >
-                        <Square size={12} fill="currentColor" strokeWidth={0} />
+                        <Square size={10} fill="currentColor" strokeWidth={0} />
                       </motion.button>
                     ) : (
                       <motion.button
@@ -713,19 +754,19 @@ export function ChatInputBar({
                         aria-label={busy ? 'Queue message' : 'Send message'}
                         initial={iconMotion.initial}
                         animate={iconMotion.animate}
-                        exit={iconMotion.initial}
+                        exit={iconMotion.exit}
                         transition={iconMotion.transition}
                         className={cn(
-                          'absolute inset-0 flex items-center justify-center rounded-lg transition-transform',
+                          'absolute inset-0 flex items-center justify-center rounded-md transition-transform',
                           canSend
                             ? cn(
-                                'bg-foreground text-background hover:bg-foreground/90 active:scale-[0.96]',
+                                'bg-foreground text-background hover:bg-foreground/90 active:scale-[0.97]',
                                 EMBOSSED_BUTTON
                               )
                             : 'cursor-not-allowed bg-muted text-muted-foreground'
                         )}
                       >
-                        <ArrowUp size={16} strokeWidth={2.5} />
+                        <ArrowUp size={14} strokeWidth={2.5} />
                       </motion.button>
                     )}
                   </AnimatePresence>
@@ -733,7 +774,7 @@ export function ChatInputBar({
               </div>
             </div>
           </div>
-        </BorderBeam>
+        </ComposerBeamShell>
         <div
           className={cn(
             'flex items-center px-1 pt-1.5 text-3xs text-muted-foreground transition-opacity duration-150',
@@ -760,4 +801,34 @@ export function ChatInputBar({
 /** Inline keyboard-key hint used in the composer footer. */
 function KbdHint({ k }: { k: string }): React.JSX.Element {
   return <kbd className="mr-1 font-mono text-[0.6rem] font-medium text-foreground">{k}</kbd>
+}
+
+/**
+ * BorderBeam only when motion is allowed. Under prefers-reduced-motion the beam
+ * wrapper is omitted entirely (no keyframes / data-active), not merely paused.
+ */
+function ComposerBeamShell({
+  busy,
+  reduced,
+  children
+}: {
+  busy: boolean
+  reduced: boolean
+  children: React.ReactNode
+}): React.JSX.Element {
+  if (reduced) {
+    return <div className="w-full">{children}</div>
+  }
+  return (
+    <BorderBeam
+      size="md"
+      colorVariant="mono"
+      theme="auto"
+      borderRadius={16}
+      active={busy}
+      className="w-full"
+    >
+      {children}
+    </BorderBeam>
+  )
 }

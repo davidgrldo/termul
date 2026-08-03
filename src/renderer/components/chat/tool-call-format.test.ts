@@ -6,6 +6,7 @@ import {
   isAllowOption,
   isRejectOption,
   kindIcon,
+  pickPrimaryAllowOption,
   pickRejectOption,
   statusStyle
 } from './tool-call-format'
@@ -129,5 +130,18 @@ describe('permission option helpers', () => {
   it('picks a reject option when present, null otherwise', () => {
     expect(pickRejectOption(options)?.optionId).toBe('r1')
     expect(pickRejectOption(options.slice(0, 2))).toBeNull()
+  })
+  it('prefers reject_once over reject_always for dismiss', () => {
+    const withAlwaysFirst: PermissionOption[] = [
+      { optionId: 'ra', name: 'Reject always', kind: 'reject_always' },
+      { optionId: 'ro', name: 'Reject once', kind: 'reject_once' }
+    ]
+    expect(pickRejectOption(withAlwaysFirst)?.optionId).toBe('ro')
+    expect(pickRejectOption(withAlwaysFirst.slice(0, 1))?.optionId).toBe('ra')
+  })
+  it('picks allow_once as the primary allow when present', () => {
+    expect(pickPrimaryAllowOption(options)?.optionId).toBe('a1')
+    expect(pickPrimaryAllowOption(options.slice(1, 2))?.optionId).toBe('a2')
+    expect(pickPrimaryAllowOption([])).toBeNull()
   })
 })

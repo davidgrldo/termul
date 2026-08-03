@@ -21,7 +21,8 @@ interface MessageActionsProps {
 
 /**
  * Toolbar for a chat message — copy, plus optional edit (user turns) and
- * retry (assistant turns). Hover-revealed by default; pinned stays visible.
+ * retry (assistant turns). Fine-pointer: hover-revealed (pinned stays visible).
+ * Coarse pointer / touch: always soft-visible so actions stay discoverable.
  * No action pill: icons flush with prose left edge (assistant) / bubble (user).
  */
 export function MessageActions({
@@ -49,10 +50,13 @@ export function MessageActions({
   return (
     <div
       className={cn(
-        // -ml-1 pulls the size-6 hit box so the 14px glyph lines up with prose.
+        // size-11 icon slots already provide spacing; keep a tight visual row.
         'flex items-center gap-0.5 transition-opacity duration-150 focus-within:opacity-100',
-        pinned ? 'opacity-100' : 'opacity-0 group-hover/message:opacity-100',
-        align === 'start' && '-ml-1',
+        // Touch / coarse: always visible. Fine pointer: hover-reveal unless pinned.
+        pinned
+          ? 'opacity-100'
+          : 'opacity-100 pointer-fine:opacity-0 pointer-fine:group-hover/message:opacity-100',
+        align === 'start' && '-ml-2.5',
         align === 'end' && 'justify-end',
         className
       )}
@@ -60,7 +64,7 @@ export function MessageActions({
       <div className={cn('flex items-center gap-0.5', align === 'end' && 'flex-row-reverse')}>
         <IconActionButton label={copied ? 'Copied' : 'Copy'} onClick={copy}>
           <IconSwap iconKey={copied}>
-            {copied ? <Check className="text-green-400" /> : <Copy />}
+            {copied ? <Check className="text-success" /> : <Copy />}
           </IconSwap>
         </IconActionButton>
         {onEdit && (

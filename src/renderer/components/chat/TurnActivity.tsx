@@ -6,8 +6,9 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { ShimmerText } from '@/components/ui/shimmer-text'
 import { cn } from '@/lib/utils'
 import { ChatMessage } from './ChatMessage'
-import { CHAT_SPRING } from './chat-motion'
+import { CHEVRON_TRANSITION } from './chat-motion'
 import type { TimelineItem } from './chat-timeline'
+import { formatTurnDuration } from './format-turn-duration'
 import { ThoughtGroup } from './ThoughtGroup'
 import { ToolCallCard } from './ToolCallCard'
 
@@ -18,18 +19,6 @@ interface TurnActivityProps {
   attentionRequired: boolean
   hasFinalResponse: boolean
   shouldAnimateEnter: (id: string) => boolean
-}
-
-/** Whole-second duration without implying precision the available timestamps do not have. */
-function formatTurnDuration(durationMs: number | null): string | null {
-  if (durationMs === null) return null
-  const totalSeconds = Math.max(1, Math.round(durationMs / 1000))
-  const hours = Math.floor(totalSeconds / 3600)
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  const seconds = totalSeconds % 60
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
-  if (minutes > 0) return `${minutes}m ${seconds}s`
-  return `${seconds}s`
 }
 
 /** Borderless, turn-level disclosure for reasoning, tools, and intermediate narration. */
@@ -63,14 +52,14 @@ export function TurnActivity({
         data-press-feedback="off"
         className={cn(
           'flex min-h-8 w-full cursor-pointer items-center gap-1.5 text-left text-xs text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
-          attentionRequired && !active && 'text-red-400'
+          attentionRequired && !active && 'text-destructive'
         )}
       >
         <motion.span
           aria-hidden="true"
           className="shrink-0"
           animate={{ rotate: open ? 90 : 0 }}
-          transition={reduced ? { duration: 0 } : CHAT_SPRING}
+          transition={reduced ? { duration: 0 } : CHEVRON_TRANSITION}
         >
           <ChevronRight size={13} />
         </motion.span>
@@ -115,5 +104,3 @@ export function TurnActivity({
     </Collapsible>
   )
 }
-
-export { formatTurnDuration }

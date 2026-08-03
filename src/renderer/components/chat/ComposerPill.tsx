@@ -23,7 +23,7 @@ const composerPillVariants = cva(
   {
     variants: {
       interactive: {
-        true: 'transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50',
+        true: 'transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:text-muted-foreground/50 disabled:hover:text-muted-foreground/50',
         false: ''
       }
     },
@@ -71,7 +71,7 @@ function TrailingAffordance({
             className="inline-flex"
             initial={pop.initial}
             animate={pop.animate}
-            exit={pop.initial}
+            exit={pop.exit}
             transition={pop.transition}
           >
             <Spinner
@@ -85,7 +85,7 @@ function TrailingAffordance({
             className="inline-flex"
             initial={pop.initial}
             animate={pop.animate}
-            exit={pop.initial}
+            exit={pop.exit}
             transition={pop.transition}
           >
             <ChevronDown size={12} className="shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -153,5 +153,3 @@ export const ComposerPill = React.forwardRef<HTMLButtonElement, ComposerPillProp
   }
 )
 ComposerPill.displayName = 'ComposerPill'
-
-export { composerPillVariants }

@@ -7,10 +7,11 @@
  * (`\uE000<name>\uE001`) as invisible glyphs, so the token's visible width is
  * just the `name` (sentinels are zero-width in most fonts). The overlay's
  * `SkillChip` is wider than that — it adds a `Sparkles` icon, pill padding
- * (`px-1.5`), border, gap, and renders the name at `text-xs` while the textarea
- * uses `text-sm`. Without compensation the textarea caret (placed at the end of
- * the token text) lands to the LEFT of the chip's right edge — "behind" the
- * chip by the chip's overhead (roughly 6 chars for a 12-char skill name).
+ * (`px-2`), border, gap, and renders the name at `font-medium` while the
+ * textarea uses regular weight (both share size via `text-inherit` /
+ * computed textarea font-size). Without compensation the textarea caret
+ * (placed at the end of the token text) lands to the LEFT of the chip's right
+ * edge — "behind" the chip by the chip's overhead.
  *
  * `measureSkillPadding` returns a run of FIGURE SPACE chars whose total width
  * fills the gap between the chip's rendered width and the token text's natural
@@ -25,16 +26,11 @@ import { SKILL_PAD_CHAR } from '@/lib/skill-tokens'
 
 /**
  * Horizontal overhead of the `SkillChip` pill beyond its name text, in CSS px.
- * Sum of: `px-1.5` (6+6) + `border` (1+1) + `gap-1` (4) + `Sparkles size=12`
- * = 30. MUST be kept in sync with `SkillChip.tsx`'s classes; if the chip's
+ * Sum of: `px-2` (8+8) + `border` (1+1) + `gap-1` (4) + `Sparkles size=12`
+ * = 34. MUST be kept in sync with `SkillChip.tsx`'s classes; if the chip's
  * padding/border/gap/icon changes, update this constant.
  */
-export const SKILL_CHIP_OVERHEAD_PX = 30
-
-// Tailwind text-sm / text-xs rem ratios (0.875rem / 0.75rem). The textarea
-// (text-sm) is the width reference; the chip name uses text-xs. Derived from
-// the textarea's computed font-size so a non-standard rem base still works.
-const TEXT_XS_RATIO = 12 / 14
+export const SKILL_CHIP_OVERHEAD_PX = 34
 
 let canvasCtx: CanvasRenderingContext2D | null = null
 
@@ -64,10 +60,8 @@ export function measureSkillPadding(name: string, textareaEl: HTMLTextAreaElemen
   const cs = window.getComputedStyle(textareaEl)
   const fontFamily = cs.fontFamily || 'sans-serif'
   const taWeight = cs.fontWeight || '400'
-  // The textarea renders at text-sm; read the actual computed size so a
-  // non-standard rem base / zoom is respected.
+  // Chip uses `text-inherit`, so name size matches the textarea's computed size.
   const taSize = parseFloat(cs.fontSize) || 14
-  const xsSize = taSize * TEXT_XS_RATIO
 
   // Token text width: the name in the textarea's font (sentinels are
   // zero-width, so only the name contributes).
@@ -75,8 +69,8 @@ export function measureSkillPadding(name: string, textareaEl: HTMLTextAreaElemen
   const tokenNameWidth = ctx.measureText(name).width
   const padCharWidth = ctx.measureText(SKILL_PAD_CHAR).width
 
-  // Chip name width: the name in the chip's font (text-xs, font-medium=500).
-  ctx.font = `500 ${xsSize}px ${fontFamily}`
+  // Chip name width: same size as textarea, font-medium=500.
+  ctx.font = `500 ${taSize}px ${fontFamily}`
   const chipNameWidth = ctx.measureText(name).width
 
   const chipWidth = SKILL_CHIP_OVERHEAD_PX + chipNameWidth

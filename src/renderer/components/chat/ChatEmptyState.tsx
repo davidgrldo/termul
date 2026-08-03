@@ -1,8 +1,8 @@
 import { motion, type Transition, useReducedMotion } from 'framer-motion'
 import { Bug, FileText, ListChecks, Sparkles } from 'lucide-react'
-import { TermulMark } from '@/components/TermulMark'
 import type { AgentId } from '@/lib/acp-api'
 import { useAgentIdentity } from '@/stores/acp-store'
+import { AgentGlyph } from './AgentGlyph'
 import { CHAT_SPRING } from './chat-motion'
 
 interface Suggestion {
@@ -43,20 +43,20 @@ interface ChatEmptyStateProps {
 /** First-run state for an empty thread: agent identity + clickable starter prompts. */
 export function ChatEmptyState({ agentId, onPick }: ChatEmptyStateProps): React.JSX.Element {
   const reduced = useReducedMotion() ?? false
-  const { name } = useAgentIdentity(agentId)
+  const { name, templateId } = useAgentIdentity(agentId)
   const transition = (i: number): Transition =>
-    reduced ? { duration: 0.15 } : { ...CHAT_SPRING, delay: 0.04 * i }
+    reduced ? { duration: 0 } : { ...CHAT_SPRING, delay: 0.04 * i }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
       <motion.div
         className="flex flex-col items-center gap-3"
-        initial={reduced ? { opacity: 0 } : { opacity: 0, y: 8, scale: 0.96 }}
+        initial={reduced ? false : { opacity: 0, y: 8, scale: 0.96 }}
         animate={reduced ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
         transition={transition(0)}
       >
         <div className="flex size-12 items-center justify-center rounded-2xl bg-secondary/60">
-          <TermulMark size={24} className="text-foreground" />
+          <AgentGlyph templateId={templateId} size={24} className="text-foreground" />
         </div>
         <div>
           <h2 className="text-base font-semibold text-foreground">
@@ -73,8 +73,8 @@ export function ChatEmptyState({ agentId, onPick }: ChatEmptyStateProps): React.
               key={s.label}
               type="button"
               onClick={() => onPick(s.prompt)}
-              initial={reduced ? { opacity: 0 } : { opacity: 0, y: 8 }}
-              animate={reduced ? { opacity: 1 } : { opacity: 1, y: 0 }}
+              initial={reduced ? false : { opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
               transition={transition(i + 1)}
               whileTap={reduced ? undefined : { scale: 0.97 }}
               className="flex items-center gap-2.5 rounded-lg border border-border/60 bg-secondary/30 px-3.5 py-2.5 text-left text-sm text-foreground transition-colors hover:border-border hover:bg-secondary/60"

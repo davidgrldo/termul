@@ -47,7 +47,9 @@ export type QueueItemActionProps = Omit<ComponentProps<typeof Button>, 'variant'
 export const QueueItemAction = ({ className, ...props }: QueueItemActionProps) => (
   <Button
     className={cn(
-      'size-auto rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted-foreground/10 hover:text-foreground group-hover:opacity-100',
+      // 44×44 layout slot so adjacent queue actions do not share hit regions.
+      'relative size-11 shrink-0 rounded-md p-0 text-muted-foreground',
+      'opacity-100 transition-colors hover:bg-muted-foreground/10 hover:text-foreground',
       className
     )}
     size="icon"
