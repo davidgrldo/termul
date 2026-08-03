@@ -9,9 +9,10 @@
 //! so the manager and any future renderer bridge stay in sync.
 
 use crate::acp::config::{AgentId, SessionId};
-use agent_client_protocol::schema::{
-    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan, SessionConfigOption,
-    SessionMode, SessionModeId, SessionModelState, StopReason, ToolCall, ToolCallUpdate,
+use agent_client_protocol::schema::v1::{
+    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionMode, SessionModeId, StopReason, ToolCall, ToolCallUpdate,
 };
 use serde::Serialize;
 
@@ -24,6 +25,103 @@ use serde::Serialize;
 /// The ONLY place that still calls `AppHandle::emit` for `acp:*` events is
 /// `crate::web::TauriEventSink::emit` (the desktop's sink). See AC7.
 pub(crate) use crate::web::fan_out;
+
+/// A single selectable model advertised by an ACP agent.
+///
+/// Mirror of the pre-1.3 schema `SessionModel` wire shape (`{ modelId, name,
+/// description? }`). Models are no longer a dedicated protocol type since ACP
+/// 0.14 — they are a `SessionConfigOption` with `category = "model"` — so
+/// Termul reconstructs this legacy view from `config_options` to keep the
+/// renderer's Model Picker contract byte-compatible.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModel {
+    pub model_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Snapshot of an agent's model selector, derived from its `config_options`.
+///
+/// Wire-identical to the pre-1.3 schema `SessionModelState`
+/// (`{ currentModelId, availableModels[] }`).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelState {
+    pub current_model_id: String,
+    pub available_models: Vec<SessionModel>,
+}
+
+/// Derive the legacy `SessionModelState` view from an agent's
+/// `config_options`: find the `select`-kind option whose `category` is
+/// `Model` and map its `currentValue` + `options[]` to the old shape.
+///
+/// Returns `None` when the agent advertises no model selector (either no
+/// `config_options` or no `Model`-category `select` option).
+#[allow(clippy::module_name_repetitions)]
+pub(crate) fn models_from_config_options(
+    opts: Option<&[SessionConfigOption]>,
+) -> Option<SessionModelState> {
+    let opts = opts?;
+    let opt = opts
+        .iter()
+        .find(|o| o.category == Some(SessionConfigOptionCategory::Model))?;
+    let select = match &opt.kind {
+        SessionConfigKind::Select(s) => s,
+        _ => return None,
+    };
+    let current_model_id = select.current_value.0.as_ref().to_string();
+    let available_models = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(items) => items
+            .iter()
+            .map(|o| SessionModel {
+                model_id: o.value.0.as_ref().to_string(),
+                name: o.name.clone(),
+                description: o.description.clone(),
+            })
+            .collect::<Vec<_>>(),
+        // Flatten grouped model selectors (e.g. models organized by provider)
+        // into the same flat `available_models` list the picker expects.
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter())
+            .map(|o| SessionModel {
+                model_id: o.value.0.as_ref().to_string(),
+                name: o.name.clone(),
+                description: o.description.clone(),
+            })
+            .collect(),
+        // Future-proof against new `SessionConfigSelectOptions` variants the
+        // schema may add (the enum is `#[non_exhaustive]`); none today.
+        _ => return None,
+    };
+    if available_models.is_empty() {
+        return None;
+    }
+    Some(SessionModelState {
+        current_model_id,
+        available_models,
+    })
+}
+
+/// Derive the agent-advertised configId of the Model selector from a session's
+/// `config_options` (the `id` of the `select`-kind option whose `category` is
+/// `Model`). Returns `None` when the agent advertises no model selector.
+///
+/// ACP 0.14 made model selection a `session/set_config_option` call, whose
+/// `configId` is the agent-provided option id (conventionally `"model"` but not
+/// guaranteed). This extracts the real id so `set_model` targets it precisely.
+#[allow(clippy::module_name_repetitions)]
+pub(crate) fn model_config_id_from_options(
+    opts: Option<&[SessionConfigOption]>,
+) -> Option<String> {
+    let opts = opts?;
+    let opt = opts
+        .iter()
+        .find(|o| o.category == Some(SessionConfigOptionCategory::Model))?;
+    Some(opt.id.0.as_ref().to_string())
+}
 
 /// Event name: an agent subprocess was spawned and `initialize` completed.
 pub const EVENT_AGENT_SPAWNED: &str = "acp:agent_spawned";
@@ -120,7 +218,7 @@ pub struct SessionCreatedEvent {
     pub agent_id: AgentId,
     pub session_id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modes: Option<agent_client_protocol::schema::SessionModeState>,
+    pub modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<SessionModelState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +446,7 @@ pub struct UsageUpdateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::SessionConfigSelectOption;
 
     #[test]
     fn agent_spawned_serializes_camel_case() {
@@ -417,7 +516,7 @@ mod tests {
             agent_id: AgentId("a".to_string()),
             session_id: SessionId::new("s"),
             role: ChunkRole::Agent,
-            content: ContentBlock::Text(agent_client_protocol::schema::TextContent::new("hi")),
+            content: ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new("hi")),
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["role"], "agent");
@@ -431,9 +530,9 @@ mod tests {
             agent_id: AgentId("a".to_string()),
             session_id: SessionId::new("s"),
             request_id: "req-7".to_string(),
-            tool_call: agent_client_protocol::schema::ToolCallUpdate::new(
+            tool_call: agent_client_protocol::schema::v1::ToolCallUpdate::new(
                 "tc-1",
-                agent_client_protocol::schema::ToolCallUpdateFields::new(),
+                agent_client_protocol::schema::v1::ToolCallUpdateFields::new(),
             ),
             options: vec![],
         };
@@ -599,5 +698,66 @@ mod tests {
         };
         let value = serde_json::to_value(&event).unwrap();
         assert!(value.get("cost").is_none());
+    }
+
+    /// Build a Model-category `select` option for the derivation tests.
+    fn model_select_option(
+        id: &'static str,
+        current: &'static str,
+        opts: &'static [(&'static str, &'static str)],
+    ) -> SessionConfigOption {
+        SessionConfigOption::select(
+            id,
+            "Model",
+            current,
+            opts.iter()
+                .map(|(v, n)| SessionConfigSelectOption::new(*v, *n))
+                .collect::<Vec<SessionConfigSelectOption>>(),
+        )
+        .category(SessionConfigOptionCategory::Model)
+    }
+
+    #[test]
+    fn models_from_config_options_derives_ungrouped() {
+        let opts = vec![model_select_option(
+            "model",
+            "m1",
+            &[("m1", "Model 1"), ("m2", "Model 2")],
+        )];
+        let state = models_from_config_options(Some(&opts)).expect("model option present");
+        assert_eq!(state.current_model_id, "m1");
+        assert_eq!(state.available_models.len(), 2);
+        assert_eq!(state.available_models[0].model_id, "m1");
+        assert_eq!(state.available_models[0].name, "Model 1");
+        assert_eq!(state.available_models[1].model_id, "m2");
+    }
+
+    #[test]
+    fn models_from_config_options_returns_none_without_model_category() {
+        // A non-Model-category select option must not populate the picker.
+        let opt =
+            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
+                SessionConfigOptionCategory::Mode,
+            );
+        assert!(models_from_config_options(Some(&[opt])).is_none());
+        assert!(models_from_config_options(None).is_none());
+        assert!(models_from_config_options(Some(&[])).is_none());
+    }
+
+    #[test]
+    fn model_config_id_from_options_uses_advertised_id() {
+        // CodeRabbit finding: an agent may use a configId other than "model"
+        // for its Model selector. The helper must surface the real id.
+        let opts = vec![model_select_option("llm_model", "m1", &[("m1", "M1")])];
+        assert_eq!(
+            model_config_id_from_options(Some(&opts)),
+            Some("llm_model".to_string())
+        );
+        // Falls back to None when no Model-category option is advertised.
+        let non_model =
+            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
+                SessionConfigOptionCategory::Mode,
+            );
+        assert_eq!(model_config_id_from_options(Some(&[non_model])), None);
     }
 }
