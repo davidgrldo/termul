@@ -8,7 +8,7 @@ import {
   Search,
   X
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { clipboardApi, filesystemApi, openerApi } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -36,6 +36,12 @@ interface InlineInputState {
   mode: 'create' | 'rename'
   existingEntry?: DirectoryEntry
 }
+
+/** Outcome of expanding the create-target chain (GH-539). */
+type ExpandChainResult =
+  | { status: 'expanded'; dir: string }
+  | { status: 'load-failed' }
+  | { status: 'root-changed' }
 
 interface FileExplorerProps {
   side?: 'left' | 'right'
@@ -103,10 +109,15 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
   const resizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const userSelectedTabRef = useRef(false)
-  // Mirror of inlineInput so async handlers can re-check the latest value
-  // after awaiting directory expansion (GH-540 re-entrancy guard).
+  // Mirrors of component state so async header-create handlers can re-check
+  // the latest values after awaiting chain expansion (GH-539 / GH-540).
+  // Synced in useLayoutEffect (not during render) so the mirror is committed
+  // before any post-paint handler runs.
   const inlineInputRef = useRef<InlineInputState | null>(null)
-  inlineInputRef.current = inlineInput
+  useLayoutEffect(() => {
+    inlineInputRef.current = inlineInput
+  }, [inlineInput])
+  const headerCreateInFlightRef = useRef(false)
 
   const rootEntries = rootPath ? directoryContents.get(rootPath) : undefined
   const normalizedSearchQuery = searchQuery ?? ''
@@ -567,24 +578,21 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
 
   /** Expand every directory from the project root down to (and including) the target. */
   const expandDirectoryChain = useCallback(
-    async (targetDir: string): Promise<'expanded' | 'load-failed' | 'root-changed'> => {
-      if (!rootPath) return 'load-failed'
+    async (targetDir: string): Promise<ExpandChainResult> => {
+      if (!rootPath) return { status: 'load-failed' }
       const normalizedRoot = rootPath.replace(/\\/g, '/')
-      let normalizedTarget = targetDir.replace(/\\/g, '/')
-      if (
-        normalizedTarget !== normalizedRoot &&
-        !normalizedTarget.startsWith(`${normalizedRoot}/`)
-      ) {
-        normalizedTarget = normalizedRoot
+      // Separator-safe prefix check (handles root '/' without '//').
+      const rootPrefix = normalizedRoot.endsWith('/') ? normalizedRoot : `${normalizedRoot}/`
+      // Resolve the target to an in-root directory; stale/out-of-root
+      // selections clamp to the active root so creation can never escape it.
+      let resolved = targetDir.replace(/\\/g, '/')
+      if (resolved !== normalizedRoot && !resolved.startsWith(rootPrefix)) {
+        resolved = normalizedRoot
       }
 
       const chain: string[] = []
-      let current = normalizedTarget
-      while (
-        current !== normalizedRoot &&
-        current.length > normalizedRoot.length &&
-        current.startsWith(`${normalizedRoot}/`)
-      ) {
+      let current = resolved
+      while (current !== normalizedRoot && current.startsWith(rootPrefix)) {
         chain.push(current)
         const lastSlash = current.lastIndexOf('/')
         if (lastSlash <= 0) break
@@ -598,12 +606,13 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           await toggleDirectory(dir)
         }
         // Abort if the directory could not be expanded (load failure) or the
-        // project changed mid-chain.
+        // project changed mid-chain — never create into an invisible or
+        // foreign tree.
         const state = useFileExplorerStore.getState()
-        if (state.rootPath !== rootPath) return 'root-changed'
-        if (!state.expandedDirs.has(dir)) return 'load-failed'
+        if (state.rootPath !== rootPath) return { status: 'root-changed' }
+        if (!state.expandedDirs.has(dir)) return { status: 'load-failed' }
       }
-      return 'expanded'
+      return { status: 'expanded', dir: resolved }
     },
     [rootPath, toggleDirectory]
   )
@@ -616,30 +625,46 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     })
   }, [])
 
+  /** Select a newly created entry and scroll its row into view (best-effort). */
+  const revealCreatedEntry = useCallback(
+    (path: string) => {
+      selectPath(path)
+      revealTreePath(path)
+    },
+    [selectPath, revealTreePath]
+  )
+
   /**
    * Header New File / New Folder (GH-540): resolve + expand + reveal the
    * target directory, then start the existing inline create flow.
    */
   const startHeaderCreate = useCallback(
     async (type: 'file' | 'folder') => {
-      if (inlineInputRef.current) return
+      // Never clobber an in-progress create/rename input, and serialize
+      // header requests while the chain expansion is awaiting.
+      if (inlineInputRef.current || headerCreateInFlightRef.current) return
       const targetDir = getCreateTargetDir()
       if (!targetDir) return
-      const expandResult = await expandDirectoryChain(targetDir)
-      // Re-check after the awaits: another flow may have opened an input or
-      // switched projects while the chain was expanding.
-      if (expandResult !== 'expanded' || inlineInputRef.current) {
-        if (expandResult === 'load-failed') {
-          toast.error('Could not open the target directory', {
-            description: 'The folder could not be expanded. Try again once the tree is loaded.'
-          })
+      headerCreateInFlightRef.current = true
+      try {
+        const result = await expandDirectoryChain(targetDir)
+        // Re-check after the awaits: another flow may have opened an input or
+        // switched projects while the chain was expanding.
+        if (result.status !== 'expanded' || inlineInputRef.current) {
+          if (result.status === 'load-failed') {
+            toast.error('Could not open the target directory', {
+              description: 'The folder could not be expanded. Try again once the tree is loaded.'
+            })
+          }
+          return
         }
-        return
+        revealTreePath(result.dir)
+        setContextMenu(null)
+        setInlineInput({ parentPath: result.dir, type, mode: 'create' })
+        setInputValue('')
+      } finally {
+        headerCreateInFlightRef.current = false
       }
-      revealTreePath(targetDir)
-      setContextMenu(null)
-      setInlineInput({ parentPath: targetDir, type, mode: 'create' })
-      setInputValue('')
     },
     [getCreateTargetDir, expandDirectoryChain, revealTreePath]
   )
@@ -689,7 +714,21 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     }
 
     const name = inputValue.trim()
-    const fullPath = `${inlineInput.parentPath}/${name}`
+    // Reject path separators and dot-segments so creation can never escape
+    // the target directory (GH-539). Release the submission lock here — this
+    // branch returns before the try/finally that resets it.
+    if (name === '.' || name === '..' || /[/\\]/.test(name)) {
+      toast.error('Invalid name: file and folder names cannot contain path separators')
+      submitFailedRef.current = true
+      isSubmittingRef.current = false
+      return
+    }
+    // Separator-safe join: a filesystem-root parent ('/') must not gain a
+    // second slash before the name.
+    const targetParent = inlineInput.parentPath
+    const fullPath = targetParent.endsWith('/')
+      ? `${targetParent}${name}`
+      : `${targetParent}/${name}`
 
     try {
       let result: { success: boolean; error?: string } | undefined
@@ -719,6 +758,10 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         }
       }
       await refreshDirectory(inlineInput.parentPath)
+      if (inlineInput.mode === 'create') {
+        // GH-539: newly created entries are selected and revealed in the tree.
+        revealCreatedEntry(fullPath)
+      }
       setInlineInput(null)
       setInputValue('')
     } catch (err) {
@@ -727,7 +770,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     } finally {
       isSubmittingRef.current = false
     }
-  }, [inlineInput, inputValue, refreshDirectory])
+  }, [inlineInput, inputValue, refreshDirectory, revealCreatedEntry])
 
   const handleInlineInputCancel = useCallback(() => {
     if (isSubmittingRef.current) return
@@ -991,7 +1034,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           <button
             type="button"
             onClick={() => void startHeaderCreate('file')}
-            disabled={!rootPath}
+            disabled={!rootPath || !!rootLoadError}
             className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
             title="New File"
             aria-label="New File"
@@ -1001,7 +1044,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           <button
             type="button"
             onClick={() => void startHeaderCreate('folder')}
-            disabled={!rootPath}
+            disabled={!rootPath || !!rootLoadError}
             className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
             title="New Folder"
             aria-label="New Folder"
@@ -1011,7 +1054,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           <button
             type="button"
             onClick={handleHeaderRefresh}
-            disabled={!rootPath}
+            disabled={!rootPath || !!rootLoadError}
             className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
             title="Refresh"
             aria-label="Refresh"
@@ -1021,7 +1064,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           <button
             type="button"
             onClick={collapseAll}
-            disabled={!rootPath}
+            disabled={!rootPath || !!rootLoadError}
             className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
             title="Collapse All"
             aria-label="Collapse All"
