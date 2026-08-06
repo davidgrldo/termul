@@ -1024,11 +1024,11 @@ mod tests {
             pty,
             relay: Arc::new(WsRelaySink::new()),
             registry: Arc::new(ProjectRegistry::new()),
-            chat_history_store: None,
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
             project_root: Arc::new(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())),
+            workspace_manifest: None,
         }
     }
 

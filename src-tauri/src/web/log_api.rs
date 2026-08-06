@@ -100,7 +100,6 @@ mod tests {
             pty,
             relay: Arc::new(WsRelaySink::new()),
             registry: Arc::new(ProjectRegistry::new()),
-            chat_history_store: None,
             registry_persistence: None,
             projects_file: None,
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
@@ -109,6 +108,7 @@ mod tests {
                     .canonicalize()
                     .unwrap_or_else(|_| std::env::temp_dir()),
             ),
+            workspace_manifest: None,
         }
     }
 

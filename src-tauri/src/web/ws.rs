@@ -37,7 +37,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 use crate::acp::config::AgentConfig;
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
@@ -288,17 +288,20 @@ pub struct AppState {
     /// In-memory, renderer-fed project registry — source for `GET /projects`
     /// + `switch_project` cwd resolution. Empty on the standalone path.
     pub registry: Arc<ProjectRegistry>,
-    /// Durable, disk-backed Rust chat-history store — source for
-    /// `list_persisted_sessions` + `get_session_payload` + switch-back reopen
-    /// on the desktop-hosted path. `None` on the standalone VPS (which uses
-    /// file-backed `SessionPersistence` for Story 4.3).
-    pub chat_history_store: Option<Arc<crate::acp::ChatHistoryStore>>,
     /// Optional writable VPS file registry + configured path. Desktop shared-live
     /// passes `None`, so switching there remains file-free.
     pub registry_persistence: Option<Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     pub projects_file: Option<Arc<PathBuf>>,
     /// Deployment history provider exposed to authenticated browser clients.
     pub history_mode: HistoryMode,
+    /// Host-owned versioned workspace manifest service (CAP-5 / Story 5).
+    /// `None` when the desktop could not open `WorkspaceManifestService` at
+    /// startup (degraded fresh-only mode) — routes return `Ok(None)` /
+    /// idempotent success in that case. The web/remote client reads/writes a
+    /// project's manifest through the three `/workspace/*` routes in
+    /// `workspace_api.rs`; the desktop renderer uses the `workspace_manifest_*`
+    /// Tauri commands (same `IpcResult<T>` shape byte-for-byte).
+    pub workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
     /// PR-S4: the project-root boundary for the fs_api routes. Requests whose
     /// canonicalized target path resolves outside this root are refused with
     /// `code: "OUTSIDE_ROOT"` (or `PATH_TRAVERSAL` for explicit `..`
@@ -451,7 +454,6 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     // Epic-4 bridge: the in-memory project registry — source for `GET /projects`
     // (router) + `switch_project` cwd resolution (this handler).
     let registry = Arc::clone(&state.registry);
-    let chat_history_store = state.chat_history_store.clone();
     let registry_persistence = state.registry_persistence.clone();
     let projects_file = state.projects_file.clone();
     let history_mode = state.history_mode;
@@ -570,7 +572,6 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                         &acp,
                         &relay,
                         &registry,
-                        chat_history_store.as_ref(),
                         registry_persistence.as_ref(),
                         projects_file.as_deref(),
                         &write_tx,
@@ -688,7 +689,6 @@ async fn handle_request(
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
     out_tx: &mpsc::UnboundedSender<Outbound>,
@@ -752,7 +752,7 @@ async fn handle_request(
         "ping" => WsReply::ok(id, Some(json!({}))),
         "subscribe" => handle_subscribe(id, &req.payload, relay, out_tx, subscribed_clients).await,
         "list_persisted_sessions" => {
-            handle_list_persisted_sessions(id, relay, chat_history_store, history_mode).await
+            handle_list_persisted_sessions(id, relay, history_mode).await
         }
         "open_persisted_session" => {
             handle_open_persisted_session(
@@ -766,8 +766,7 @@ async fn handle_request(
             .await
         }
         "get_session_payload" => {
-            handle_get_session_payload(id, &req.payload, relay, chat_history_store, history_mode)
-                .await
+            handle_get_session_payload(id, &req.payload, relay, history_mode).await
         }
         "recover_session_snapshot" => {
             handle_recover_session_snapshot(
@@ -785,8 +784,7 @@ async fn handle_request(
         // subscription), this only returns `{ sessionId, watermark }` so a
         // refreshed transport seeds `lastSeq` before its first subscribe.
         "get_session_cursor" => {
-            handle_get_session_cursor(id, &req.payload, relay, chat_history_store, history_mode)
-                .await
+            handle_get_session_cursor(id, &req.payload, relay, history_mode).await
         }
         // Story 1.7: `respond_permission` — route the browser's permission
         // decision through the server-side rendezvous (first-response-wins,
@@ -807,6 +805,7 @@ async fn handle_request(
                 id,
                 &req.payload,
                 acp,
+                registry,
                 current_agent,
                 current_session,
                 current_project,
@@ -858,14 +857,27 @@ async fn handle_request(
                 acp,
                 relay,
                 registry,
-                chat_history_store,
-                registry_persistence,
-                projects_file,
                 out_tx,
                 current_agent,
                 current_session,
                 current_project,
                 switch_queue,
+            )
+            .await
+        }
+        // Explicit host-default change (Epic 7 — cross-client continuity).
+        // Distinct from `switch_project` (per-connection): updates the host's
+        // `default_project_id`, persists to `FileProjectRegistry` (VPS, with
+        // rollback), and broadcasts `projects_changed` to ALL clients. Any
+        // authenticated client can set the default for now (Epic 2 wires auth).
+        "set_default_project" => {
+            handle_set_default_project(
+                id,
+                &req.payload,
+                relay,
+                registry,
+                registry_persistence,
+                projects_file,
             )
             .await
         }
@@ -911,7 +923,6 @@ async fn handle_request(
 async fn handle_list_persisted_sessions(
     id: String,
     relay: &Arc<WsRelaySink>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
     history_mode: HistoryMode,
 ) -> WsReply {
     if history_mode != HistoryMode::Server {
@@ -921,59 +932,8 @@ async fn handle_list_persisted_sessions(
             "persisted history is unavailable",
         );
     }
-    // Desktop-hosted path: read the durable renderer-history index and map it
-    // to the existing browser wire shape without retaining transcript copies.
-    if let Some(store) = chat_history_store {
-        let task_store = Arc::clone(store);
-        let (entries, _) = match tokio::task::spawn_blocking(move || task_store.list()).await {
-            Ok(result) => result,
-            Err(error) => {
-                return WsReply::err(
-                    id,
-                    WsErrorCode::Unsupported,
-                    format!("failed to list session history: {error}"),
-                )
-            }
-        };
-        let sessions: Vec<crate::acp::SessionIndexEntry> = entries
-            .into_iter()
-            .map(|entry| {
-                let resume_eligible = entry.agent_config_id.is_some() || !entry.agent_id.is_empty();
-                crate::acp::SessionIndexEntry {
-                    storage_key: entry.id.clone(),
-                    session_id: entry.id,
-                    stable_agent_namespace: entry
-                        .agent_config_id
-                        .as_ref()
-                        .map(|config_id| format!("config:{config_id}")),
-                    runtime_agent_id: (!entry.agent_id.is_empty()).then_some(entry.agent_id),
-                    project_id: (!entry.project_id.is_empty()).then_some(entry.project_id),
-                    cwd: entry.cwd,
-                    title: Some(entry.title),
-                    created_at: entry.created_at,
-                    last_activity_at: entry.last_activity_at,
-                    status: match entry.status {
-                        crate::acp::ChatHistoryStatus::Initializing
-                        | crate::acp::ChatHistoryStatus::Active => {
-                            crate::acp::PersistedSessionStatus::Active
-                        }
-                        crate::acp::ChatHistoryStatus::Error => {
-                            crate::acp::PersistedSessionStatus::Error
-                        }
-                        crate::acp::ChatHistoryStatus::Closed => {
-                            crate::acp::PersistedSessionStatus::Closed
-                        }
-                    },
-                    message_count: entry.message_count,
-                    tool_count: 0,
-                    last_seq: 0,
-                    resume_eligible,
-                }
-            })
-            .collect();
-        return ok_with_payload(id, &sessions);
-    }
-    // Standalone VPS path: the file-backed `SessionPersistence` (Story 4.3).
+    // Host-owned history (CAP-2): both desktop shared-live and the standalone
+    // server serve the file-backed `SessionPersistence` index.
     match relay.persistence() {
         Some(persistence) => ok_with_payload(id, &persistence.list_sessions()),
         None => WsReply::err(
@@ -985,16 +945,15 @@ async fn handle_list_persisted_sessions(
 }
 
 /// `get_session_payload` — fetch the FULL stored transcript (`{ metadata,
-/// messages }`) for a session id. Desktop-hosted path reads the durable Rust
-/// history store; the standalone VPS falls through to `SessionPersistence`
-/// once Story 4.3 attaches its file-backed payload fetch. Returns
+/// messages }`) for a session id. Both desktop shared-live and the standalone
+/// server materialize the renderer shape from the host-owned
+/// `SessionPersistence` JSONL records. Returns
 /// `{ ok:false, err:'not_found' }` when the id is absent (web shows "chat
 /// unavailable").
 async fn handle_get_session_payload(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
     history_mode: HistoryMode,
 ) -> WsReply {
     if history_mode != HistoryMode::Server {
@@ -1019,37 +978,43 @@ async fn handle_get_session_payload(
             )
         }
     };
-    // Desktop-hosted path: read the full payload on demand from the durable
-    // provider. No second all-session transcript cache is materialized.
-    if let Some(store) = chat_history_store {
-        let task_store = Arc::clone(store);
-        let task_id = parsed.session_id.clone();
-        let result = match tokio::task::spawn_blocking(move || task_store.get(&task_id)).await {
-            Ok(result) => result,
-            Err(error) => {
-                return WsReply::err(
-                    id,
-                    WsErrorCode::Unsupported,
-                    format!("failed to read session payload: {error}"),
-                )
+    // Host-owned history (CAP-2): materialize the renderer-shaped payload from
+    // the durable JSONL records (pure fold of `user_prompt` / `message_chunk`).
+    // `session_payload_async` flushes the writer queue first, so an active
+    // session reads every already-assigned seq; a finalized session is served
+    // read-only. Errors fail closed — never a fabricated empty payload.
+    match relay.persistence() {
+        Some(persistence) => {
+            match persistence.session_payload_async(&parsed.session_id).await {
+                Ok(payload) => {
+                    tracing::debug!(
+                        target: "termul::web::ws",
+                        session_id = %parsed.session_id,
+                        messages = payload.messages.len(),
+                        "get_session_payload: materialized host payload"
+                    );
+                    ok_with_payload(id, &payload)
+                }
+                Err(crate::acp::SessionPersistenceError::SessionNotFound) => {
+                    WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
+                }
+                Err(error) => {
+                    // Fail closed with a generic client-facing message: storage
+                    // error strings can carry absolute paths and internal
+                    // detail that do not belong on the wire. The full context
+                    // stays in the host log.
+                    tracing::warn!(
+                        target: "termul::web::ws",
+                        session_id = %parsed.session_id,
+                        error = %error,
+                        "get_session_payload: host payload materialization failed"
+                    );
+                    WsReply::err(id, WsErrorCode::Unsupported, "failed to read session payload")
+                }
             }
-        };
-        return match result {
-            Ok(value) => ok_with_payload(id, &value),
-            Err(crate::acp::ChatHistoryStoreError::SessionNotFound) => {
-                WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
-            }
-            Err(error) => WsReply::err(
-                id,
-                WsErrorCode::Unsupported,
-                format!("failed to read session payload: {error}"),
-            ),
-        };
+        }
+        None => WsReply::err(id, WsErrorCode::NotFound, "session payload not found"),
     }
-    // Standalone VPS path: Story 4.3 will attach a file-backed payload fetch
-    // here. Until then a VPS without the cache returns not_found.
-    let _ = relay;
-    WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
 }
 
 async fn handle_recover_session_snapshot(
@@ -1140,7 +1105,6 @@ async fn handle_get_session_cursor(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
     history_mode: HistoryMode,
 ) -> WsReply {
     if history_mode != HistoryMode::Server {
@@ -1168,38 +1132,25 @@ async fn handle_get_session_cursor(
     if parsed.session_id.is_empty() {
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
     }
-    // Desktop-hosted path (serve_router): the durable renderer-history store
-    // owns the transcripts; its `last_seq` reads the persisted payload's max
-    // message `seq`. Standalone VPS path falls through to the file-backed
-    // `SessionPersistence::last_seq` (the authoritative JSONL append log).
+    // Host-owned history (CAP-2): both desktop shared-live and the standalone
+    // server resolve the authoritative JSONL append log's `last_seq`.
     // `last_seq` returns `Ok(0)` for a genuinely unknown (brand-new) session,
     // but `Err(_)` for a real I/O / decode failure. `unwrap_or(0)` would mask a
     // storage failure as "new session" in the reply + logs; log the `Err` first
     // so a corrupted payload or permission error is visible, then default to 0.
-    let watermark = if let Some(store) = chat_history_store {
-        store.last_seq(&parsed.session_id).unwrap_or_else(|error| {
-            tracing::warn!(
-                session_id = %parsed.session_id,
-                error = ?error,
-                "get_session_cursor: last_seq lookup failed"
-            );
-            0
-        })
-    } else {
-        relay
-            .persistence()
-            .map(|persistence| {
-                persistence.last_seq(&parsed.session_id).unwrap_or_else(|error| {
-                    tracing::warn!(
-                        session_id = %parsed.session_id,
-                        error = ?error,
-                        "get_session_cursor: last_seq lookup failed"
-                    );
-                    0
-                })
+    let watermark = relay
+        .persistence()
+        .map(|persistence| {
+            persistence.last_seq(&parsed.session_id).unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id = %parsed.session_id,
+                    error = ?error,
+                    "get_session_cursor: last_seq lookup failed"
+                );
+                0
             })
-            .unwrap_or(0)
-    };
+        })
+        .unwrap_or(0);
     tracing::debug!(
         target: "termul::web::ws",
         session_id = %parsed.session_id,
@@ -1274,7 +1225,11 @@ fn ok_with_payload<T: serde::Serialize>(id: String, value: &T) -> WsReply {
 // browser automatically — these handlers only own the request/reply half.
 
 /// `spawn_agent` → `AcpManager::spawn(config)`. Mirrors Tauri `acp_spawn_agent`
-/// invoke args `{ config }`. Reply payload = `AgentId` (JSON string).
+/// invoke args `{ config }`. Reply payload = the [`SpawnOutcome`] (camelCase:
+/// `agentId`/`capabilities`/`authMethods`/`stableNamespace?`) — the
+/// authoritative spawn metadata so the renderer populates the store
+/// synchronously from the response (CAP-4: the spawn response — not the async
+/// `agent_spawned` event — is the source of truth on both desktop and web).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SpawnAgentPayload {
@@ -1315,11 +1270,11 @@ async fn handle_spawn_agent(
         );
     }
     match acp.spawn(parsed.config).await {
-        Ok(agent_id) => {
+        Ok(outcome) => {
             // Track the spawned agent so a later `switch_project` can reuse it
             // (Ask-First resolution: do NOT auto-spawn on switch).
-            *current_agent = Some(agent_id.clone());
-            ok_with_payload(id, &agent_id)
+            *current_agent = Some(outcome.agent_id.clone());
+            ok_with_payload(id, &outcome)
         }
         Err(e) => acp_err_to_reply(id, e),
     }
@@ -1392,6 +1347,7 @@ async fn handle_create_session(
     id: String,
     payload: &Value,
     acp: &Arc<AcpManager>,
+    registry: &Arc<ProjectRegistry>,
     current_agent: &mut Option<crate::acp::AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<crate::acp::SessionId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
@@ -1416,13 +1372,18 @@ async fn handle_create_session(
             "create_session requires a non-empty `cwd`",
         );
     }
+    // CAP-2 attribution: resolve the project id best-effort from the registry
+    // by cwd, so browser-origin sessions persist under their owning project
+    // (switch-back reopen + project-scoped listings). Unknown cwds stay
+    // project-less.
+    let project_id = registry.find_by_path(&parsed.cwd);
     match acp
         .new_session_with_context(
             &parsed.agent_id,
             parsed.cwd,
             parsed.mcp_servers,
             SessionCreationContext {
-                project_id: None,
+                project_id,
                 ephemeral: parsed.ephemeral,
             },
         )
@@ -1447,6 +1408,154 @@ async fn handle_create_session(
 #[serde(rename_all = "camelCase")]
 struct SwitchProjectPayload {
     project_id: String,
+}
+
+/// `set_default_project` WS request payload. Changes the host's default
+/// project (distinct from a per-connection `switch_project`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDefaultProjectPayload {
+    project_id: String,
+}
+
+/// `set_default_project` WS handler — the explicit host-default change.
+///
+/// Validates the target (unknown/archived/pathless → `NOT_FOUND`), updates
+/// `registry.set_default_project`, persists to `FileProjectRegistry` (VPS only,
+/// with rollback on failure), and broadcasts `projects_changed` carrying the
+/// new `defaultProjectId` to ALL connected clients. Desktop-hosted mode has
+/// no `FileProjectRegistry` (`registry_persistence`/`projects_file` are
+/// `None`) — it updates the in-memory registry + broadcasts only. The
+/// `remote_sync_projects` desktop push is the other path that changes the
+/// default (the desktop user IS the host operator).
+///
+/// # Error code mapping (P9)
+///
+/// The WS protocol's fixed `WsErrorCode` enum has no dedicated
+/// "persistence failed" variant (the 10 stable codes are mirrored in TS).
+/// Malformed payloads use `Unsupported` (matching `switch_project`); a
+/// persistence failure also maps to `Unsupported` but with a distinct
+/// message ("failed to persist default project: ..."). The HTTP route
+/// (`POST /projects/default`) uses the free-form `IpcBody.code` string
+/// `PERSIST_FAILED` for the same condition — the codes differ by transport
+/// but the messages are unambiguous.
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_default_project(
+    id: String,
+    payload: &Value,
+    relay: &Arc<WsRelaySink>,
+    registry: &Arc<ProjectRegistry>,
+    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
+    projects_file: Option<&PathBuf>,
+) -> WsReply {
+    let parsed: SetDefaultProjectPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                target: "termul::web::ws",
+                error = %e,
+                "set_default_project: malformed payload (want projectId)"
+            );
+            return WsReply::err(
+                id,
+                WsErrorCode::Unsupported,
+                format!("malformed set_default_project payload (want projectId): {e}"),
+            );
+        }
+    };
+    // Validate via the in-memory registry (unknown/archived/pathless → NOT_FOUND).
+    // `switch_context` re-checks the same conditions; reuse it so the
+    // validation path is identical to `switch_project`.
+    if registry.switch_context(&parsed.project_id).is_none() {
+        warn!(
+            target: "termul::web::ws",
+            project_id = %parsed.project_id,
+            "set_default_project: project not found or not switchable"
+        );
+        return WsReply::err(
+            id,
+            WsErrorCode::NotFound,
+            format!(
+                "project '{}' not found or not switchable",
+                parsed.project_id
+            ),
+        );
+    }
+    // VPS persistence (with rollback). Desktop-hosted mode skips this (no file
+    // registry). The old default is captured so the in-memory-set failure path
+    // below can roll the file back (P1: no split-brain — if
+    // `registry.set_default_project` returns false after the file was already
+    // persisted, the file is restored + re-saved before returning the error).
+    let mut persisted_old_default: Option<Option<String>> = None;
+    if let (Some(file_registry), Some(path)) = (registry_persistence, projects_file) {
+        let persistence_result = {
+            let mut file_registry = file_registry.lock();
+            let old_default = file_registry.default_project_id().map(str::to_string);
+            match file_registry.set_default_project(&parsed.project_id) {
+                Ok(()) => match file_registry.save_atomic(path) {
+                    Ok(()) => {
+                        persisted_old_default = Some(old_default);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        file_registry.restore_default_project(old_default);
+                        Err(error)
+                    }
+                },
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = persistence_result {
+            error!(
+                target: "termul::web::ws",
+                project_id = %parsed.project_id,
+                error = %error,
+                "set_default_project: persistence failed (rolled back)"
+            );
+            return WsReply::err(
+                id,
+                WsErrorCode::Unsupported,
+                format!("failed to persist default project: {error}"),
+            );
+        }
+    }
+    // Update the in-memory registry default + broadcast to all clients.
+    // If the in-memory set fails (target vanished between validation and
+    // commit), roll back the file registry (P1: no split-brain).
+    if !registry.set_default_project(&parsed.project_id) {
+        if let (Some(file_registry), Some(path), Some(old_default)) = (
+            registry_persistence,
+            projects_file,
+            persisted_old_default,
+        ) {
+            let mut file_registry = file_registry.lock();
+            file_registry.restore_default_project(old_default);
+            if let Err(error) = file_registry.save_atomic(path) {
+                warn!(
+                    target: "termul::web::ws",
+                    error = %error,
+                    "set_default_project: failed to persist in-memory-set rollback"
+                );
+            }
+        }
+        warn!(
+            target: "termul::web::ws",
+            project_id = %parsed.project_id,
+            "set_default_project: target became unavailable before commit (file rolled back)"
+        );
+        return WsReply::err(
+            id,
+            WsErrorCode::NotFound,
+            "target project became unavailable before commit",
+        );
+    }
+    broadcast_projects_changed(relay, Some(&parsed.project_id));
+    info!(
+        target: "termul::web::ws",
+        project_id = %parsed.project_id,
+        "set_default_project: host default updated + broadcast"
+    );
+    WsReply::ok(id, Some(json!({})))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1544,17 +1653,17 @@ fn project_switch_failed_event(
 }
 
 /// Attempt to reopen the most-recent resumable session for a project switch
-/// (switch-back restore). Looks up the cache for the target `(project_id,
-/// cwd)`, gates on the agent's `load`/`resume` capability, and reopens via
-/// `resume_session` (preferred) or `load_session`. Returns `Ok(Some(id))` on a
-/// successful reopen, `Ok(None)` when there is no resumable session or the
-/// agent lacks both capabilities, and `Err` when the reopen attempt fails
-/// (the caller falls back to `new_session_with_context` in both the `None` and
-/// `Err` cases).
+/// (switch-back restore). Looks up the host persistence store for the target
+/// `(project_id, cwd)`, gates on the agent's `load`/`resume` capability, and
+/// reopens via `resume_session` (preferred) or `load_session`. Returns
+/// `Ok(Some(id))` on a successful reopen, `Ok(None)` when there is no
+/// resumable session or the agent lacks both capabilities, and `Err` when the
+/// reopen attempt fails (the caller falls back to `new_session_with_context`
+/// in both the `None` and `Err` cases).
 async fn try_reopen_session_for_switch(
     acp: &Arc<AcpManager>,
     agent_id: &AgentId,
-    cache: &Arc<crate::acp::ChatHistoryStore>,
+    persistence: &Arc<crate::acp::SessionPersistence>,
     target: &ProjectSwitchContext,
 ) -> Result<Option<SessionId>, String> {
     // Resolve the current agent's stable namespace (config id or safe
@@ -1564,14 +1673,14 @@ async fn try_reopen_session_for_switch(
     // namespace cannot be resolved (agent unknown / has no stable
     // namespace).
     let agent_namespace = acp.stable_agent_namespace(agent_id).ok().flatten();
-    let Some(entry) = cache.find_most_recent_for_project(
+    let Some(entry) = persistence.find_most_recent_for_project(
         &target.project_id,
         &target.cwd,
         agent_namespace.as_deref(),
     ) else {
         return Ok(None);
     };
-    let session_id = SessionId(entry.id.clone());
+    let session_id = SessionId(entry.session_id.clone());
     // Prefer resume; fall back to load. The store's `resumeEligible` flag
     // only guarantees the session has SOME stable agent namespace — it does
     // NOT guarantee that namespace matches the current agent. The
@@ -1612,10 +1721,6 @@ async fn execute_project_switch(
     previous_session_id: SessionId,
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
-    registry: &Arc<ProjectRegistry>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
-    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
-    projects_file: Option<&PathBuf>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<SwitchProjectOutcome, String> {
@@ -1631,14 +1736,16 @@ async fn execute_project_switch(
     let mcp_server_count = target.mcp_servers.len();
     // Switch-back reopen (Epic-4 bridge): before minting a new session, look up
     // the most-recent resumable session for the target `(project_id, cwd)` in
-    // the durable Rust history store. If found AND the agent has the `load`/`resume`
-    // capability, reopen it so the web client restores the previous
-    // conversation instead of starting a blank chat (mirrors desktop's
+    // the host-owned durable history store. If found AND the agent has the
+    // `load`/`resume` capability, reopen it so the web client restores the
+    // previous conversation instead of starting a blank chat (mirrors desktop's
     // "restore the last tab"). Falls back to `new_session_with_context` when
     // no resumable session exists, the agent lacks the capability, or the
     // reopen fails (e.g. the session was purged).
-    let reopened = match chat_history_store {
-        Some(cache) => try_reopen_session_for_switch(acp, agent_id, cache, &target).await,
+    let reopened = match relay.persistence() {
+        Some(persistence) => {
+            try_reopen_session_for_switch(acp, agent_id, &persistence, &target).await
+        }
         None => Ok(None),
     }
     .unwrap_or(None);
@@ -1659,46 +1766,20 @@ async fn execute_project_switch(
             outcome.session_id
         }
     };
-    let mut persisted_previous_active: Option<Option<String>> = None;
 
-    if let (Some(file_registry), Some(path)) = (registry_persistence, projects_file) {
-        let persistence_result = {
-            let mut file_registry = file_registry.lock();
-            let old_active = file_registry.active_project_id().map(str::to_string);
-            if let Err(error) = file_registry.set_active_project(&target.project_id) {
-                Err(error.to_string())
-            } else if let Err(error) = file_registry.save_atomic(path) {
-                file_registry.restore_active_project(old_active);
-                Err(error.to_string())
-            } else {
-                persisted_previous_active = Some(old_active);
-                Ok(())
-            }
-        };
-        if let Err(error) = persistence_result {
-            let _ = acp.close_session(agent_id, new_session.clone()).await;
-            return Err(format!("failed to persist active project: {error}"));
-        }
-    }
-
-    if !registry.set_active_project(&target.project_id) {
-        if let (Some(file_registry), Some(path), Some(old_active)) = (
-            registry_persistence,
-            projects_file,
-            persisted_previous_active,
-        ) {
-            let mut file_registry = file_registry.lock();
-            file_registry.restore_active_project(old_active);
-            if let Err(error) = file_registry.save_atomic(path) {
-                warn!("[ws] failed to persist active-project rollback: {error}");
-            }
-        }
-        let _ = acp.close_session(agent_id, new_session.clone()).await;
-        return Err("target project became unavailable before commit".to_string());
-    }
-    broadcast_projects_changed(relay, Some(&target.project_id));
+    // Per-connection switch (Epic 7): update only this connection's
+    // `current_project`. No `registry.set_default_project`, no
+    // `broadcast_projects_changed`, no `FileProjectRegistry` persistence —
+    // a per-client switch is ephemeral; only `set_default_project` writes
+    // the durable default. Other connected clients are unaffected.
     *current_session.lock() = Some(new_session.clone());
     *current_project.lock() = Some(target.project_id.clone());
+    debug!(
+        target: "termul::web::ws",
+        project_id = %target.project_id,
+        session_id = %new_session.0,
+        "switch_project: per-connection switch committed (no broadcast)"
+    );
 
     if previous_session_id != new_session {
         if let Err(error) = acp.close_session(agent_id, previous_session_id).await {
@@ -1714,57 +1795,22 @@ async fn execute_project_switch(
     })
 }
 
-/// Cold-tab (no live agent) `switch_project`: deferred select. Updates the
-/// shared `active_project_id` (+ persists to disk with rollback, mirroring
-/// `execute_project_switch`) and the connection's `current_project`, then
-/// broadcasts `projects_changed`. No agent is spawned and no session is
-/// created — the Ask-First resolution stands; the web client spawns the agent
-/// lazily when a chat starts. Returns `Selected`; errors (persistence failure,
-/// target vanished between lookup and commit) are `String`s the caller maps
-/// via `acp_err_to_reply` (same mapping as the live-agent path).
+/// Cold-tab (no live agent) `switch_project`: deferred select. Updates only
+/// the requesting connection's `current_project`. No agent is spawned and no
+/// session is created — the Ask-First resolution stands; the web client
+/// spawns the agent lazily when a chat starts. Returns `Selected`. The shared
+/// `default_project_id` is NOT touched (per-connection switch); only
+/// `set_default_project` changes the host default.
 fn execute_cold_tab_select(
     target: ProjectSwitchContext,
-    relay: &Arc<WsRelaySink>,
-    registry: &Arc<ProjectRegistry>,
-    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
-    projects_file: Option<&PathBuf>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<SwitchProjectOutcome, String> {
-    let mut persisted_previous_active: Option<Option<String>> = None;
-    if let (Some(file_registry), Some(path)) = (registry_persistence, projects_file) {
-        let persistence_result = {
-            let mut file_registry = file_registry.lock();
-            let old_active = file_registry.active_project_id().map(str::to_string);
-            if let Err(error) = file_registry.set_active_project(&target.project_id) {
-                Err(error.to_string())
-            } else if let Err(error) = file_registry.save_atomic(path) {
-                file_registry.restore_active_project(old_active);
-                Err(error.to_string())
-            } else {
-                persisted_previous_active = Some(old_active);
-                Ok(())
-            }
-        };
-        if let Err(error) = persistence_result {
-            return Err(format!("failed to persist active project: {error}"));
-        }
-    }
-    if !registry.set_active_project(&target.project_id) {
-        if let (Some(file_registry), Some(path), Some(old_active)) = (
-            registry_persistence,
-            projects_file,
-            persisted_previous_active,
-        ) {
-            let mut file_registry = file_registry.lock();
-            file_registry.restore_active_project(old_active);
-            if let Err(error) = file_registry.save_atomic(path) {
-                warn!("[ws] failed to persist active-project rollback: {error}");
-            }
-        }
-        return Err("target project became unavailable before commit".to_string());
-    }
-    broadcast_projects_changed(relay, Some(&target.project_id));
     *current_project.lock() = Some(target.project_id.clone());
+    debug!(
+        target: "termul::web::ws",
+        project_id = %target.project_id,
+        "switch_project: cold-tab per-connection select (no broadcast, no persistence)"
+    );
     Ok(SwitchProjectOutcome::Selected {
         project_id: target.project_id,
         cwd: target.cwd,
@@ -1776,10 +1822,6 @@ async fn run_switch_queue(
     agent_id: AgentId,
     acp: Arc<AcpManager>,
     relay: Arc<WsRelaySink>,
-    registry: Arc<ProjectRegistry>,
-    chat_history_store: Option<Arc<crate::acp::ChatHistoryStore>>,
-    registry_persistence: Option<Arc<parking_lot::Mutex<FileProjectRegistry>>>,
-    projects_file: Option<Arc<PathBuf>>,
     out_tx: mpsc::UnboundedSender<Outbound>,
     current_session: Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_project: Arc<parking_lot::Mutex<Option<String>>>,
@@ -1828,10 +1870,6 @@ async fn run_switch_queue(
             pending.previous_session_id.clone(),
             &acp,
             &relay,
-            &registry,
-            chat_history_store.as_ref(),
-            registry_persistence.as_ref(),
-            projects_file.as_deref(),
             &current_session,
             &current_project,
         )
@@ -1890,9 +1928,6 @@ async fn handle_switch_project(
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
-    chat_history_store: Option<&Arc<crate::acp::ChatHistoryStore>>,
-    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
-    projects_file: Option<&PathBuf>,
     out_tx: &mpsc::UnboundedSender<Outbound>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -1929,18 +1964,12 @@ async fn handle_switch_project(
     };
     let agent_id = match current_agent.clone() {
         Some(agent_id) => agent_id,
-        // Cold tab (no live agent): deferred select — update the shared active
-        // project (+ persist) + `current_project`, broadcast
-        // `projects_changed`, return `Selected`. No agent spawn / session
-        // (Ask-First stands; the web client spawns lazily on chat start).
-        None => match execute_cold_tab_select(
-            target,
-            relay,
-            registry,
-            registry_persistence,
-            projects_file,
-            current_project,
-        ) {
+        // Cold tab (no live agent): deferred per-connection select — update
+        // only this connection's `current_project`, return `Selected`. No
+        // agent spawn / session (Ask-First stands; the web client spawns
+        // lazily on chat start). No host-default change, no broadcast, no
+        // persistence (per-connection switch is ephemeral).
+        None => match execute_cold_tab_select(target, current_project) {
             Ok(outcome) => return ok_with_payload(id, &outcome),
             Err(error) => return acp_err_to_reply(id, error),
         },
@@ -1966,10 +1995,6 @@ async fn handle_switch_project(
             previous_session_id,
             acp,
             relay,
-            registry,
-            chat_history_store,
-            registry_persistence,
-            projects_file,
             current_session,
             current_project,
         )
@@ -2003,10 +2028,6 @@ async fn handle_switch_project(
                     agent_id,
                     Arc::clone(acp),
                     Arc::clone(relay),
-                    Arc::clone(registry),
-                    chat_history_store.cloned(),
-                    registry_persistence.cloned(),
-                    projects_file.cloned().map(Arc::new),
                     out_tx.clone(),
                     Arc::clone(current_session),
                     Arc::clone(current_project),
@@ -2828,6 +2849,7 @@ async fn handle_answer_question(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use crate::acp::SpawnOutcome;
     use std::collections::HashSet;
 
     #[tokio::test]
@@ -3048,7 +3070,6 @@ mod tests {
                 project_id: project_id.to_string(),
                 cwd: format!("/work/{project_id}"),
                 mcp_servers: Vec::new(),
-                is_active: false,
             },
             previous_session_id: SessionId("s-old".to_string()),
         };
@@ -3112,7 +3133,6 @@ mod tests {
                 &acp,
                 &relay,
                 &registry,
-                None,
                 None,
                 None,
                 &tx,
@@ -3289,6 +3309,59 @@ mod tests {
         assert_eq!(reply.err.unwrap().code, "unsupported");
     }
 
+    /// `spawn_agent` success path: `ok_with_payload` serializes the full
+    /// `SpawnOutcome` (camelCase: `agentId`/`capabilities`/`authMethods`/
+    /// `stableNamespace?`) — the same shape the desktop Tauri command returns,
+    /// so the renderer sees one authoritative payload on both transports (CAP-4).
+    #[test]
+    fn spawn_outcome_serializes_full_payload_as_ws_reply() {
+        let outcome = SpawnOutcome {
+            agent_id: AgentId("agn_test".to_string()),
+            capabilities: agent_client_protocol::schema::v1::AgentCapabilities::default(),
+            auth_methods: vec![crate::acp::events::AuthMethodInfo {
+                id: "cursor_login".to_string(),
+                name: "Sign in with Cursor".to_string(),
+                description: None,
+            }],
+            stable_namespace: Some("config:cursor".to_string()),
+        };
+        let reply = ok_with_payload("spawn-1".to_string(), &outcome);
+        assert!(reply.ok);
+        assert!(reply.err.is_none());
+        let payload = reply.payload.expect("payload present on success");
+        assert_eq!(payload["agentId"], "agn_test");
+        assert!(payload.get("capabilities").is_some(), "capabilities always serialized");
+        assert_eq!(payload["authMethods"][0]["id"], "cursor_login");
+        assert_eq!(payload["authMethods"][0]["name"], "Sign in with Cursor");
+        // `description` is `None` + skip_serializing_if → omitted from JSON.
+        assert!(
+            payload["authMethods"][0].get("description").is_none(),
+            "description omitted when absent"
+        );
+        assert_eq!(payload["stableNamespace"], "config:cursor");
+    }
+
+    /// `spawn_agent` success with no auth + no namespace: `authMethods` is `[]`
+    /// (always serialized) and `stableNamespace` is omitted (skip_if_none).
+    #[test]
+    fn spawn_outcome_serializes_no_auth_no_namespace() {
+        let outcome = SpawnOutcome {
+            agent_id: AgentId("agn_noauth".to_string()),
+            capabilities: agent_client_protocol::schema::v1::AgentCapabilities::default(),
+            auth_methods: vec![],
+            stable_namespace: None,
+        };
+        let reply = ok_with_payload("spawn-2".to_string(), &outcome);
+        assert!(reply.ok);
+        let payload = reply.payload.expect("payload");
+        assert_eq!(payload["agentId"], "agn_noauth");
+        assert_eq!(payload["authMethods"], json!([]), "authMethods always serialized as []");
+        assert!(
+            payload.get("stableNamespace").is_none(),
+            "stableNamespace omitted when None"
+        );
+    }
+
     /// Story 1.8 review (EC4): `create_session` rejects an empty/whitespace
     /// `cwd` (mirrors the desktop store's `cwd.trim()` guard — the WS path must
     /// not diverge).
@@ -3407,7 +3480,6 @@ mod tests {
                 &registry,
                 None,
                 None,
-                None,
                 &tx,
                 &mut subs,
                 &mut current_agent,
@@ -3491,7 +3563,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs.clone(),
             &mut current_agent,
@@ -3541,7 +3612,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs.clone(),
             &mut current_agent,
@@ -3577,7 +3647,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs.clone(),
             &mut current_agent,
@@ -3594,7 +3663,6 @@ mod tests {
             &acp,
             &relay,
             &registry,
-            None,
             None,
             None,
             &tx,
@@ -3629,7 +3697,6 @@ mod tests {
             &acp,
             &relay,
             &registry,
-            None,
             None,
             None,
             &tx,
@@ -3719,7 +3786,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs,
             &mut current_agent,
@@ -3751,7 +3817,6 @@ mod tests {
             &acp,
             &relay,
             &registry,
-            None,
             None,
             None,
             &tx,
@@ -3801,7 +3866,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs.clone(),
             &mut current_agent,
@@ -3836,7 +3900,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs.clone(),
             &mut current_agent,
@@ -3852,7 +3915,6 @@ mod tests {
             &acp,
             &relay,
             &registry,
-            None,
             None,
             None,
             &tx,
@@ -3886,7 +3948,6 @@ mod tests {
             &acp,
             &relay,
             &registry,
-            None,
             None,
             None,
             &tx,
@@ -3944,7 +4005,6 @@ mod tests {
                 &registry,
                 None,
                 None,
-                None,
                 &tx,
                 &mut subs,
                 &mut current_agent,
@@ -3970,7 +4030,6 @@ mod tests {
                 &registry,
                 None,
                 None,
-                None,
                 &tx,
                 &mut subs2,
                 &mut current_agent,
@@ -3993,7 +4052,6 @@ mod tests {
                 &acp,
                 &relay,
                 &registry,
-                None,
                 None,
                 None,
                 &tx,
@@ -4021,7 +4079,6 @@ mod tests {
                 &registry,
                 None,
                 None,
-                None,
                 &tx,
                 &mut subs3,
                 &mut current_agent,
@@ -4038,9 +4095,11 @@ mod tests {
 
     /// Epic-4 bridge: a cold web tab (no agent spawned / session created yet)
     /// sends `switch_project` → deferred `Selected` (Ask-First resolution:
-    /// do NOT auto-spawn). The shared `active_project_id` is updated,
-    /// `projects_changed` is broadcast, and no agent/session is touched —
-    /// the web client spawns the agent lazily when a chat starts.
+    /// do NOT auto-spawn). Per-connection `current_project` is updated; the
+    /// host default is NOT touched (no `registry.set_default_project`, no
+    /// `broadcast_projects_changed`, no persistence — a per-client switch is
+    /// ephemeral). No agent/session is created — the web client spawns the
+    /// agent lazily when a chat starts.
     #[test]
     fn handle_switch_project_cold_tab_is_deferred_select() {
         let relay = Arc::new(WsRelaySink::new());
@@ -4053,7 +4112,7 @@ mod tests {
                 color: "blue".to_string(),
                 path: Some("/a".to_string()),
                 is_archived: false,
-                is_active: false,
+                is_default: false,
             }],
             None,
         );
@@ -4072,7 +4131,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs,
             &mut current_agent,
@@ -4088,11 +4146,12 @@ mod tests {
         assert_eq!(payload["cwd"], "/a");
         // Cold tab: no session was created.
         assert!(current_session.lock().is_none());
-        // The shared active-project mirror + connection tracking reflect it.
-        let snap = registry.snapshot();
-        assert_eq!(snap.active_project_id.as_deref(), Some("p-1"));
+        // Per-connection tracking reflects the switch.
         let cp = current_project.lock().clone();
         assert_eq!(cp.as_deref(), Some("p-1"));
+        // The host default is UNCHANGED (per-connection switch — Epic 7).
+        let snap = registry.snapshot();
+        assert_eq!(snap.default_project_id, None);
     }
 
     /// Cold-tab `switch_project` with an unknown/archived/pathless `projectId`
@@ -4110,7 +4169,7 @@ mod tests {
                 color: "blue".to_string(),
                 path: Some("/a".to_string()),
                 is_archived: false,
-                is_active: true,
+                is_default: true,
             }],
             Some("p-1".to_string()),
         );
@@ -4129,7 +4188,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs,
             &mut current_agent,
@@ -4142,12 +4200,16 @@ mod tests {
         assert_eq!(reply.err.unwrap().code, "not_found");
     }
 
-    /// Cold-tab deferred select persists the new active project to the
-    /// `--projects-file` (rollback-safe), mirroring the live-agent path. A
-    /// desktop/server restart therefore reflects the web tab's selection.
+    /// Cold-tab `switch_project` is per-connection (Epic 7): it updates only
+    /// the requester's `current_project`. It does NOT persist to the
+    /// `--projects-file` (only `set_default_project` writes the durable
+    /// default) and does NOT broadcast `projects_changed`.
     #[test]
-    fn execute_cold_tab_select_persists_active_project() {
-        let relay = Arc::new(WsRelaySink::new());
+    fn execute_cold_tab_select_is_per_connection_no_persistence_no_broadcast() {
+        // A relay is wired (VPS-mode fixture) but the cold-tab switch must NOT
+        // touch it (no broadcast). Prefix `_` so the unused binding documents
+        // the intent without failing the build.
+        let _relay = Arc::new(WsRelaySink::new());
         let registry = Arc::new(ProjectRegistry::new());
         registry.set(
             vec![crate::web::project_registry::ProjectSummary {
@@ -4156,10 +4218,12 @@ mod tests {
                 color: "blue".to_string(),
                 path: Some("/a".to_string()),
                 is_archived: false,
-                is_active: false,
+                is_default: false,
             }],
             None,
         );
+        // A file registry + path are wired (VPS-mode fixtures), but the
+        // cold-tab switch must NOT touch them.
         let file_registry = FileProjectRegistry::from_roots(
             vec![crate::acp::VfsRoot {
                 id: "p-1".to_string(),
@@ -4173,7 +4237,7 @@ mod tests {
         );
         let file_registry = Arc::new(parking_lot::Mutex::new(file_registry));
         let path = std::env::temp_dir().join(format!(
-            "termul-ws-cold-tab-persist-{}.json",
+            "termul-ws-cold-tab-noperist-{}.json",
             std::process::id()
         ));
         let current_project = Arc::new(parking_lot::Mutex::new(None::<String>));
@@ -4181,19 +4245,10 @@ mod tests {
             project_id: "p-1".to_string(),
             cwd: "/a".to_string(),
             mcp_servers: vec![],
-            is_active: false,
         };
-        let result = execute_cold_tab_select(
-            target,
-            &relay,
-            &registry,
-            Some(&file_registry),
-            Some(&path),
-            &current_project,
-        );
-        // Capture the persisted file before best-effort cleanup so a failing
-        // assertion cannot leak the temp file.
-        let saved = std::fs::read_to_string(&path).ok();
+        let result = execute_cold_tab_select(target, &current_project);
+        // Capture whether a file was written (it must NOT be).
+        let leaked = std::fs::read_to_string(&path).ok();
         let _ = std::fs::remove_file(&path);
         let outcome = result.expect("cold-tab select succeeds");
         let SwitchProjectOutcome::Selected { project_id, cwd } = outcome else {
@@ -4201,18 +4256,15 @@ mod tests {
         };
         assert_eq!(project_id, "p-1");
         assert_eq!(cwd, "/a");
-        // In-memory file registry + web registry + connection all reflect it.
-        let file_active = file_registry.lock().active_project_id().map(str::to_string);
-        assert_eq!(file_active.as_deref(), Some("p-1"));
-        let snap = registry.snapshot();
-        assert_eq!(snap.active_project_id.as_deref(), Some("p-1"));
+        // Per-connection tracking reflects the switch.
         let cp = current_project.lock().clone();
         assert_eq!(cp.as_deref(), Some("p-1"));
-        // The persisted file on disk carries the active id (read raw — `load`
-        // would re-validate root paths against the real fs).
-        let saved = saved.expect("persisted file written");
-        let v: Value = serde_json::from_str(&saved).expect("valid json");
-        assert_eq!(v["activeProjectId"], "p-1");
+        // The host default is UNCHANGED (per-connection switch).
+        assert_eq!(registry.snapshot().default_project_id, None);
+        // The file registry is UNCHANGED (no persistence on switch).
+        assert_eq!(file_registry.lock().default_project_id(), None);
+        // No file was written to disk.
+        assert!(leaked.is_none(), "switch must not write the projects file");
     }
 
     /// `switch_project` with a live agent but an unknown `projectId` →
@@ -4231,7 +4283,7 @@ mod tests {
                 color: "blue".to_string(),
                 path: Some("/a".to_string()),
                 is_archived: false,
-                is_active: true,
+                is_default: true,
             }],
             Some("p-1".to_string()),
         );
@@ -4250,7 +4302,6 @@ mod tests {
             &registry,
             None,
             None,
-            None,
             &tx,
             &mut subs,
             &mut current_agent,
@@ -4263,84 +4314,44 @@ mod tests {
         assert_eq!(reply.err.unwrap().code, "not_found");
     }
 
-    fn desktop_history_payload(session_id: &str) -> Value {
-        json!({
-            "metadata": {
-                "id": session_id,
-                "agentId": "agent-1",
-                "agentConfigId": "claude",
-                "title": "Chat",
-                "cwd": "/a",
-                "projectId": "p-1",
-                "createdAt": 1,
-                "lastActivityAt": 2,
-                "messageCount": 1,
-                "status": "closed"
-            },
-            "messages": [{ "id": "m-1", "seq": 1 }]
-        })
-    }
-
+    /// Host-owned history (CAP-2): `list_persisted_sessions` serves the
+    /// host `SessionPersistence` index — the same seam on desktop shared-live
+    /// and standalone.
     #[tokio::test]
-    async fn list_persisted_sessions_reads_durable_desktop_store() {
-        let store = crate::acp::ChatHistoryStore::new();
-        store.save("s-1", desktop_history_payload("s-1")).unwrap();
-        let relay = Arc::new(WsRelaySink::new());
-        let reply = handle_list_persisted_sessions(
-            "r1".to_string(),
-            &relay,
-            Some(&store),
-            HistoryMode::Server,
-        )
-        .await;
+    async fn list_persisted_sessions_serves_host_persistence() {
+        let root = std::env::temp_dir().join(format!("termul-ws-list-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(crate::acp::SessionRegistration {
+                session_id: "s-1".to_string(),
+                stable_agent_namespace: Some("config:claude".to_string()),
+                runtime_agent_id: Some("agent-1".to_string()),
+                project_id: Some("p-1".to_string()),
+                cwd,
+            })
+            .await
+            .unwrap();
+        let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
+        let reply =
+            handle_list_persisted_sessions("r1".to_string(), &relay, HistoryMode::Server).await;
         assert!(reply.ok);
         let value = serde_json::to_value(&reply).unwrap();
         assert_eq!(value["payload"][0]["sessionId"], "s-1");
-    }
-
-    #[tokio::test]
-    async fn get_session_payload_reads_durable_desktop_store() {
-        let store = crate::acp::ChatHistoryStore::new();
-        store.save("s-9", desktop_history_payload("s-9")).unwrap();
-        let relay = Arc::new(WsRelaySink::new());
-        let reply = handle_get_session_payload(
-            "r1".to_string(),
-            &json!({ "sessionId": "s-9" }),
-            &relay,
-            Some(&store),
-            HistoryMode::Server,
-        )
-        .await;
-        assert!(reply.ok);
-        let value = serde_json::to_value(&reply).unwrap();
-        assert_eq!(value["payload"]["metadata"]["id"], "s-9");
-    }
-
-    #[tokio::test]
-    async fn get_session_payload_not_found_when_absent() {
-        let store = crate::acp::ChatHistoryStore::new();
-        let relay = Arc::new(WsRelaySink::new());
-        let reply = handle_get_session_payload(
-            "r1".to_string(),
-            &json!({ "sessionId": "missing" }),
-            &relay,
-            Some(&store),
-            HistoryMode::Server,
-        )
-        .await;
-        assert!(!reply.ok);
-        assert_eq!(reply.err.unwrap().code, "not_found");
+        persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn get_session_payload_unsupported_in_live_only() {
-        let store = crate::acp::ChatHistoryStore::new();
         let relay = Arc::new(WsRelaySink::new());
         let reply = handle_get_session_payload(
             "r1".to_string(),
             &json!({ "sessionId": "s-1" }),
             &relay,
-            Some(&store),
             HistoryMode::LiveOnly,
         )
         .await;
@@ -4348,21 +4359,276 @@ mod tests {
         assert_eq!(reply.err.unwrap().code, "unsupported");
     }
 
+    fn standalone_payload_record(
+        session_id: &str,
+        seq: u64,
+        type_: &str,
+        payload: Value,
+    ) -> crate::acp::PersistedEventRecord {
+        crate::acp::PersistedEventRecord {
+            schema_version: crate::acp::session_persistence::SESSION_SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            seq,
+            type_: type_.to_string(),
+            recorded_at: 2_000 + seq,
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_session_payload_materializes_standalone_durable_history() {
+        let root =
+            std::env::temp_dir().join(format!("termul-ws-payload-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(crate::acp::SessionRegistration {
+                session_id: "session-p".to_string(),
+                stable_agent_namespace: Some("config:claude".to_string()),
+                runtime_agent_id: Some("runtime-p".to_string()),
+                project_id: Some("p-1".to_string()),
+                cwd,
+            })
+            .await
+            .unwrap();
+        // Turn with a tool boundary mid-stream: user bubble + two agent runs.
+        for record in [
+            standalone_payload_record(
+                "session-p",
+                1,
+                "user_prompt",
+                json!({
+                    "agentId": "runtime-p",
+                    "sessionId": "session-p",
+                    "turnId": "turn-1",
+                    "content": [{"type": "text", "text": "hello"}],
+                }),
+            ),
+            standalone_payload_record(
+                "session-p",
+                2,
+                "message_chunk",
+                json!({
+                    "agentId": "runtime-p",
+                    "sessionId": "session-p",
+                    "role": "agent",
+                    "content": {"type": "text", "text": "wor"},
+                }),
+            ),
+            standalone_payload_record(
+                "session-p",
+                3,
+                "tool_call",
+                json!({
+                    "agentId": "runtime-p",
+                    "sessionId": "session-p",
+                    "toolCall": {"toolCallId": "t-1", "kind": "execute", "status": "completed"},
+                }),
+            ),
+            standalone_payload_record(
+                "session-p",
+                4,
+                "message_chunk",
+                json!({
+                    "agentId": "runtime-p",
+                    "sessionId": "session-p",
+                    "role": "agent",
+                    "content": {"type": "text", "text": "ld"},
+                }),
+            ),
+            standalone_payload_record(
+                "session-p",
+                5,
+                "prompt_complete",
+                json!({"sessionId": "session-p", "turnId": "turn-1", "stopReason": "end_turn"}),
+            ),
+        ] {
+            persistence.enqueue_event(record).unwrap();
+        }
+        let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
+
+        let reply = handle_get_session_payload(
+            "r1".to_string(),
+            &json!({ "sessionId": "session-p" }),
+            &relay,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(reply.ok, "reply: {reply:?}");
+        let value = serde_json::to_value(&reply).unwrap();
+        let payload = &value["payload"];
+        assert_eq!(payload["metadata"]["id"], "session-p");
+        assert_eq!(payload["metadata"]["agentId"], "runtime-p");
+        assert_eq!(payload["metadata"]["agentConfigId"], "claude");
+        assert_eq!(payload["metadata"]["projectId"], "p-1");
+        assert_eq!(payload["metadata"]["messageCount"], 3);
+        assert_eq!(payload["metadata"]["lastSeq"], 5);
+        assert_eq!(payload["metadata"]["status"], "active");
+        assert_eq!(payload["messages"][0]["id"], "turn:turn-1");
+        assert_eq!(payload["messages"][0]["role"], "user");
+        assert_eq!(payload["messages"][0]["seq"], 1);
+        assert_eq!(payload["messages"][0]["streaming"], false);
+        assert_eq!(payload["messages"][0]["blocks"][0]["text"], "hello");
+        // tool_call at seq 3 splits the agent run; text coalesces per run.
+        assert_eq!(payload["messages"][1]["id"], "snapshot:agent:2");
+        assert_eq!(payload["messages"][1]["blocks"][0]["text"], "wor");
+        assert_eq!(payload["messages"][2]["id"], "snapshot:agent:4");
+        assert_eq!(payload["messages"][2]["blocks"][0]["text"], "ld");
+
+        // Stable re-read: a second request is byte-identical.
+        let reply2 = handle_get_session_payload(
+            "r2".to_string(),
+            &json!({ "sessionId": "session-p" }),
+            &relay,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(reply2.ok);
+        let value2 = serde_json::to_value(&reply2).unwrap();
+        assert_eq!(value2["payload"], payload.clone());
+
+        persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn get_session_payload_standalone_unknown_session_is_not_found() {
+        let root =
+            std::env::temp_dir().join(format!("termul-ws-payload-nf-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(crate::acp::SessionRegistration {
+                session_id: "session-known".to_string(),
+                stable_agent_namespace: None,
+                runtime_agent_id: None,
+                project_id: None,
+                cwd,
+            })
+            .await
+            .unwrap();
+        let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
+        let reply = handle_get_session_payload(
+            "r1".to_string(),
+            &json!({ "sessionId": "session-absent" }),
+            &relay,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "not_found");
+        persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn get_session_payload_without_store_or_persistence_is_not_found() {
+        let relay = Arc::new(WsRelaySink::new());
+        let reply = handle_get_session_payload(
+            "r1".to_string(),
+            &json!({ "sessionId": "s-1" }),
+            &relay,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "not_found");
+    }
+
+    /// Storage degradation after finalization: the transcript log becomes
+    /// unreadable. The handler must fail closed with `unsupported` — never a
+    /// fabricated empty payload that would wipe the client's transcript.
+    #[tokio::test]
+    async fn get_session_payload_standalone_corrupt_log_is_unsupported() {
+        let root =
+            std::env::temp_dir().join(format!("termul-ws-payload-corrupt-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(crate::acp::SessionRegistration {
+                session_id: "session-c".to_string(),
+                stable_agent_namespace: None,
+                runtime_agent_id: None,
+                project_id: None,
+                cwd,
+            })
+            .await
+            .unwrap();
+        persistence
+            .enqueue_event(standalone_payload_record(
+                "session-c",
+                1,
+                "user_prompt",
+                json!({
+                    "agentId": "runtime-c",
+                    "sessionId": "session-c",
+                    "turnId": "turn-1",
+                    "content": [{"type": "text", "text": "hello"}],
+                }),
+            ))
+            .unwrap();
+        persistence
+            .finalize_session("session-c", crate::acp::PersistedSessionStatus::Closed)
+            .await
+            .unwrap();
+        // Corrupt the durable transcript log after finalization.
+        let storage_key = persistence.metadata("session-c").unwrap().storage_key;
+        let log_path = persistence
+            .root()
+            .join(&storage_key)
+            .join("messages.jsonl");
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            file.write_all(b"{not valid json}\n").unwrap();
+            file.flush().unwrap();
+        }
+        let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
+        let reply = handle_get_session_payload(
+            "r1".to_string(),
+            &json!({ "sessionId": "session-c" }),
+            &relay,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "unsupported");
+        persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn try_reopen_returns_none_when_no_stored_session() {
-        let store = crate::acp::ChatHistoryStore::new();
+        let root =
+            std::env::temp_dir().join(format!("termul-ws-reopen-none-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
         let acp = Arc::new(AcpManager::new(vec![]));
         let target = ProjectSwitchContext {
             project_id: "p-1".to_string(),
             cwd: "/a".to_string(),
             mcp_servers: vec![],
-            is_active: false,
         };
         let result =
-            try_reopen_session_for_switch(&acp, &AgentId("a-1".to_string()), &store, &target)
+            try_reopen_session_for_switch(&acp, &AgentId("a-1".to_string()), &persistence, &target)
                 .await
                 .unwrap();
         assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Switch-back reopen returns `Err` (fallback) when a durable session exists
@@ -4370,20 +4636,531 @@ mod tests {
     /// this and falls back to a new session.
     #[tokio::test]
     async fn try_reopen_falls_back_when_agent_cannot_load() {
-        let store = crate::acp::ChatHistoryStore::new();
-        store.save("s-1", desktop_history_payload("s-1")).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "termul-ws-reopen-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let persistence = crate::acp::SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(crate::acp::SessionRegistration {
+                session_id: "s-1".to_string(),
+                stable_agent_namespace: Some("config:claude".to_string()),
+                runtime_agent_id: Some("agent-1".to_string()),
+                project_id: Some("p-1".to_string()),
+                cwd: cwd.clone(),
+            })
+            .await
+            .unwrap();
         let acp = Arc::new(AcpManager::new(vec![]));
         let target = ProjectSwitchContext {
             project_id: "p-1".to_string(),
-            cwd: "/a".to_string(),
+            // `register_session` canonicalizes cwd; match exactly so the
+            // `(project_id, cwd)` lookup finds the stored session.
+            cwd: persistence.metadata("s-1").unwrap().cwd,
             mcp_servers: vec![],
-            is_active: false,
         };
         let result =
-            try_reopen_session_for_switch(&acp, &AgentId("a-1".to_string()), &store, &target).await;
+            try_reopen_session_for_switch(&acp, &AgentId("a-1".to_string()), &persistence, &target)
+                .await;
         assert!(
             result.is_err(),
             "no registered agent → reopen fails → Err → new session"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `set_default_project` WS request (Epic 7): updates the host default,
+    /// persists to the `FileProjectRegistry` (VPS, rollback-safe), and
+    /// broadcasts `projects_changed`. Mirrors the `set_host_default_project`
+    /// Tauri command + `POST /projects/default` HTTP route (transport parity).
+    #[tokio::test]
+    async fn handle_set_default_project_updates_host_default_and_persists() {
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![
+                crate::web::project_registry::ProjectSummary {
+                    id: "p-1".to_string(),
+                    name: "Proj p-1".to_string(),
+                    color: "blue".to_string(),
+                    path: Some("/a".to_string()),
+                    is_archived: false,
+                    is_default: true,
+                },
+                crate::web::project_registry::ProjectSummary {
+                    id: "p-2".to_string(),
+                    name: "Proj p-2".to_string(),
+                    color: "green".to_string(),
+                    path: Some("/b".to_string()),
+                    is_archived: false,
+                    is_default: false,
+                },
+            ],
+            Some("p-1".to_string()),
+        );
+        let file_registry = FileProjectRegistry::from_roots(
+            vec![
+                crate::acp::VfsRoot {
+                    id: "p-1".to_string(),
+                    name: "Proj p-1".to_string(),
+                    path: PathBuf::from("/a"),
+                    color: "blue".to_string(),
+                    is_archived: false,
+                    mcp_servers: vec![],
+                },
+                crate::acp::VfsRoot {
+                    id: "p-2".to_string(),
+                    name: "Proj p-2".to_string(),
+                    path: PathBuf::from("/b"),
+                    color: "green".to_string(),
+                    is_archived: false,
+                    mcp_servers: vec![],
+                },
+            ],
+            Some("p-1".to_string()),
+        );
+        let file_registry = Arc::new(parking_lot::Mutex::new(file_registry));
+        let path = std::env::temp_dir().join(format!(
+            "termul-ws-set-default-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let reply = handle_set_default_project(
+            "r1".to_string(),
+            &json!({ "projectId": "p-2" }),
+            &relay,
+            &registry,
+            Some(&file_registry),
+            Some(&path),
+        )
+        .await;
+        let saved = std::fs::read_to_string(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        assert!(reply.ok, "{:?}", reply.err);
+        // In-memory registry default + flags updated.
+        let snap = registry.snapshot();
+        assert_eq!(snap.default_project_id.as_deref(), Some("p-2"));
+        assert!(!snap.projects[0].is_default);
+        assert!(snap.projects[1].is_default);
+        // File registry persisted (VPS mode).
+        assert_eq!(file_registry.lock().default_project_id(), Some("p-2"));
+        let saved = saved.expect("persisted file written");
+        let v: Value = serde_json::from_str(&saved).expect("valid json");
+        assert_eq!(v["schemaVersion"], 3);
+        assert_eq!(v["defaultProjectId"], "p-2");
+    }
+
+    /// `set_default_project` WS request with an unknown/archived/pathless id →
+    /// `NOT_FOUND` (validation rejects before any mutation or persistence).
+    #[tokio::test]
+    async fn handle_set_default_project_unknown_id_is_not_found() {
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![
+                crate::web::project_registry::ProjectSummary {
+                    id: "p-1".to_string(),
+                    name: "Proj p-1".to_string(),
+                    color: "blue".to_string(),
+                    path: Some("/a".to_string()),
+                    is_archived: false,
+                    is_default: true,
+                },
+                crate::web::project_registry::ProjectSummary {
+                    id: "p-archived".to_string(),
+                    name: "Archived".to_string(),
+                    color: "blue".to_string(),
+                    path: Some("/b".to_string()),
+                    is_archived: true,
+                    is_default: false,
+                },
+                crate::web::project_registry::ProjectSummary {
+                    id: "p-pathless".to_string(),
+                    name: "Pathless".to_string(),
+                    color: "blue".to_string(),
+                    path: None,
+                    is_archived: false,
+                    is_default: false,
+                },
+            ],
+            Some("p-1".to_string()),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "termul-ws-set-default-nf-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        for bad in ["missing", "p-archived", "p-pathless"] {
+            let reply = handle_set_default_project(
+                "r1".to_string(),
+                &json!({ "projectId": bad }),
+                &relay,
+                &registry,
+                None,
+                Some(&path),
+            )
+            .await;
+            assert!(!reply.ok, "{bad} should be rejected");
+            assert_eq!(reply.err.unwrap().code, "not_found");
+            // Default unchanged.
+            assert_eq!(
+                registry.snapshot().default_project_id.as_deref(),
+                Some("p-1")
+            );
+        }
+        // No file was written (validation rejected before persistence).
+        assert!(
+            !path.exists(),
+            "no file should be written on validation failure"
+        );
+    }
+
+    /// `set_default_project` WS request is a distinct operation from
+    /// `switch_project`: the host default changes + broadcasts to ALL clients,
+    /// while a per-connection switch touches only the requester's
+    /// `current_project`. This test documents the parity boundary.
+    #[tokio::test]
+    async fn handle_set_default_project_broadcasts_unlike_switch() {
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                color: "blue".to_string(),
+                path: Some("/a".to_string()),
+                is_archived: false,
+                is_default: false,
+            }],
+            None,
+        );
+        // Subscribe a client to prove the broadcast reaches it.
+        let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
+
+        let reply = handle_set_default_project(
+            "r1".to_string(),
+            &json!({ "projectId": "p-1" }),
+            &relay,
+            &registry,
+            None,
+            None,
+        )
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+        // P13: inspect the broadcast event type + payload (not just count).
+        let mut drained = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            drained.push(evt);
+        }
+        assert_eq!(drained.len(), 1, "exactly one projects_changed broadcast");
+        let evt = &drained[0];
+        assert_eq!(evt.type_, "projects_changed");
+        assert!(
+            evt.sid.is_none(),
+            "agent-level event: sid must be null"
+        );
+        assert_eq!(evt.seq, 0, "agent-level event: seq must be 0");
+        assert_eq!(
+            evt.payload["defaultProjectId"], "p-1",
+            "the broadcast carries the new default project id"
+        );
+    }
+
+    /// P7 — live-agent `switch_project` success path: no `projects_changed`
+    /// broadcast, no `FileProjectRegistry` persistence. The cold-tab path has
+    /// this assertion; this test covers the live-agent `execute_project_switch`
+    /// path. A `block_on` AcpManager can't spawn a real agent, so we call
+    /// `execute_project_switch` directly with a no-op AcpManager — the key
+    /// assertion is that NO broadcast fires (the relay's event log stays empty)
+    /// and the file registry default is UNCHANGED even though the connection's
+    /// `current_project` was updated.
+    ///
+    /// Note: `AcpManager::new(vec![])` has no registered agents, so
+    /// `new_session_with_context` will fail. We assert the error path does NOT
+    /// broadcast (the success path can't be exercised without a real agent).
+    /// This is a structural gap — a regression that adds a broadcast BEFORE
+    /// the session-creation step would be caught here.
+    #[tokio::test]
+    async fn execute_project_switch_live_agent_path_does_not_broadcast() {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                color: "blue".to_string(),
+                path: Some("/a".to_string()),
+                is_archived: false,
+                is_default: true,
+            }],
+            Some("p-1".to_string()),
+        );
+        // A file registry + path are wired (VPS fixtures), but the switch must
+        // NOT touch them.
+        let file_registry = FileProjectRegistry::from_roots(
+            vec![crate::acp::VfsRoot {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                path: PathBuf::from("/a"),
+                color: "blue".to_string(),
+                is_archived: false,
+                mcp_servers: vec![],
+            }],
+            Some("p-1".to_string()),
+        );
+        let file_registry = Arc::new(parking_lot::Mutex::new(file_registry));
+        let path = std::env::temp_dir().join(format!(
+            "termul-ws-live-switch-nobroadcast-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Subscribe a client to prove NO broadcast reaches it.
+        let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
+
+        let current_session =
+            Arc::new(parking_lot::Mutex::new(None::<crate::acp::SessionId>));
+        let current_project = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let target = ProjectSwitchContext {
+            project_id: "p-1".to_string(),
+            cwd: "/a".to_string(),
+            mcp_servers: vec![],
+        };
+        // The live-agent path will fail (no registered agent →
+        // new_session_with_context errors), but the key assertion is that NO
+        // broadcast fires even on this path. A regression that calls
+        // broadcast_projects_changed BEFORE the session-creation error would
+        // be caught.
+        let _result = execute_project_switch(
+            &AgentId("a-1".to_string()),
+            target,
+            SessionId("s-old".to_string()),
+            &acp,
+            &relay,
+            &current_session,
+            &current_project,
+        )
+        .await;
+        // No broadcast reached the subscribed client.
+        assert!(
+            rx.try_recv().is_err(),
+            "switch_project must NOT broadcast projects_changed (per-connection)"
+        );
+        // The file registry default is UNCHANGED (no persistence on switch).
+        assert_eq!(
+            file_registry.lock().default_project_id(),
+            Some("p-1"),
+            "switch must not persist to the file registry"
+        );
+        // No file was written to disk.
+        assert!(
+            !path.exists(),
+            "switch must not write the projects file"
+        );
+    }
+
+    /// P8 — multi-client: a `switch_project` by one client does NOT fan out
+    /// a `projects_changed` event to other subscribed clients. This is the
+    /// symmetric negative of `handle_set_default_project_broadcasts_unlike_switch`
+    /// (which proves `set_default_project` DOES broadcast). The cold-tab path
+    /// is used (no live agent) — the assertion is that the relay's event log
+    /// stays empty for the non-switching client.
+    #[tokio::test]
+    async fn switch_project_cold_tab_does_not_fan_out_to_other_clients() {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                color: "blue".to_string(),
+                path: Some("/a".to_string()),
+                is_archived: false,
+                is_default: false,
+            }],
+            None,
+        );
+        // Client A subscribes to sess-a; client B subscribes to sess-b.
+        let (_client_a, mut rx_a, _replay_a) = relay.subscribe("sess-a", None).await;
+        let (_client_b, mut rx_b, _replay_b) = relay.subscribe("sess-b", None).await;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let mut subs = Vec::new();
+        let mut authed = true;
+        let mut current_agent: Option<crate::acp::AgentId> = None;
+        let current_session =
+            Arc::new(parking_lot::Mutex::new(None::<crate::acp::SessionId>));
+        let current_project_a = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let switch_queue =
+            Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+
+        // Client A sends switch_project (cold-tab path).
+        let reply_a = handle_request(
+            r#"{"id":"r1","type":"switch_project","payload":{"projectId":"p-1"}}"#,
+            &mut authed,
+            &acp,
+            &relay,
+            &registry,
+            None,
+            None,
+            &tx,
+            &mut subs,
+            &mut current_agent,
+            &current_session,
+            &current_project_a,
+            &switch_queue,
+            HistoryMode::LiveOnly,
+        )
+        .await;
+        assert!(reply_a.ok, "client A switch succeeds: {:?}", reply_a.err);
+
+        // Client A's current_project reflects the switch.
+        assert_eq!(current_project_a.lock().as_deref(), Some("p-1"));
+
+        // P8: client B receives ZERO projects_changed events (no fan-out).
+        let mut b_drained = 0;
+        while rx_b.try_recv().is_ok() {
+            b_drained += 1;
+        }
+        assert_eq!(
+            b_drained, 0,
+            "switch_project must not fan out to other clients"
+        );
+        // Client A also receives nothing (switch_project responds to the
+        // requester ONLY — no broadcast).
+        let mut a_drained = 0;
+        while rx_a.try_recv().is_ok() {
+            a_drained += 1;
+        }
+        assert_eq!(a_drained, 0, "switch_project must not broadcast at all");
+    }
+
+    /// P10 — cold-tab `switch_project` with `registry_persistence: Some(...)`
+    /// still does NOT write the file (the persistence block was removed from
+    /// the switch path entirely — only `set_default_project` persists).
+    #[test]
+    fn execute_cold_tab_select_with_persistence_does_not_write_file() {
+        let _relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                color: "blue".to_string(),
+                path: Some("/a".to_string()),
+                is_archived: false,
+                is_default: false,
+            }],
+            None,
+        );
+        // Wire a REAL file registry + path (VPS-mode fixtures) — the switch
+        // must NOT touch them.
+        let file_registry = FileProjectRegistry::from_roots(
+            vec![crate::acp::VfsRoot {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                path: PathBuf::from("/a"),
+                color: "blue".to_string(),
+                is_archived: false,
+                mcp_servers: vec![],
+            }],
+            None,
+        );
+        let file_registry = Arc::new(parking_lot::Mutex::new(file_registry));
+        let path = std::env::temp_dir().join(format!(
+            "termul-ws-cold-tab-vps-noperist-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let current_project = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let target = ProjectSwitchContext {
+            project_id: "p-1".to_string(),
+            cwd: "/a".to_string(),
+            mcp_servers: vec![],
+        };
+        // The cold-tab switch only takes (target, current_project) now — it
+        // no longer accepts registry_persistence/projects_file. Calling it
+        // directly proves the file is untouched even when VPS fixtures exist
+        // in the caller's scope.
+        let result = execute_cold_tab_select(target, &current_project);
+        let leaked = std::fs::read_to_string(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        let outcome = result.expect("cold-tab select succeeds");
+        let SwitchProjectOutcome::Selected { project_id, cwd } = outcome else {
+            panic!("expected Selected, got {:?}", outcome);
+        };
+        assert_eq!(project_id, "p-1");
+        assert_eq!(cwd, "/a");
+        assert_eq!(current_project.lock().as_deref(), Some("p-1"));
+        // The host default is UNCHANGED (per-connection switch).
+        assert_eq!(registry.snapshot().default_project_id, None);
+        // The file registry is UNCHANGED.
+        assert_eq!(file_registry.lock().default_project_id(), None);
+        // No file was written.
+        assert!(leaked.is_none(), "switch must not write the projects file");
+    }
+
+    /// P17 — `connection_already_on_project` gate: when the connection's
+    /// `current_project` already matches the target, the switch returns early
+    /// (a no-op `Completed` with the previous session). The cold-tab test
+    /// (`execute_cold_tab_select_is_per_connection_no_persistence_no_broadcast`)
+    /// covers the non-matching path; this test pins the matching path.
+    #[tokio::test]
+    async fn execute_project_switch_returns_early_when_already_on_project() {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let registry = Arc::new(ProjectRegistry::new());
+        registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "p-1".to_string(),
+                name: "Proj p-1".to_string(),
+                color: "blue".to_string(),
+                path: Some("/a".to_string()),
+                is_archived: false,
+                is_default: true,
+            }],
+            Some("p-1".to_string()),
+        );
+        let current_session =
+            Arc::new(parking_lot::Mutex::new(Some(SessionId("s-prev".to_string()))));
+        // The connection is ALREADY on p-1.
+        let current_project = Arc::new(parking_lot::Mutex::new(Some("p-1".to_string())));
+        let target = ProjectSwitchContext {
+            project_id: "p-1".to_string(),
+            cwd: "/a".to_string(),
+            mcp_servers: vec![],
+        };
+        let outcome = execute_project_switch(
+            &AgentId("a-1".to_string()),
+            target,
+            SessionId("s-prev".to_string()),
+            &acp,
+            &relay,
+            &current_session,
+            &current_project,
+        )
+        .await
+        .expect("early return succeeds");
+        // The switch is a no-op: same session, no new session created.
+        let SwitchProjectOutcome::Completed {
+            project_id,
+            session_id,
+            cwd,
+            mcp_server_count: _,
+        } = outcome
+        else {
+            panic!("expected Completed (early return), got {:?}", outcome);
+        };
+        assert_eq!(project_id, "p-1");
+        assert_eq!(session_id.0, "s-prev");
+        assert_eq!(cwd, "/a");
+        // current_session unchanged (no new session).
+        assert_eq!(current_session.lock().as_ref().unwrap().0, "s-prev");
     }
 }

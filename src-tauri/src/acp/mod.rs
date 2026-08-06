@@ -14,12 +14,15 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod events;
+pub mod history_import;
 pub mod manager;
 pub mod mcp_probe;
 pub mod project_registry;
 pub mod session;
+pub mod session_payload;
 pub mod session_persistence;
 pub mod terminal;
+pub mod workspace_manifest;
 
 // Re-exported for the renderer bridge (P1+) and `lib.rs` wiring. `AcpManager`
 // is used now (managed in `lib.rs`); the config/id types are part of the public
@@ -31,12 +34,21 @@ pub use chat_history_store::{
 };
 #[allow(unused_imports)]
 pub use config::{AgentConfig, AgentId, SessionId};
-pub use manager::{AcpManager, SessionCreationContext};
+#[allow(unused_imports)]
+pub use history_import::import_chat_history;
+#[allow(unused_imports)]
+pub use manager::{AcpManager, SessionCreationContext, SpawnOutcome};
 pub use project_registry::{FileProjectRegistry, VfsRoot};
 #[allow(unused_imports)]
 pub use session_persistence::{
     PersistedEventRecord, PersistedSessionStatus, SessionIndexEntry, SessionPersistence,
-    SessionRegistration,
+    SessionPersistenceError, SessionRegistration,
+};
+#[allow(unused_imports)]
+pub use workspace_manifest::{
+    EditorDescriptor, LeafNode, PaneDirection, PaneNode, SplitNode, TerminalDescriptor,
+    WorkspaceManifest, WorkspaceManifestError, WorkspaceManifestService, WriteOutcome,
+    WORKSPACE_MANIFEST_SCHEMA_VERSION,
 };
 
 #[cfg(test)]

@@ -65,11 +65,11 @@ mod tests {
             pty,
             relay: Arc::new(WsRelaySink::new()),
             registry: Arc::new(ProjectRegistry::new()),
-            chat_history_store: None,
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
             project_root: Arc::new(std::env::temp_dir()),
+            workspace_manifest: None,
         };
         axum::Router::new()
             .route("/mcp-servers/probe", post(super::probe))

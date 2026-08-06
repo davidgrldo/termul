@@ -4,9 +4,11 @@ import { persistenceApi, secureStorageApi, syncProjects, terminalApi, worktreeAp
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { setTerminalProtected } from '@/lib/terminal-api'
 import { webServerProjects } from '@/lib/web-server-api'
+import { workspaceManifestApi } from '@/lib/workspace-manifest-api'
 import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatusStore } from '@/stores/remote-status-store'
 import { useTerminalStore } from '@/stores/terminal-store'
+import { useWorkspaceManifestSyncStore } from '@/stores/workspace-manifest-sync-store'
 import type { EnvVariable, Project, ProjectColor, ProjectGroup, Worktree } from '@/types/project'
 import type {
   PersistedProject,
@@ -383,15 +385,36 @@ export async function reconcileProjectWorktreesNow(projectId: string): Promise<v
  * (Epic-4 bridge) from the renderer `Project` store. No env-var values cross
  * the wire — redact-by-omission. Shared by the auto-save live-push path + the
  * `RemoteAccessPopover` server-start seed.
+ *
+ * In desktop-hosted mode the desktop's `activeProjectId` IS the host default
+ * (the desktop user is the host operator), so the per-entry flag is
+ * `isDefault` (the host default), not `isActive` (which is per-client and the
+ * host cannot know). The param is named `defaultProjectId` because the value
+ * the desktop renderer tracks (its active selection) is pushed as the default
+ * for new web clients — the caller passes `state.activeProjectId` as the
+ * `defaultProjectId` (P12: the param name now matches its wire semantics).
  */
-export function toProjectSummaries(projects: Project[], activeProjectId: string): ProjectSummary[] {
+export function toProjectSummaries(
+  projects: Project[],
+  defaultProjectId: string
+): ProjectSummary[] {
+  // Derive the host default from each project's stored `isDefault` flag — NOT
+  // from `defaultProjectId`. At the autosave call site `defaultProjectId` is
+  // `state.activeProjectId`, but the active (per-connection) project and the
+  // host default are distinct: `handleSetDefault` flips the stored flags while
+  // `activeProjectId` still points at the switch target. Deriving from
+  // `activeProjectId` here would re-broadcast the active project as the host
+  // default and clobber an explicit `set_default_project`. Fall back to
+  // `defaultProjectId` only when no project carries a stored flag (legacy
+  // snapshots / initial load where the flag was never set).
+  const hasStoredDefault = projects.some((p) => p.isDefault === true)
   return projects.map((p) => ({
     id: p.id,
     name: p.name,
     color: p.color,
     path: p.path ?? null,
     isArchived: p.isArchived ?? false,
-    isActive: p.id === activeProjectId
+    isDefault: hasStoredDefault ? p.isDefault === true : p.id === defaultProjectId
   }))
 }
 
@@ -402,6 +425,11 @@ export function toProjectSummaries(projects: Project[], activeProjectId: string)
  * interim), so `envVars` is empty and worktree reconciliation is skipped (the
  * browser cannot shell out to git anyway). `color` is a valid `ProjectColor`
  * token string the desktop sent, cast through.
+ *
+ * Maps `summary.isDefault` (host default) → `Project.isDefault`. Does NOT map
+ * an `isActive` — the host no longer sends one (it cannot know a client's
+ * per-connection active selection). `Project.isActive` stays per-client and is
+ * stamped locally by `selectProject`.
  */
 function summaryToProject(summary: ProjectSummary): Project {
   return {
@@ -410,7 +438,7 @@ function summaryToProject(summary: ProjectSummary): Project {
     color: summary.color as ProjectColor,
     path: summary.path ?? undefined,
     isArchived: summary.isArchived,
-    isActive: summary.isActive,
+    isDefault: summary.isDefault,
     envVars: [],
     worktrees: [],
     activeWorktreeId: null
@@ -426,6 +454,13 @@ export function useProjectsLoader(): void {
     // returns nothing, so without this branch the sidebar renders empty. The
     // mirror is read-only — `useProjectsAutoSave` is disabled in web mode. The
     // desktop broadcasts `projects_changed` on store mutation; refetch on it.
+    //
+    // Epic 7 (cross-client continuity): on the INITIAL load (store not yet
+    // `isLoaded`) the client seeds `activeProjectId` from the host's
+    // `defaultProjectId`. On subsequent `projects_changed` refetches it
+    // preserves its OWN `activeProjectId` (no silent retarget when another
+    // client switches). If the current project was deleted by the host, it
+    // falls back to `defaultProjectId` (or the first project).
     if (!isTauriContext()) {
       let unsub: (() => void) | undefined
       // Guard against completing a fetch after unmount (skip the stale
@@ -433,8 +468,26 @@ export function useProjectsLoader(): void {
       let cancelled = false
       const fetchMirror = async (): Promise<void> => {
         const result = await webServerProjects.list()
-        if (!cancelled && result.success && result.data) {
-          setProjects(result.data.projects.map(summaryToProject), result.data.activeProjectId ?? '')
+        if (cancelled || !result.success || !result.data) return
+        const projects = result.data.projects.map(summaryToProject)
+        const defaultId = result.data.defaultProjectId
+        // P2: validate the host default references a project still in the
+        // list (the host may have deleted the default project). Fall back to
+        // the first project when the default is null or dangling.
+        const validDefault =
+          defaultId && projects.some((p) => p.id === defaultId)
+            ? defaultId
+            : (projects[0]?.id ?? '')
+        if (!useProjectStore.getState().isLoaded) {
+          // Initial load: seed activeProjectId from the host default.
+          setProjects(projects, validDefault)
+        } else {
+          // Subsequent refetch: preserve the client's own activeProjectId.
+          // If it's no longer in the list (host deleted it), fall back to the
+          // default (or the first project if the default is also gone).
+          const currentActive = useProjectStore.getState().activeProjectId
+          const stillExists = !!currentActive && projects.some((p) => p.id === currentActive)
+          setProjects(projects, stillExists ? currentActive : validDefault)
         }
       }
       void fetchMirror()
@@ -626,10 +679,35 @@ export function useDeleteProjectWithCascade(): (id: string) => Promise<void> {
     // Delete the project from the store
     useProjectStore.getState().deleteProject(id)
 
-    // Cascade delete: remove terminal layout and snapshots for this project
+    // Patch 15: evict the deleted project's entries from the manifest sync
+    // store (basedRevision + restore-in-progress flags) so they don't leak.
+    const syncStore = useWorkspaceManifestSyncStore.getState()
+    syncStore.setBasedRevision(id, null)
+    syncStore.setManifestRestoreInProgress(id, false)
+    // Clear a pending conflict that belonged to the deleted project.
+    if (syncStore.pendingConflict?.projectId === id) {
+      syncStore.setPendingConflict(null)
+    }
+
+    // Cascade delete: remove terminal layout and snapshots for this project.
+    // Story 6: also delete the host-owned workspace manifest (best-effort —
+    // a failure is logged but never blocks the project delete; the host's
+    // delete is idempotent whether or not the manifest file existed).
     await Promise.all([
       persistenceApi.delete(PersistenceKeys.terminals(id)),
-      persistenceApi.delete(PersistenceKeys.snapshots(id))
+      persistenceApi.delete(PersistenceKeys.snapshots(id)),
+      workspaceManifestApi
+        .deleteManifest(id)
+        .then((result) => {
+          if (!result.success) {
+            console.warn(
+              `[projects] manifest delete unsuccessful for ${id}: ${result.error} (${result.code})`
+            )
+          }
+        })
+        .catch((error) => {
+          console.warn(`[projects] manifest delete threw for ${id}:`, error)
+        })
     ])
 
     // Persist the updated projects list

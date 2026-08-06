@@ -1,4 +1,6 @@
 // IPC Result pattern from architecture.md
+import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
+
 export type IpcResult<T> =
   | { success: true; data: T }
   | { success: false; error: string; code: string }
@@ -39,12 +41,82 @@ export interface TerminalInfo {
   cwd: string
 }
 
+/**
+ * CAP-3 spawn response: terminal info PLUS the issued claim credential.
+ * Same flattened camelCase shape on both transports (desktop `terminal_spawn`
+ * IpcResult data and web `spawn` reply data). Spawn is the ONLY issuance path.
+ * Mirrors the Rust `SpawnedTerminal` serde shape exactly (id/shell/cwd/pid/
+ * cols/rows/claim — pinned by the Rust serde shape tests).
+ */
+export interface SpawnedTerminal extends TerminalInfo {
+  pid: number
+  cols: number
+  rows: number
+  /** Unguessable host-issued lease credential (64 hex chars). Present only in
+   * the spawn/rotate responses — never echoed by any other operation. */
+  claim: string
+}
+
+/**
+ * CAP-3 attach response — byte-identical camelCase shape on both transports
+ * (desktop `terminal_attach` IpcResult data; web `attach` reply data).
+ * Carries the replay cursor (`latestSeq`) + `gap` flag. NEVER carries a
+ * claim: attach consumes the credential, it never issues one.
+ */
+export interface TerminalAttachResult {
+  id: string
+  shell: string
+  cwd: string
+  pid: number
+  cols: number
+  rows: number
+  latestSeq: number
+  gap: boolean
+}
+
+/** CAP-3 rotate response: the fresh credential. */
+export interface RotatedClaim {
+  claim: string
+}
+
 // IPC channel definitions
 export type TerminalIpcChannels = {
-  'terminal:spawn': (options: TerminalSpawnOptions) => IpcResult<TerminalInfo>
+  'terminal:spawn': (options: TerminalSpawnOptions) => IpcResult<SpawnedTerminal>
+  'terminal:attach': (
+    terminalId: string,
+    claim: string,
+    lastSeq: number
+  ) => IpcResult<TerminalAttachResult>
+  'terminal:rotate_claim': (terminalId: string, claim: string) => IpcResult<RotatedClaim>
+  'terminal:revoke_claim': (terminalId: string, claim: string) => IpcResult<void>
   'terminal:write': (terminalId: string, data: string) => IpcResult<void>
   'terminal:resize': (terminalId: string, cols: number, rows: number) => IpcResult<void>
   'terminal:kill': (terminalId: string) => IpcResult<void>
+}
+
+// CAP-5 / Story 5: Workspace manifest IPC channels. Mirrors the three Tauri
+// commands (`workspace_manifest_get` / `_write` / `_delete`) and the three
+// HTTP routes (`GET /workspace/:projectId`, `POST /workspace/:projectId/write`,
+// `POST /workspace/:projectId/delete`) — both transports return the SAME
+// `IpcResult<...>` shape byte-for-byte. Conflict is a SUCCESS body variant of
+// `WriteOutcome` (NOT an error code); an excluded-field payload (`envVars`,
+// raw `claim`, `fullscreenPaneId`) fails serde `deny_unknown_fields` and maps
+// to `VALIDATION_ERROR` with no state change.
+//
+// Patch 11: the channel keys use the colon-separated pattern
+// (`workspace:manifest:get`, etc.) to mirror the existing
+// `TerminalIpcChannels` (`terminal:spawn`, `terminal:attach`, …). The Tauri
+// adapter's IPC_COMMANDS map uses the underscored Rust command names
+// (`workspace_manifest_get`); the channel map keys are a documentation /
+// type-safety surface, not the literal invoke() strings.
+export type WorkspaceManifestIpcChannels = {
+  'workspace:manifest:get': (projectId: string) => IpcResult<WorkspaceManifest | null>
+  'workspace:manifest:write': (
+    projectId: string,
+    basedRevision: number | null,
+    manifest: WorkspaceManifest
+  ) => IpcResult<WriteOutcome>
+  'workspace:manifest:delete': (projectId: string) => IpcResult<void>
 }
 
 // Event types for main -> renderer communication
@@ -139,7 +211,22 @@ export interface GitApi {
 
 // Terminal API exposed via preload
 export interface TerminalApi {
-  spawn: (options?: TerminalSpawnOptions) => Promise<IpcResult<TerminalInfo>>
+  spawn: (options?: TerminalSpawnOptions) => Promise<IpcResult<SpawnedTerminal>>
+  /**
+   * CAP-3: attach to a terminal's output stream with terminalId + claim +
+   * lastSeq. Verification is the gate — any failure (unknown terminal,
+   * missing/wrong/revoked credential) resolves to the same generic
+   * UNAUTHORIZED error with no terminal metadata or output.
+   */
+  attach: (
+    terminalId: string,
+    claim: string,
+    lastSeq: number
+  ) => Promise<IpcResult<TerminalAttachResult>>
+  /** CAP-3: possession-based rotation — old credential invalidated atomically. */
+  rotateClaim: (terminalId: string, claim: string) => Promise<IpcResult<RotatedClaim>>
+  /** CAP-3: revoke the credential; the PTY keeps running. */
+  revokeClaim: (terminalId: string, claim: string) => Promise<IpcResult<void>>
   write: (terminalId: string, data: string) => Promise<IpcResult<void>>
   resize: (terminalId: string, cols: number, rows: number) => Promise<IpcResult<void>>
   kill: (terminalId: string) => Promise<IpcResult<void>>

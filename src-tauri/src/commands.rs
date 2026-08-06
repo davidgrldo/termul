@@ -3,7 +3,9 @@ use crate::migrations::{
     MigrationInfo, MigrationManager, MigrationRecord, MigrationResult, SchemaVersion,
 };
 use crate::path_validation;
-use crate::pty::{PtyManager, SpawnOptions, TerminalInfo};
+use crate::pty::claims::RotatedClaim;
+use crate::pty::manager::{SpawnedTerminal, TerminalAttachResult};
+use crate::pty::{PtyManager, SpawnOptions};
 use crate::remote;
 use crate::trackers::{
     CwdTracker, ExitCodeTracker, GitCommit, GitStatus, GitStatusDetail, GitTracker,
@@ -224,15 +226,265 @@ pub fn read_attachment_bytes(path: String) -> Result<Response, String> {
 /// zero-overhead binary IPC. PTY output is sent as raw `Vec<u8>` via
 /// `Response::new(bytes)`, arriving in JS as `ArrayBuffer` with no JSON
 /// serialization overhead.
+///
+/// CAP-3: the response carries the terminal info PLUS the issued `claim`
+/// credential (flattened camelCase, same shape as the web `spawn` reply).
+/// This is the only issuance path.
 #[tauri::command]
 pub async fn terminal_spawn(
     options: SpawnOptions,
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
-) -> Result<IpcResult<TerminalInfo>, String> {
+) -> Result<IpcResult<SpawnedTerminal>, String> {
     match pty_manager.spawn(options, Some(on_data)).await {
-        Ok(info) => Ok(IpcResult::success(info)),
+        Ok(spawned) => Ok(IpcResult::success(spawned)),
         Err(e) => Ok(IpcResult::error(e, "SPAWN_FAILED")),
+    }
+}
+
+/// Milliseconds between claim-generation checks in a desktop attach forwarder.
+/// Bounds how long a forwarder survives a rotate/revoke while its terminal is
+/// idle (no output events to piggyback the check on).
+const ATTACH_FORWARDER_GENERATION_CHECK_MS: u64 = 250;
+
+/// Tracked desktop attach forwarders: terminal_id → (token, abort handle).
+/// Exactly one live forwarder per terminal — a re-attach aborts the
+/// predecessor; rotate/revoke terminate it via the claim generation bump.
+static ATTACH_FORWARDERS: OnceLock<Mutex<HashMap<String, (u64, tokio::task::AbortHandle)>>> =
+    OnceLock::new();
+static ATTACH_FORWARDER_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn attach_forwarders() -> &'static Mutex<HashMap<String, (u64, tokio::task::AbortHandle)>> {
+    ATTACH_FORWARDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Recover the forwarder map guard even if a holder panicked while holding the
+/// lock — silently skipping on poison would skip predecessor aborts and leak
+/// entries.
+fn lock_forwarders() -> std::sync::MutexGuard<'static, HashMap<String, (u64, tokio::task::AbortHandle)>> {
+    attach_forwarders()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Teardown condition for an attach forwarder, pure for testability. Shared
+/// by the desktop forwarder and the web attachment task (CAP-3 amendment R1:
+/// invalidation severs EVERY access derived from the credential, on all
+/// connections).
+///
+/// A forwarder must terminate when the captured claim generation no longer
+/// matches the registry: a bump means rotate/revoke invalidated the credential
+/// this stream was derived from, and a missing record (`None`) means the
+/// terminal was killed/reaped.
+pub(crate) fn forwarder_should_terminate(
+    captured_generation: Option<u64>,
+    current_generation: Option<u64>,
+) -> bool {
+    captured_generation != current_generation
+}
+
+#[cfg(test)]
+mod forwarder_teardown_tests {
+    use super::forwarder_should_terminate;
+
+    #[test]
+    fn same_generation_keeps_streaming() {
+        assert!(!forwarder_should_terminate(Some(3), Some(3)));
+    }
+
+    #[test]
+    fn rotated_generation_terminates() {
+        assert!(forwarder_should_terminate(Some(3), Some(4)));
+        assert!(forwarder_should_terminate(Some(3), Some(2)));
+    }
+
+    #[test]
+    fn killed_or_reaped_terminal_terminates() {
+        assert!(forwarder_should_terminate(Some(3), None));
+    }
+
+    #[test]
+    fn absent_at_both_ends_is_neutral() {
+        assert!(!forwarder_should_terminate(None, None));
+        // A forwarder can never start without a record, but the condition must
+        // still be total.
+        assert!(forwarder_should_terminate(None, Some(1)));
+    }
+}
+
+/// Attach to a terminal's output stream with a claim credential (CAP-3).
+///
+/// Verification is the gate: `terminalId` + valid `claim` + `lastSeq`. Any
+/// verification failure (unknown terminal, missing/wrong/revoked credential,
+/// binding mismatch) returns ONE generic UNAUTHORIZED error — no response
+/// shape distinguishes the cases (existence leak stays fixed). On success the
+/// ring-bounded replay (chunks with `seq > lastSeq`) is delivered through the
+/// raw-bytes channel, then a tracked forwarder streams live output.
+///
+/// Forwarder lifecycle: exactly one per terminal — this command aborts any
+/// predecessor before installing the new one; rotate/revoke bump the claim
+/// generation, which the forwarder observes and terminates on. The PTY is
+/// never touched by attach failures or forwarder teardown.
+#[tauri::command]
+pub async fn terminal_attach(
+    terminal_id: String,
+    claim: String,
+    last_seq: u64,
+    on_data: Channel<Response>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<TerminalAttachResult>, String> {
+    // Capture the generation BEFORE verifying (TOCTOU-safe ordering): if a
+    // rotate/revoke lands between capture and verify, verify fails (the
+    // credential was invalidated) and we reject; if it lands after verify, the
+    // captured generation is stale and the forwarder terminates on its next
+    // check. Capturing after verify would invert the race and let an
+    // invalidated credential stream forever.
+    let generation = pty_manager.claim_generation(&terminal_id);
+    if pty_manager.verify_claim(&terminal_id, &claim).is_err() {
+        // Registry already logged the failure (terminal id, never the
+        // credential). Keep the response generic.
+        return Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED"));
+    }
+    let Some(instance) = pty_manager.get(&terminal_id) else {
+        // Verified a heartbeat ago but gone now — same generic error.
+        return Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED"));
+    };
+
+    // Bounded replay + live subscription snapshot atomically (existing seq
+    // infra, unchanged).
+    let replay = instance.subscribe_from(last_seq);
+    let result = pty_manager.build_attach_result(&instance, &replay);
+
+    // Single-forwarder invariant: abort the predecessor BEFORE delivering the
+    // replay so it cannot interleave a duplicate stream.
+    let token = ATTACH_FORWARDER_TOKENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    {
+        let mut forwarders = lock_forwarders();
+        if let Some((_, previous)) = forwarders.remove(&terminal_id) {
+            previous.abort();
+            log::info!(
+                "[terminal-attach] aborted previous forwarder terminal_id={}",
+                terminal_id
+            );
+        }
+    }
+
+    for chunk in &replay.chunks {
+        if on_data.send(Response::new(chunk.data.clone())).is_err() {
+            log::warn!(
+                "[terminal-attach] replay channel closed terminal_id={}",
+                terminal_id
+            );
+            return Ok(IpcResult::success(result));
+        }
+    }
+
+    let pty = pty_manager.inner().clone();
+    let forwarder_id = terminal_id.clone();
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+            ATTACH_FORWARDER_GENERATION_CHECK_MS,
+        ));
+        let mut receiver = replay.receiver;
+        loop {
+            // Teardown on rotate/revoke (generation bump) or kill/reap
+            // (record gone). Checked every tick AND after every chunk.
+            if forwarder_should_terminate(generation, pty.claim_generation(&forwarder_id)) {
+                log::info!(
+                    "[terminal-attach] forwarder terminating (claim invalidated) terminal_id={}",
+                    forwarder_id
+                );
+                break;
+            }
+            tokio::select! {
+                received = receiver.recv() => {
+                    match received {
+                        Ok(chunk) => {
+                            if on_data.send(Response::new(chunk.data)).is_err() {
+                                break; // renderer channel gone
+                            }
+                        }
+                        // Desktop's raw-bytes channel has no gap framing
+                        // (deferred parity decision) — keep streaming.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            log::warn!(
+                                "[terminal-attach] output receiver lagged by {skipped} for {forwarder_id}"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = tick.tick() => {}
+            }
+        }
+        // Self-deregister only if this forwarder is still the tracked one (a
+        // later re-attach may have replaced the entry already).
+        let mut forwarders = lock_forwarders();
+        if let Some((tracked_token, _)) = forwarders.get(&forwarder_id) {
+            if *tracked_token == token {
+                forwarders.remove(&forwarder_id);
+            }
+        }
+    });
+
+    if !handle.is_finished() {
+        let mut forwarders = lock_forwarders();
+        // A concurrent attach may have raced — keep this (latest) forwarder
+        // and abort any rival: exactly one survives, last attach wins. A
+        // forwarder that already terminated (e.g. a generation bump raced the
+        // spawn) is never registered, so no dead entry lingers in the map.
+        if let Some((prev_token, prev_abort)) =
+            forwarders.insert(terminal_id.clone(), (token, handle.abort_handle()))
+        {
+            if prev_token != token {
+                prev_abort.abort();
+            }
+        }
+    }
+
+    log::info!(
+        "[terminal-attach] attached terminal_id={} latest_seq={} gap={}",
+        terminal_id,
+        result.latest_seq,
+        result.gap
+    );
+    Ok(IpcResult::success(result))
+}
+
+/// Rotate a terminal's claim credential (CAP-3).
+///
+/// Possession-based: presenting the current credential yields a fresh one and
+/// atomically invalidates the old. Any verification failure returns the same
+/// generic UNAUTHORIZED error as attach. The generation bump terminates the
+/// tracked desktop attach forwarder (teardown of the invalidated holder's
+/// access) while the PTY itself keeps running.
+#[tauri::command]
+pub async fn terminal_rotate_claim(
+    terminal_id: String,
+    claim: String,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<RotatedClaim>, String> {
+    match pty_manager.rotate_claim(&terminal_id, &claim) {
+        Ok(new_claim) => Ok(IpcResult::success(RotatedClaim { claim: new_claim })),
+        Err(_) => Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED")),
+    }
+}
+
+/// Revoke a terminal's claim credential (CAP-3).
+///
+/// The PTY survives (never-clause) and stays attachable by a client holding a
+/// newly rotated credential; only the presented credential is invalidated. The
+/// generation bump terminates the tracked desktop attach forwarder. Any
+/// verification failure returns the same generic UNAUTHORIZED error.
+#[tauri::command]
+pub async fn terminal_revoke_claim(
+    terminal_id: String,
+    claim: String,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<()>, String> {
+    match pty_manager.revoke_claim(&terminal_id, &claim) {
+        Ok(()) => Ok(IpcResult::success(())),
+        Err(_) => Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED")),
     }
 }
 
@@ -2995,7 +3247,7 @@ pub async fn remote_server_start(
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
-    chat_history_store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+    workspace_manifest_store: State<'_, HostWorkspaceManifestStore>,
     bind_mode: Option<String>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
     // Default to localhost only when the caller omits the bind mode; an
@@ -3007,14 +3259,20 @@ pub async fn remote_server_start(
         Some(s) => remote::RemoteBindMode::parse(s)
             .ok_or_else(|| format!("invalid bind mode '{s}': use 'localhost' or 'all'",))?,
     };
+    // CAP-5: thread the desktop's `WorkspaceManifestService` (opened under
+    // `<app_data_dir>/workspace-manifests` in `lib.rs`) through to
+    // `serve_router` so the web/remote client can read/write a project's
+    // manifest through the three `/workspace/*` routes. `None` degrades to
+    // fresh-only mode (no host store attached).
+    let workspace_manifest = workspace_manifest_store.store().map(Arc::clone);
     let started = remote_state
         .start(
             acp_manager.inner().clone(),
             pty_manager.inner().clone(),
             ws_relay.inner().clone(),
             project_registry.inner().clone(),
-            chat_history_store.inner().clone(),
             bind_mode,
+            workspace_manifest,
         )
         .await;
     match started {
@@ -3094,12 +3352,17 @@ pub async fn remote_server_status(
 /// so connected web clients refetch `GET /projects`. Called by the renderer
 /// on server-start success + on every project-store mutation while the server
 /// runs. No env-var values cross the wire — `ProjectSummary` redacts-by-omission.
+///
+/// In desktop-hosted mode the desktop's `activeProjectId` IS the host default
+/// (the desktop user is the host operator), so it is pushed as `defaultProjectId`.
+/// The web client seeds its initial `activeProjectId` from it on the first
+/// `GET /projects` but preserves its own selection on subsequent refetches.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProjectsPayload {
     pub projects: Vec<crate::web::ProjectSummary>,
     #[serde(default)]
-    pub active_project_id: Option<String>,
+    pub default_project_id: Option<String>,
 }
 
 #[tauri::command]
@@ -3108,8 +3371,52 @@ pub async fn remote_sync_projects(
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    project_registry.set(payload.projects, payload.active_project_id.clone());
-    crate::web::broadcast_projects_changed(ws_relay.inner(), payload.active_project_id.as_deref());
+    project_registry.set(payload.projects, payload.default_project_id.clone());
+    crate::web::broadcast_projects_changed(ws_relay.inner(), payload.default_project_id.as_deref());
+    Ok(IpcResult::success(()))
+}
+
+/// Explicitly set the host's default project (Epic 7 — cross-client
+/// workspace continuity). Distinct from a per-connection `switch_project`:
+/// this changes the host default that new web clients start with. Validates
+/// the project is switchable, updates `registry.set_default_project`, and
+/// broadcasts `projects_changed` to all connected web clients. Desktop-hosted
+/// mode has no `FileProjectRegistry` (the file registry is VPS-only); the
+/// desktop pushes its active selection as the default via `remote_sync_projects`,
+/// but this command lets the desktop set a default DIFFERENT from its own
+/// active project.
+#[tauri::command]
+pub async fn set_host_default_project(
+    project_id: String,
+    project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
+    ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
+) -> Result<IpcResult<()>, String> {
+    // Validate via switch_context (unknown/archived/pathless → NOT_FOUND).
+    if project_registry.switch_context(&project_id).is_none() {
+        log::warn!(
+            "set_host_default_project: project '{}' not found or not switchable",
+            project_id
+        );
+        return Ok(IpcResult::error(
+            format!("project '{project_id}' not found or not switchable"),
+            "NOT_FOUND",
+        ));
+    }
+    if !project_registry.set_default_project(&project_id) {
+        log::warn!(
+            "set_host_default_project: project '{}' became unavailable before commit",
+            project_id
+        );
+        return Ok(IpcResult::error(
+            "target project became unavailable before commit".to_string(),
+            "NOT_FOUND",
+        ));
+    }
+    crate::web::broadcast_projects_changed(ws_relay.inner(), Some(&project_id));
+    log::info!(
+        "set_host_default_project: host default updated to '{}' + broadcast",
+        project_id
+    );
     Ok(IpcResult::success(()))
 }
 
@@ -3162,6 +3469,12 @@ pub async fn remote_sync_chat_history(
     Ok(IpcResult::success(()))
 }
 
+/// Host-owned durable history state (CAP-2). `None` when the desktop could not
+/// open `SessionPersistence` at startup (degraded live-only mode); commands
+/// must treat absence as empty history, never crash.
+#[derive(Default)]
+pub struct HostHistoryStore(pub Option<Arc<crate::acp::SessionPersistence>>);
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopChatHistoryList {
@@ -3169,12 +3482,48 @@ pub struct DesktopChatHistoryList {
     pub legacy_import_complete: bool,
 }
 
+fn host_entry_to_desktop(entry: crate::acp::SessionIndexEntry) -> crate::acp::ChatHistoryIndexEntry {
+    crate::acp::ChatHistoryIndexEntry {
+        id: entry.session_id,
+        agent_id: entry.runtime_agent_id.unwrap_or_default(),
+        // The renderer maps `config:<id>` namespaces back to the bare config
+        // id; anything else (absent or unprefixed) omits the key.
+        agent_config_id: entry
+            .stable_agent_namespace
+            .as_deref()
+            .and_then(|namespace| namespace.strip_prefix("config:"))
+            .map(str::to_string),
+        title: entry.title.unwrap_or_else(|| "Untitled Chat".to_string()),
+        cwd: entry.cwd,
+        project_id: entry.project_id.unwrap_or_default(),
+        created_at: entry.created_at,
+        last_activity_at: entry.last_activity_at,
+        message_count: entry.message_count,
+        status: match entry.status {
+            crate::acp::PersistedSessionStatus::Active => crate::acp::ChatHistoryStatus::Active,
+            crate::acp::PersistedSessionStatus::Error => crate::acp::ChatHistoryStatus::Error,
+            crate::acp::PersistedSessionStatus::Closed => crate::acp::ChatHistoryStatus::Closed,
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn acp_history_list(
+    host: State<'_, HostHistoryStore>,
     store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
 ) -> Result<IpcResult<DesktopChatHistoryList>, String> {
     log::info!("[acp-history] list start");
-    let (sessions, legacy_import_complete) = store.list();
+    // The legacy flag still gates the renderer's one-time KV wipe migration;
+    // the session list itself is host-owned now.
+    let legacy_import_complete = store.list().1;
+    let sessions = match &host.0 {
+        Some(persistence) => persistence
+            .list_sessions()
+            .into_iter()
+            .map(host_entry_to_desktop)
+            .collect(),
+        None => Vec::new(),
+    };
     log::info!("[acp-history] list success sessions={}", sessions.len());
     Ok(IpcResult::success(DesktopChatHistoryList {
         sessions,
@@ -3185,21 +3534,22 @@ pub async fn acp_history_list(
 #[tauri::command]
 pub async fn acp_history_get(
     session_id: String,
-    store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+    host: State<'_, HostHistoryStore>,
 ) -> Result<IpcResult<Option<serde_json::Value>>, String> {
     let log_session_id = sanitize_log_field(&session_id);
     log::info!("[acp-history] get start session_id={}", log_session_id);
-    let task_store = store.inner().clone();
-    let task_id = session_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.get(&task_id))
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
+    let Some(persistence) = host.0.as_ref().map(Arc::clone) else {
+        log::info!("[acp-history] get not_found session_id={}", log_session_id);
+        return Ok(IpcResult::success(None));
+    };
+    match persistence.session_payload_async(&session_id).await {
         Ok(payload) => {
             log::info!("[acp-history] get success session_id={}", log_session_id);
-            Ok(IpcResult::success(Some(payload)))
+            let value = serde_json::to_value(&payload)
+                .map_err(|error| error.to_string())?;
+            Ok(IpcResult::success(Some(value)))
         }
-        Err(crate::acp::ChatHistoryStoreError::SessionNotFound) => {
+        Err(crate::acp::SessionPersistenceError::SessionNotFound) => {
             log::info!("[acp-history] get not_found session_id={}", log_session_id);
             Ok(IpcResult::success(None))
         }
@@ -3217,11 +3567,17 @@ pub async fn acp_history_get(
     }
 }
 
+/// Legacy write path (renderer wipe-migration only). Live sessions are authored
+/// by the host event/session layer and never flow through this command. The
+/// payload lands in the legacy `ChatHistoryStore`; the incremental host import
+/// then converges it into `SessionPersistence` so the host-owned `list`/`get`
+/// read back exactly what was just saved (read-your-writes for the migration).
 #[tauri::command]
 pub async fn acp_history_save(
     session_id: String,
     payload: serde_json::Value,
     store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+    host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
     let log_session_id = sanitize_log_field(&session_id);
@@ -3233,6 +3589,9 @@ pub async fn acp_history_save(
         .map_err(|error| error.to_string())?;
     match result {
         Ok(()) => {
+            if let Some(persistence) = &host.0 {
+                crate::acp::import_chat_history(persistence, store.inner()).await;
+            }
             crate::web::broadcast_chat_history_changed(ws_relay.inner());
             log::info!("[acp-history] save success session_id={}", log_session_id);
             Ok(IpcResult::success(()))
@@ -3254,33 +3613,32 @@ pub async fn acp_history_save(
 #[tauri::command]
 pub async fn acp_history_delete(
     session_id: String,
-    store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+    host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
     let log_session_id = sanitize_log_field(&session_id);
     log::info!("[acp-history] delete start session_id={}", log_session_id);
-    let task_store = store.inner().clone();
-    let task_id = session_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.delete(&task_id))
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            crate::web::broadcast_chat_history_changed(ws_relay.inner());
-            log::info!("[acp-history] delete success session_id={}", log_session_id);
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!(
-                "[acp-history] delete failure session_id={} error={}",
-                log_session_id,
-                error
-            );
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_DELETE_FAILED",
-            ))
-        }
+    match &host.0 {
+        Some(persistence) => match persistence.delete_session(&session_id).await {
+            Ok(()) => {
+                crate::web::broadcast_chat_history_changed(ws_relay.inner());
+                log::info!("[acp-history] delete success session_id={}", log_session_id);
+                Ok(IpcResult::success(()))
+            }
+            Err(error) => {
+                log::error!(
+                    "[acp-history] delete failure session_id={} error={}",
+                    log_session_id,
+                    error
+                );
+                Ok(IpcResult::error(
+                    error.to_string(),
+                    "ACP_HISTORY_DELETE_FAILED",
+                ))
+            }
+        },
+        // Degraded live-only mode: there is no durable history to delete.
+        None => Ok(IpcResult::success(())),
     }
 }
 
@@ -3311,6 +3669,8 @@ pub async fn acp_history_flush(
 #[tauri::command]
 pub async fn acp_history_mark_legacy_import_complete(
     store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+    host: State<'_, HostHistoryStore>,
+    ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
     log::info!("[acp-history] legacy marker start");
     let task_store = store.inner().clone();
@@ -3320,6 +3680,14 @@ pub async fn acp_history_mark_legacy_import_complete(
             .map_err(|error| error.to_string())?;
     match result {
         Ok(()) => {
+            // The wipe migration may just have written new legacy entries;
+            // converge the host store incrementally (idempotent).
+            if let Some(persistence) = &host.0 {
+                let imported = crate::acp::import_chat_history(persistence, store.inner()).await;
+                if imported > 0 {
+                    crate::web::broadcast_chat_history_changed(ws_relay.inner());
+                }
+            }
             log::info!("[acp-history] legacy marker success");
             Ok(IpcResult::success(()))
         }
@@ -3330,6 +3698,42 @@ pub async fn acp_history_mark_legacy_import_complete(
                 "ACP_HISTORY_MIGRATION_FAILED",
             ))
         }
+    }
+}
+
+/// Legacy-store read used ONLY by the renderer's one-time KV wipe migration,
+/// which must read back exactly what it wrote to the legacy
+/// `ChatHistoryStore` (byte-for-byte verification). Live history reads use the
+/// host-owned `acp_history_list` / `acp_history_get` instead.
+#[tauri::command]
+pub async fn acp_history_list_legacy(
+    store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+) -> Result<IpcResult<DesktopChatHistoryList>, String> {
+    let (sessions, legacy_import_complete) = store.list();
+    Ok(IpcResult::success(DesktopChatHistoryList {
+        sessions,
+        legacy_import_complete,
+    }))
+}
+
+/// Legacy-store payload read for the wipe migration (see `acp_history_list_legacy`).
+#[tauri::command]
+pub async fn acp_history_get_legacy(
+    session_id: String,
+    store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
+) -> Result<IpcResult<Option<serde_json::Value>>, String> {
+    let task_store = store.inner().clone();
+    let task_id = session_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || task_store.get(&task_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    match result {
+        Ok(payload) => Ok(IpcResult::success(Some(payload))),
+        Err(crate::acp::ChatHistoryStoreError::SessionNotFound) => Ok(IpcResult::success(None)),
+        Err(error) => Ok(IpcResult::error(
+            error.to_string(),
+            "ACP_HISTORY_GET_FAILED",
+        )),
     }
 }
 
@@ -3770,6 +4174,208 @@ pub fn log_frontend_error(
     Ok(())
 }
 
+// ============================================================================
+// Workspace Manifest Commands (CAP-5 / Story 5)
+// ============================================================================
+//
+// Host-owned versioned workspace manifests — one per project, atomically
+// persisted, revision-checked. Conflict is a success-body variant of
+// `WriteOutcome`, NOT an error code; serde `deny_unknown_fields` rejection
+// (an over-serialized payload with `envVars` / raw `claim` /
+// `fullscreenPaneId`) maps to `VALIDATION_ERROR`. Mirrors the three HTTP
+// routes in `web/workspace_api.rs` byte-for-byte (camelCase `IpcResult<T>`).
+
+/// Host-owned workspace-manifest state (CAP-5). `None` when the desktop could
+/// not open `WorkspaceManifestService` at startup (degraded fresh-only mode);
+/// commands must treat absence as an empty manifest, never crash.
+///
+/// Patch 12: the inner field is private (not `pub`) so callers cannot reach
+/// the `Arc` directly — they go through [`Self::store`] (read) or
+/// [`Self::new`] (construct). This keeps the access surface tight so a future
+/// swap (e.g. a manager wrapper that owns the `Arc`) doesn't break every call
+/// site.
+#[derive(Default)]
+pub struct HostWorkspaceManifestStore(Option<Arc<crate::acp::WorkspaceManifestService>>);
+
+impl HostWorkspaceManifestStore {
+    /// Construct from an already-opened `WorkspaceManifestService` (`None`
+    /// for degraded fresh-only mode — the desktop could not open the store
+    /// at startup).
+    #[must_use]
+    pub fn new(service: Option<Arc<crate::acp::WorkspaceManifestService>>) -> Self {
+        Self(service)
+    }
+
+    /// Access the inner `WorkspaceManifestService` (`None` in degraded mode).
+    /// Callers that need to clone the `Arc` should `.as_ref().map(Arc::clone)`.
+    #[must_use]
+    pub(crate) fn store(&self) -> Option<&Arc<crate::acp::WorkspaceManifestService>> {
+        self.0.as_ref()
+    }
+}
+
+/// `workspace_manifest_get(projectId)` — load a project's manifest. Returns
+/// `IpcResult::success(None)` when no manifest exists (the success path — a
+/// workspace reload starts fresh) OR when the host store is unavailable
+/// (degraded mode). Mirrors `GET /workspace/:projectId` byte-for-byte.
+#[tauri::command]
+pub async fn workspace_manifest_get(
+    project_id: String,
+    store: State<'_, HostWorkspaceManifestStore>,
+) -> Result<IpcResult<Option<crate::acp::WorkspaceManifest>>, String> {
+    let log_project_id = sanitize_log_field(&project_id);
+    log::info!(
+        "[workspace-manifest] get start project_id={}",
+        log_project_id
+    );
+    let Some(service) = store.store().map(Arc::clone) else {
+        log::info!(
+            "[workspace-manifest] get unavailable project_id={}",
+            log_project_id
+        );
+        return Ok(IpcResult::success(None));
+    };
+    match service.load(&project_id).await {
+        Ok(manifest) => {
+            log::info!(
+                "[workspace-manifest] get success project_id={} revision={}",
+                log_project_id,
+                manifest.as_ref().map_or(0, |m| m.revision)
+            );
+            Ok(IpcResult::success(manifest))
+        }
+        Err(error) => {
+            log::error!(
+                "[workspace-manifest] get failure project_id={} error={}",
+                log_project_id,
+                error
+            );
+            Ok(IpcResult::error(
+                error.to_string(),
+                "WORKSPACE_MANIFEST_GET_FAILED",
+            ))
+        }
+    }
+}
+
+/// `workspace_manifest_write(projectId, basedRevision, manifest)` —
+/// revision-checked write. The host compares `basedRevision` (null = initial
+/// write) against the on-disk `revision`; on match → apply + increment +
+/// persist + return `WriteOutcome::Updated`; on mismatch → return
+/// `WriteOutcome::Conflict` WITHOUT mutating state. Conflict is a SUCCESS
+/// body variant (NOT an error code) — the caller branches on the
+/// `status` discriminator.
+///
+/// Patch 1: the `manifest` argument is `serde_json::Value` (not
+/// `WorkspaceManifest`) so the manual deserialization inside the command
+/// catches a `deny_unknown_fields` rejection (an excluded field like
+/// `envVars` / raw `claim` / `fullscreenPaneId`) and maps it to
+/// `IpcResult::error(VALIDATION_ERROR)` — BEFORE the service is reached, with
+/// NO state change. If the argument were typed `WorkspaceManifest`, Tauri's
+/// IPC deserialization layer would reject the payload before this command
+/// body runs, surfacing as an `INVOKE_ERROR` (a thrown IPC error) instead of
+/// the spec-required `VALIDATION_ERROR`.
+#[tauri::command]
+pub async fn workspace_manifest_write(
+    project_id: String,
+    based_revision: Option<u64>,
+    manifest: serde_json::Value,
+    store: State<'_, HostWorkspaceManifestStore>,
+) -> Result<IpcResult<crate::acp::WriteOutcome>, String> {
+    let log_project_id = sanitize_log_field(&project_id);
+    log::info!(
+        "[workspace-manifest] write start project_id={} based_revision={:?}",
+        log_project_id,
+        based_revision
+    );
+    // Patch 1: manual deserialization so a `deny_unknown_fields` rejection
+    // (envVars / raw claim / fullscreenPaneId / agentLauncherPaneId) surfaces
+    // as `IpcResult::error(VALIDATION_ERROR)` — NOT a thrown IPC error
+    // (`INVOKE_ERROR`) that would mask the validation failure.
+    let manifest: crate::acp::WorkspaceManifest = match serde_json::from_value(manifest) {
+        Ok(m) => m,
+        Err(error) => {
+            log::warn!(
+                "[workspace-manifest] write payload validation failed project_id={} error={}",
+                log_project_id,
+                error
+            );
+            return Ok(IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            ));
+        }
+    };
+    let Some(service) = store.store().map(Arc::clone) else {
+        log::error!(
+            "[workspace-manifest] write unavailable project_id={}",
+            log_project_id
+        );
+        return Ok(IpcResult::error(
+            "workspace manifest store is unavailable",
+            "WORKSPACE_MANIFEST_UNAVAILABLE",
+        ));
+    };
+    match service
+        .write(&project_id, based_revision, manifest)
+        .await
+    {
+        Ok(outcome) => {
+            // Boundary log emits project_id + revision + update_identity —
+            // never the topology or claim. The service already logged it.
+            Ok(IpcResult::success(outcome))
+        }
+        Err(error) => {
+            log::error!(
+                "[workspace-manifest] write failure project_id={} error={}",
+                log_project_id,
+                error
+            );
+            Ok(IpcResult::error(
+                error.to_string(),
+                "WORKSPACE_MANIFEST_WRITE_FAILED",
+            ))
+        }
+    }
+}
+
+/// `workspace_manifest_delete(projectId)` — idempotent delete. Returns
+/// `IpcResult::success(())` whether the file existed or not. Never touches
+/// the PTY / agent layer (the manifest is a passive durable projection).
+#[tauri::command]
+pub async fn workspace_manifest_delete(
+    project_id: String,
+    store: State<'_, HostWorkspaceManifestStore>,
+) -> Result<IpcResult<()>, String> {
+    let log_project_id = sanitize_log_field(&project_id);
+    log::info!(
+        "[workspace-manifest] delete start project_id={}",
+        log_project_id
+    );
+    let Some(service) = store.store().map(Arc::clone) else {
+        log::info!(
+            "[workspace-manifest] delete unavailable project_id={}",
+            log_project_id
+        );
+        // Idempotent success — there is nothing to delete in degraded mode.
+        return Ok(IpcResult::success(()));
+    };
+    match service.delete(&project_id).await {
+        Ok(()) => Ok(IpcResult::success(())),
+        Err(error) => {
+            log::error!(
+                "[workspace-manifest] delete failure project_id={} error={}",
+                log_project_id,
+                error
+            );
+            Ok(IpcResult::error(
+                error.to_string(),
+                "WORKSPACE_MANIFEST_DELETE_FAILED",
+            ))
+        }
+    }
+}
+
 /// Get available shells
 #[cfg(test)]
 mod tests {
@@ -3791,6 +4397,70 @@ mod tests {
         assert!(result.data.is_none());
         assert_eq!(result.error, Some("test error".to_string()));
         assert_eq!(result.code, Some("TEST_ERROR".to_string()));
+    }
+
+    /// The host-owned list maps `SessionIndexEntry` (camelCase wire) into the
+    /// renderer's `ChatHistoryIndexEntry` shape unchanged by the ownership
+    /// transfer: `config:<id>` namespaces collapse back to the bare config id,
+    /// absent titles/projects fall back to the renderer defaults.
+    #[test]
+    fn host_entry_to_desktop_maps_renderer_shape() {
+        let entry = crate::acp::SessionIndexEntry {
+            storage_key: "key".to_string(),
+            session_id: "s-1".to_string(),
+            stable_agent_namespace: Some("config:claude".to_string()),
+            runtime_agent_id: Some("runtime-1".to_string()),
+            project_id: Some("p-1".to_string()),
+            cwd: "/work".to_string(),
+            title: Some("Chat".to_string()),
+            created_at: 10,
+            last_activity_at: 20,
+            status: crate::acp::PersistedSessionStatus::Active,
+            message_count: 3,
+            tool_count: 1,
+            last_seq: 5,
+            resume_eligible: true,
+        };
+        let desktop = host_entry_to_desktop(entry);
+        assert_eq!(desktop.id, "s-1");
+        assert_eq!(desktop.agent_id, "runtime-1");
+        assert_eq!(desktop.agent_config_id.as_deref(), Some("claude"));
+        assert_eq!(desktop.title, "Chat");
+        assert_eq!(desktop.cwd, "/work");
+        assert_eq!(desktop.project_id, "p-1");
+        assert_eq!(desktop.created_at, 10);
+        assert_eq!(desktop.last_activity_at, 20);
+        assert_eq!(desktop.message_count, 3);
+        assert!(matches!(
+            desktop.status,
+            crate::acp::ChatHistoryStatus::Active
+        ));
+
+        let bare = crate::acp::SessionIndexEntry {
+            storage_key: "k".to_string(),
+            session_id: "s-2".to_string(),
+            stable_agent_namespace: Some("custom-ns".to_string()),
+            runtime_agent_id: None,
+            project_id: None,
+            cwd: "/w".to_string(),
+            title: None,
+            created_at: 1,
+            last_activity_at: 2,
+            status: crate::acp::PersistedSessionStatus::Error,
+            message_count: 0,
+            tool_count: 0,
+            last_seq: 0,
+            resume_eligible: false,
+        };
+        let desktop = host_entry_to_desktop(bare);
+        assert_eq!(desktop.agent_id, "");
+        assert!(
+            desktop.agent_config_id.is_none(),
+            "non config: namespace must not surface as agentConfigId"
+        );
+        assert_eq!(desktop.title, "Untitled Chat");
+        assert_eq!(desktop.project_id, "");
+        assert!(matches!(desktop.status, crate::acp::ChatHistoryStatus::Error));
     }
 
     #[test]
@@ -4037,3 +4707,4 @@ mod tests {
         assert_eq!(req.search_id, "search-1");
     }
 }
+

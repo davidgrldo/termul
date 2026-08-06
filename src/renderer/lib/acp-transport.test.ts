@@ -44,6 +44,8 @@ class FakeWebSocket {
     pongTimeoutMs: 75_000
   }
   snapshotEvents: unknown[] = []
+  /** Session payloads served by `get_session_payload`; unknown ids → not_found. */
+  sessionPayloads: Record<string, unknown> = {}
   reopenOutcome: unknown = {
     modes: {
       currentModeId: 'ask',
@@ -198,7 +200,18 @@ class FakeWebSocket {
       }
       const agentId = 'agent-spawned-1'
       this.liveAgents.add(agentId)
-      this.emitReply({ id: req.id, ok: true, payload: agentId })
+      // CAP-4: the spawn response carries the full authoritative metadata
+      // (capabilities + authMethods + stableNamespace), not just the agentId.
+      this.emitReply({
+        id: req.id,
+        ok: true,
+        payload: {
+          agentId,
+          capabilities: { loadSession: true },
+          authMethods: [],
+          stableNamespace: 'config:test'
+        }
+      })
       return
     }
     if (req.type === 'list_agents') {
@@ -217,6 +230,22 @@ class FakeWebSocket {
       }
       this.liveAgents.delete(payload.agentId)
       this.emitReply({ id: req.id, ok: true, payload: {} })
+      return
+    }
+    if (req.type === 'get_session_payload') {
+      // Standalone history: serve the registered renderer-shaped payload, or
+      // the server's `not_found` reply for absent ids.
+      const payload = req.payload as { sessionId?: string }
+      const stored = payload.sessionId ? this.sessionPayloads[payload.sessionId] : undefined
+      if (stored) {
+        this.emitReply({ id: req.id, ok: true, payload: stored })
+      } else {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: 'not_found', message: 'session payload not found' }
+        })
+      }
       return
     }
     this.emitReply({
@@ -268,17 +297,23 @@ describe('WsAcpTransport', () => {
 
     expect(await transport.listAgents()).toEqual([])
 
-    const agentId = await transport.spawnAgent({
+    const spawnResult = await transport.spawnAgent({
       name: 'test',
       command: 'npx',
       args: ['-y', '@example/agent'],
       env: {},
       allowTerminal: false
     })
-    expect(agentId).toBe('agent-spawned-1')
+    // CAP-4: the WS spawn response carries the full authoritative payload
+    // (agentId + capabilities + authMethods + stableNamespace), matching the
+    // desktop Tauri command's return type — one contract for both transports.
+    expect(spawnResult.agentId).toBe('agent-spawned-1')
+    expect(spawnResult.capabilities).toEqual({ loadSession: true })
+    expect(spawnResult.authMethods).toEqual([])
+    expect(spawnResult.stableNamespace).toBe('config:test')
     expect(await transport.listAgents()).toEqual(['agent-spawned-1'])
 
-    await transport.killAgent(agentId)
+    await transport.killAgent(spawnResult.agentId)
     expect(await transport.listAgents()).toEqual([])
 
     await expect(
@@ -617,6 +652,68 @@ describe('WsAcpTransport', () => {
     await transport.connect()
     await transport.subscribeSession('s1', 99)
     expect(recoveries).toEqual([{ sessionId: 's1', degraded: true }])
+    transport.dispose()
+  })
+
+  it('getSessionPayload passes through the materialized SessionPayload', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    // The standalone host materializes this renderer-shaped payload from its
+    // durable JSONL records (user bubble + agent run, deterministic ids/seqs).
+    const stored = {
+      metadata: {
+        id: 's-1',
+        agentId: 'runtime-1',
+        agentConfigId: 'claude',
+        title: 'Chat title',
+        cwd: '/work/project',
+        projectId: 'project-1',
+        createdAt: 100,
+        lastActivityAt: 900,
+        messageCount: 2,
+        lastSeq: 5,
+        status: 'active'
+      },
+      messages: [
+        {
+          id: 'turn:turn-1',
+          role: 'user',
+          blocks: [{ type: 'text', text: 'hello' }],
+          streaming: false,
+          timestamp: 101,
+          seq: 1
+        },
+        {
+          id: 'snapshot:agent:2',
+          role: 'agent',
+          blocks: [{ type: 'text', text: 'world' }],
+          streaming: false,
+          timestamp: 102,
+          seq: 2
+        }
+      ]
+    }
+    sock.sessionPayloads['s-1'] = stored
+
+    await expect(transport.getSessionPayload('s-1')).resolves.toEqual(stored)
+    const sent = sock.sent.map((frame) => JSON.parse(frame) as { type: string; payload: unknown })
+    const request = sent.find((frame) => frame.type === 'get_session_payload')
+    expect(request?.payload).toEqual({ sessionId: 's-1' })
+    transport.dispose()
+  })
+
+  it('getSessionPayload maps not_found to null (chat unavailable)', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+
+    await expect(transport.getSessionPayload('missing')).resolves.toBeNull()
     transport.dispose()
   })
 

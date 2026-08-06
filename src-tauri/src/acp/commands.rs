@@ -14,15 +14,19 @@ use tauri::State;
 
 use crate::acp::config::{AgentConfig, AgentId, SessionId};
 use crate::acp::manager::{
-    AcpManager, NewSessionOutcome, SessionCreationContext, SessionReopenOutcome,
+    AcpManager, NewSessionOutcome, SessionCreationContext, SessionReopenOutcome, SpawnOutcome,
 };
 
 /// Spawn an ACP agent subprocess and complete the `initialize` handshake.
+/// Returns the authoritative [`SpawnOutcome`] (capabilities + auth methods +
+/// stable namespace) so the renderer populates the store synchronously from
+/// the response (CAP-4: the spawn response — not the async event — is the
+/// source of truth). Mirrors the WS `spawn_agent` handler payload.
 #[tauri::command]
 pub async fn acp_spawn_agent(
     manager: State<'_, Arc<AcpManager>>,
     config: AgentConfig,
-) -> Result<AgentId, String> {
+) -> Result<SpawnOutcome, String> {
     manager.spawn(config).await
 }
 
@@ -42,6 +46,8 @@ pub async fn acp_list_agents(manager: State<'_, Arc<AcpManager>>) -> Result<Vec<
 }
 
 /// Create a new session. `mcpServers` is passed through to `session/new` as-is.
+/// `projectId` (CAP-2 attribution) is optional; the renderer passes the owning
+/// project so the host-owned durable record is project-scoped.
 #[tauri::command]
 pub async fn acp_new_session(
     manager: State<'_, Arc<AcpManager>>,
@@ -49,6 +55,7 @@ pub async fn acp_new_session(
     cwd: String,
     mcp_servers: Option<Vec<McpServer>>,
     ephemeral: Option<bool>,
+    project_id: Option<String>,
 ) -> Result<NewSessionOutcome, String> {
     manager
         .new_session_with_context(
@@ -56,7 +63,7 @@ pub async fn acp_new_session(
             cwd,
             mcp_servers.unwrap_or_default(),
             SessionCreationContext {
-                project_id: None,
+                project_id: project_id.filter(|id| !id.trim().is_empty()),
                 ephemeral: ephemeral.unwrap_or(false),
             },
         )

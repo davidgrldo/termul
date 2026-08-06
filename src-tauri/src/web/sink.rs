@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -934,6 +934,32 @@ impl EventSink for WsRelaySink {
                 }
             }
         }
+
+        // CAP-2: history is now host-owned. When a session is created or
+        // finalized at the host (regardless of which client drove it), notify
+        // every connected client so sidebars refetch the host index instead of
+        // depending on a desktop renderer save. Only fires when durable
+        // persistence is attached (live-only mode has nothing to refetch).
+        if self.persistence().is_some()
+            && matches!(type_, "session_created" | "session_closed")
+        {
+            self.notify_history_changed();
+        }
+    }
+}
+
+impl WsRelaySink {
+    /// Agent-level `chat_history_changed` fan-out (mirrors
+    /// `broadcast_chat_history_changed`, but callable from inside `emit` where
+    /// no `Arc<Self>` is available). Empty payload; clients refetch the index.
+    fn notify_history_changed(&self) {
+        let type_ = "chat_history_changed";
+        let se = SequencedEvent::new(None, 0, type_, json!({}));
+        let tier = tier_of(type_);
+        let targets: Vec<ClientId> = self.clients.lock().keys().copied().collect();
+        for client_id in targets {
+            self.enqueue(client_id, se.clone(), tier);
+        }
     }
 }
 
@@ -980,23 +1006,26 @@ pub fn fan_out<P: Serialize>(
 
 /// Broadcast a `projects_changed` agent-level event to every connected client.
 ///
-/// Called by the `remote_sync_projects` command after it updates the
-/// [`crate::web::project_registry::ProjectRegistry`]. The event is
-/// agent-level (`sid: None`, `seq: 0`) so [`WsRelaySink::emit`] fans it out to
-/// ALL connected clients (the wire `type` is `projects_changed` — the `acp:`
-/// prefix is stripped by `emit`). The payload carries only the new
-/// `activeProjectId`; the web client refetches `GET /projects` for the full
-/// list (the desktop is the source of truth).
+/// Called by the `remote_sync_projects` command (desktop-hosted push — the
+/// desktop's active IS the default) and the explicit `set_default_project`
+/// operation (Tauri command + WS request + HTTP route) after they update the
+/// [`crate::web::project_registry::ProjectRegistry`]. The event is agent-level
+/// (`sid: None`, `seq: 0`) so [`WsRelaySink::emit`] fans it out to ALL connected
+/// clients (the wire `type` is `projects_changed` — the `acp:` prefix is
+/// stripped by `emit`). The payload carries only the new `defaultProjectId`;
+/// the web client refetches `GET /projects` for the full list. On the initial
+/// load a client seeds `activeProjectId` from `defaultProjectId`; on subsequent
+/// events it preserves its own `activeProjectId` (no silent retarget).
 ///
-/// `active_project_id` is `None` when the desktop has no active project.
-pub fn broadcast_projects_changed(relay: &Arc<WsRelaySink>, active_project_id: Option<&str>) {
+/// `default_project_id` is `None` when the host has no default project.
+pub fn broadcast_projects_changed(relay: &Arc<WsRelaySink>, default_project_id: Option<&str>) {
     // Use the typed `ProjectsChangedPayload` (single source of truth for the
     // wire shape) rather than hand-rolled `json!` — its `skip_serializing_if`
-    // omits `activeProjectId` when `None` (the web client ignores the payload
+    // omits `defaultProjectId` when `None` (the web client ignores the payload
     // + refetches `GET /projects`, so omit-vs-null is cosmetic, but the
     // struct stays the canonical shape if fields are added later).
     let payload = ProjectsChangedPayload {
-        active_project_id: active_project_id.map(str::to_string),
+        default_project_id: default_project_id.map(str::to_string),
     };
     // Clone into a concrete `Arc<WsRelaySink>` first so `Arc::clone` infers
     // `T = WsRelaySink` (not `dyn EventSink`); the unsized coercion to
@@ -1590,14 +1619,14 @@ mod tests {
         assert_eq!(evt.type_, "projects_changed");
         assert!(evt.sid.is_none(), "agent-level event: sid must be null");
         assert_eq!(evt.seq, 0, "agent-level event: seq must be 0");
-        assert_eq!(evt.payload["activeProjectId"], "p-3");
+        assert_eq!(evt.payload["defaultProjectId"], "p-3");
     }
 
-    /// `broadcast_projects_changed` with no active project still fans out;
+    /// `broadcast_projects_changed` with no default project still fans out;
     /// the `ProjectsChangedPayload` struct's `skip_serializing_if` OMITS the
-    /// `activeProjectId` key entirely (not `null`).
+    /// `defaultProjectId` key entirely (not `null`).
     #[tokio::test]
-    async fn broadcast_projects_changed_null_active_id() {
+    async fn broadcast_projects_changed_null_default_id() {
         let relay = Arc::new(WsRelaySink::new());
         let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
 
@@ -1608,8 +1637,8 @@ mod tests {
         assert_eq!(drained[0].type_, "projects_changed");
         // `skip_serializing_if = "Option::is_none"` → the key is omitted, not null.
         assert!(
-            drained[0].payload.get("activeProjectId").is_none(),
-            "activeProjectId must be omitted (not null) when None"
+            drained[0].payload.get("defaultProjectId").is_none(),
+            "defaultProjectId must be omitted (not null) when None"
         );
     }
 
@@ -1629,5 +1658,63 @@ mod tests {
         assert_eq!(drained[0].seq, 0, "agent-level event: seq must be 0");
         // The payload is empty `{}` — the web client refetches the index.
         assert!(drained[0].payload.as_object().unwrap().is_empty());
+    }
+
+    /// CAP-2: with host persistence attached, session lifecycle events fan an
+    /// agent-level `chat_history_changed` so connected sidebars refetch the
+    /// host-owned index (browser-origin sessions never flow through a desktop
+    /// renderer save).
+    #[tokio::test]
+    async fn session_lifecycle_broadcasts_history_changed_when_persistent() {
+        let root = std::env::temp_dir().join(format!(
+            "termul-sink-history-broadcast-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let persistence = SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
+        let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
+
+        for type_ in ["acp:session_created", "acp:session_closed"] {
+            relay.emit(&AcpEvent {
+                sid: Some("sess-1".to_string()),
+                type_,
+                payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
+            });
+        }
+
+        let drained = drain_rx(&mut rx);
+        let notifications = drained
+            .iter()
+            .filter(|event| event.type_ == "chat_history_changed")
+            .count();
+        assert_eq!(
+            notifications, 2,
+            "each lifecycle event fans one chat_history_changed"
+        );
+        persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Live-only relays (no host persistence) must NOT fan history-changed
+    /// notifications — there is no durable index to refetch.
+    #[tokio::test]
+    async fn session_lifecycle_is_silent_without_persistence() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
+
+        relay.emit(&AcpEvent {
+            sid: Some("sess-1".to_string()),
+            type_: "acp:session_closed",
+            payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
+        });
+
+        let drained = drain_rx(&mut rx);
+        assert!(
+            drained.iter().all(|event| event.type_ != "chat_history_changed"),
+            "no history notification without durable persistence"
+        );
     }
 }

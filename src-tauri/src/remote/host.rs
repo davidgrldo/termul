@@ -34,7 +34,7 @@ use tokio::process::Child;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::acp::{AcpManager, ChatHistoryStore};
+use crate::acp::{AcpManager, WorkspaceManifestService};
 use crate::pty::PtyManager;
 use crate::web::sink::WsRelaySink;
 use crate::web::{serve_router, ProjectRegistry, ServerConfig};
@@ -222,14 +222,20 @@ impl RemoteServerState {
     /// graceful drain and `status()` can detect a dead task. If a concurrent
     /// start wins the slot race, the loser signals its spawned task to drain
     /// before returning `Err` (no orphaned second server).
+    ///
+    /// `workspace_manifest` is the desktop's own `WorkspaceManifestService`
+    /// (opened under `<app_data_dir>/workspace-manifests` in `lib.rs`).
+    /// Threaded through to `serve_router` so the web/remote client can
+    /// read/write a project's manifest through `/workspace/*`. `None`
+    /// degrades to fresh-only mode.
     pub async fn start(
         &self,
         acp: Arc<AcpManager>,
         pty: Arc<PtyManager>,
         ws_relay: Arc<WsRelaySink>,
         registry: Arc<ProjectRegistry>,
-        chat_history_store: Arc<ChatHistoryStore>,
         _bind_mode: RemoteBindMode,
+        workspace_manifest: Option<Arc<WorkspaceManifestService>>,
     ) -> Result<RemoteStatus, String> {
         // The built-in cloudflared quick-tunnel forwards to localhost, so the
         // desktop-hosted server always binds localhost regardless of the
@@ -290,6 +296,12 @@ impl RemoteServerState {
             // file-backed `acp::project_registry` is VPS-mode-only.
             projects_file: None,
             sessions_dir: None,
+            // CAP-5 / Story 5: this path-override field is standalone-only.
+            // The desktop shared-live host passes its already-opened
+            // `WorkspaceManifestService` directly to `serve_router` (see the
+            // `workspace_manifest` argument below), so no path is resolved
+            // from the config here — `None` degrades nothing on this path.
+            workspace_manifests_dir: None,
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -307,11 +319,11 @@ impl RemoteServerState {
             pty.exit_code_tracker(),
             ws_relay,
             registry,
-            Some(chat_history_store),
             None,
             None,
             cfg,
             shutdown,
+            workspace_manifest,
         )
         .await
         .map_err(|e| format!("Failed to start remote server: {}", e))?;
@@ -575,36 +587,24 @@ mod tests {
     /// A real `AcpManager` (zero sinks is legal) + a `WsRelaySink` for the
     /// shared-live host lifecycle tests. The serve task binds a real OS-assigned
     /// localhost socket — safe in tests.
-    #[allow(clippy::type_complexity)]
     fn lifecycle_fixtures() -> (
         Arc<AcpManager>,
         Arc<PtyManager>,
         Arc<WsRelaySink>,
         Arc<ProjectRegistry>,
-        Arc<ChatHistoryStore>,
-        std::path::PathBuf,
     ) {
         let acp = Arc::new(AcpManager::new(vec![]));
         let pty = crate::web::test_pty_manager();
         let relay = Arc::new(WsRelaySink::new());
         let registry = Arc::new(ProjectRegistry::new());
-        let root = std::env::temp_dir().join(format!(
-            "termul-remote-history-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let chat_history_store = ChatHistoryStore::open(root.clone()).unwrap();
-        (acp, pty, relay, registry, chat_history_store, root)
+        (acp, pty, relay, registry)
     }
 
     #[tokio::test]
     async fn remote_server_state_start_then_stop_lifecycle() {
         // The full start→status(running)→stop→status(stopped)→restart cycle
         // that T8.1 asked for and the old misnamed test never exercised.
-        let (acp, pty, relay, registry, chat_history_store, history_root) = lifecycle_fixtures();
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         assert!(!state.status().running);
 
@@ -614,8 +614,8 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await
             .expect("start on localhost binds an OS-assigned port");
@@ -645,15 +645,13 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await
             .expect("restart after stop succeeds");
         assert!(again.running);
         let _ = state.stop().await;
-        drop(chat_history_store);
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[tokio::test]
@@ -661,7 +659,7 @@ mod tests {
         // The lose-race guard: a second start while the first is running returns
         // Err — and (per R1) does NOT orphan a second server (its shutdown_tx is
         // signaled before returning). The first server keeps running.
-        let (acp, pty, relay, registry, chat_history_store, history_root) = lifecycle_fixtures();
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         let _first = state
             .start(
@@ -669,8 +667,8 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await
             .expect("first start succeeds");
@@ -681,8 +679,8 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await;
         assert!(
@@ -692,8 +690,6 @@ mod tests {
         assert!(state.status().running, "the first server is still running");
 
         let _ = state.stop().await;
-        drop(chat_history_store);
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[tokio::test]
@@ -705,7 +701,7 @@ mod tests {
         // disturbed. (AcpManager::new(vec![]) owns no agents, so there is
         // nothing to kill — this guards the path: start/stop complete without
         // touching kill_all, i.e. no panic, no error, clean drain.)
-        let (acp, pty, relay, registry, chat_history_store, history_root) = lifecycle_fixtures();
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         let _ = state
             .start(
@@ -713,8 +709,8 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await
             .expect("start succeeds");
@@ -726,8 +722,6 @@ mod tests {
         // direct kill_all assertion possible without a spy; the invariant is
         // structural: serve_router does not call kill_all, host::stop does not
         // call kill_all. This test guards the path end-to-end.)
-        drop(chat_history_store);
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -736,7 +730,7 @@ mod tests {
         // then clears `tunnel_url` so the renderer poller drops the stale QR
         // (it would otherwise offer a link that yields "This site can't be
         // reached").
-        let (acp, pty, relay, registry, chat_history_store, history_root) = lifecycle_fixtures();
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         let _ = state
             .start(
@@ -744,8 +738,8 @@ mod tests {
                 pty.clone(),
                 relay.clone(),
                 registry.clone(),
-                chat_history_store.clone(),
                 RemoteBindMode::Localhost,
+                None,
             )
             .await
             .expect("start");
@@ -776,8 +770,6 @@ mod tests {
         );
 
         let _ = state.stop().await;
-        drop(chat_history_store);
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     /// A cross-platform command that exits 0 almost immediately, for the

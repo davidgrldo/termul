@@ -29,6 +29,7 @@ pub mod projects_api;
 pub mod router;
 pub mod sink;
 pub mod terminal_ws;
+pub mod workspace_api;
 pub mod ws;
 
 pub use config::ServerConfig;
@@ -80,6 +81,13 @@ pub(crate) fn test_pty_manager() -> Arc<PtyManager> {
 /// and calls [`serve_router`] directly (it never reaches this `serve`
 /// wrapper).
 ///
+/// `workspace_manifest` is the host-owned [`WorkspaceManifestService`] for
+/// CAP-5 / Story 5 — atomically persists one versioned workspace manifest per
+/// project. The standalone binary opens it under
+/// `<service_account_state_dir>/workspace-manifests`; the desktop host opens
+/// its own under `<app_data_dir>/workspace-manifests` (never shared across
+/// processes — `Never`-clause). `None` degrades to fresh-only mode.
+///
 /// The standalone binary owns its agent lifetime end-to-end, so it kills agents
 /// on exit. The desktop-hosted shared-live path calls [`serve_router`] directly
 /// and must NOT kill the desktop's live agents — see [`serve_router`].
@@ -96,6 +104,7 @@ pub async fn serve(
     registry_persistence: Option<Arc<parking_lot::Mutex<crate::acp::FileProjectRegistry>>>,
     projects_file: Option<PathBuf>,
     cfg: ServerConfig,
+    workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_addr, handle) = serve_router(
         acp.clone(),
@@ -106,14 +115,11 @@ pub async fn serve(
         exit_code_tracker,
         ws_relay,
         registry,
-        // The standalone VPS binary has no desktop chat-history store; it
-        // relies on file-backed `SessionPersistence` (Story 4.3). The desktop
-        // host attaches its Rust-owned durable history store instead.
-        None,
         registry_persistence,
         projects_file,
         cfg,
         shutdown_signal_future(),
+        workspace_manifest,
     )
     .await?;
 
@@ -176,11 +182,11 @@ pub async fn serve_router(
     exit_code_tracker: Arc<ExitCodeTracker>,
     ws_relay: Arc<WsRelaySink>,
     registry: Arc<crate::web::project_registry::ProjectRegistry>,
-    chat_history_store: Option<Arc<crate::acp::ChatHistoryStore>>,
     registry_persistence: Option<Arc<parking_lot::Mutex<crate::acp::FileProjectRegistry>>>,
     projects_file: Option<PathBuf>,
     cfg: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = cfg.bind_addr().ok_or_else(|| {
         format!(
@@ -201,11 +207,11 @@ pub async fn serve_router(
         );
     }
 
-    // Advertise `Server` history mode when EITHER the durable Rust history
-    // store is attached (desktop-hosted) OR file-backed persistence is attached
-    // (standalone VPS, Story 4.3). Otherwise the web client negotiates
-    // `live_only` (no stored transcript mirror).
-    let history_mode = if chat_history_store.is_some() || ws_relay.persistence().is_some() {
+    // Advertise `Server` history mode when the host-owned file-backed
+    // `SessionPersistence` is attached to the relay (both desktop shared-live
+    // and the standalone VPS attach it now — CAP-2). Otherwise the web client
+    // negotiates `live_only` (no stored transcript mirror).
+    let history_mode = if ws_relay.persistence().is_some() {
         HistoryMode::Server
     } else {
         HistoryMode::LiveOnly
@@ -219,11 +225,11 @@ pub async fn serve_router(
         exit_code_tracker,
         Arc::clone(&ws_relay),
         Arc::clone(&registry),
-        chat_history_store,
         registry_persistence,
         projects_file,
         cfg.project_root.clone(),
         history_mode,
+        workspace_manifest,
     );
 
     let handle = tokio::spawn(async move {

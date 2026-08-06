@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 
-use crate::acp::{AcpManager, ChatHistoryStore, FileProjectRegistry};
+use crate::acp::{AcpManager, FileProjectRegistry, WorkspaceManifestService};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::fs_api;
@@ -30,6 +30,7 @@ use crate::web::project_registry::ProjectRegistry;
 use crate::web::projects_api;
 use crate::web::sink::WsRelaySink;
 use crate::web::terminal_ws::terminal_ws_upgrade;
+use crate::web::workspace_api;
 use crate::web::ws::{ws_upgrade, AppState, HistoryMode};
 
 use super::assets;
@@ -57,11 +58,11 @@ pub fn router(
     exit_code_tracker: Arc<ExitCodeTracker>,
     ws_relay: Arc<WsRelaySink>,
     registry: Arc<ProjectRegistry>,
-    chat_history_store: Option<Arc<ChatHistoryStore>>,
     registry_persistence: Option<Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<PathBuf>,
     project_root: PathBuf,
     history_mode: HistoryMode,
+    workspace_manifest: Option<Arc<WorkspaceManifestService>>,
 ) -> Router {
     let mut r = Router::new()
         .route("/health", get(health_check))
@@ -71,6 +72,10 @@ pub fn router(
         // desktop's non-archived + archived projects here. Registered AHEAD of
         // the static fallback so the SPA mount cannot shadow it.
         .route("/projects", get(projects_api::list))
+        // Explicit host-default change (Epic 7 — cross-client workspace
+        // continuity). Mirrors the `set_default_project` WS request + the
+        // `set_host_default_project` Tauri command (transport parity).
+        .route("/projects/default", post(projects_api::set_default_project))
         .route(
             "/mcp-servers",
             get(mcp_servers_api::get).put(mcp_servers_api::put),
@@ -125,7 +130,15 @@ pub fn router(
         // Frontend error forwarding (CAP-2): `POST /log/frontend-error`.
         // Loopback-only (enforced inside the handler).
         .route("/log/frontend-error", post(log_api::frontend_error))
-        .route("/shells", get(fs_api::shells));
+        .route("/shells", get(fs_api::shells))
+        // Workspace manifest web routes (CAP-5: Web & Mobile 1:1 Parity).
+        // Each mirrors a desktop `#[tauri::command] workspace_manifest_*`
+        // handler; see `web/workspace_api.rs`. Registered AHEAD of the static
+        // fallback so the SPA mount cannot shadow them. Write + delete are
+        // loopback-guarded inside the handler.
+        .route("/workspace/{projectId}", get(workspace_api::get))
+        .route("/workspace/{projectId}/write", post(workspace_api::write))
+        .route("/workspace/{projectId}/delete", post(workspace_api::delete));
     // Static fallback: disk ServeDir in dev (dist-web/ on disk) or the embedded
     // bundle in release. `/health` + `/ws` are registered above so the static
     // mount cannot shadow them (Story 1.3 AC1).
@@ -143,15 +156,26 @@ pub fn router(
         exit_code_tracker,
         relay: ws_relay,
         registry,
-        chat_history_store,
         registry_persistence,
         projects_file: projects_file.map(Arc::new),
         history_mode,
+        workspace_manifest,
         project_root: Arc::new(project_root),
     })
 }
 
 /// Same as [`router`], but with an injectable static-root for unit tests.
+///
+/// Patch 9: this variant ALWAYS sets `workspace_manifest: None` so the
+/// `/workspace/*` routes run in degraded fresh-only mode (get → `Ok(None)`;
+/// write → `WORKSPACE_MANIFEST_UNAVAILABLE`; delete → `Ok(())`). It is
+/// intended for tests/dev only — production callers must use [`router`]
+/// (which threads the real `WorkspaceManifestService`) so the web/remote
+/// client gets a live manifest store. Adding a `workspace_manifest`
+/// parameter here would break every test call site for no real benefit
+/// (the tests do not exercise the manifest routes); the doc comment
+/// surfaces the degraded behavior loudly enough that a production caller
+/// won't silently pick this variant.
 pub fn router_with_static(
     acp: Arc<AcpManager>,
     pty: Arc<PtyManager>,
@@ -165,6 +189,7 @@ pub fn router_with_static(
         .route("/ws", get(ws_upgrade))
         .route("/terminal/ws", get(terminal_ws_upgrade))
         .route("/projects", get(projects_api::list))
+        .route("/projects/default", post(projects_api::set_default_project))
         .route(
             "/mcp-servers",
             get(mcp_servers_api::get).put(mcp_servers_api::put),
@@ -205,6 +230,9 @@ pub fn router_with_static(
         .route("/skills/{name}", get(skills_api::read))
         .route("/log/frontend-error", post(log_api::frontend_error))
         .route("/shells", get(fs_api::shells))
+        .route("/workspace/{projectId}", get(workspace_api::get))
+        .route("/workspace/{projectId}/write", post(workspace_api::write))
+        .route("/workspace/{projectId}/delete", post(workspace_api::delete))
         .fallback_service(assets::static_service_from(static_dir))
         .with_state(AppState {
             acp,
@@ -215,10 +243,10 @@ pub fn router_with_static(
             pty,
             relay: ws_relay,
             registry,
-            chat_history_store: None,
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            workspace_manifest: None,
             project_root: Arc::new(project_root),
         })
 }
