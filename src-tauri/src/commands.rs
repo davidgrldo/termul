@@ -3241,6 +3241,7 @@ pub async fn sftp_create_file(
 /// param is accepted for API stability but ignored (the tunnel targets
 /// localhost). App auth / token-gating land in Epic 2.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn remote_server_start(
     acp_manager: State<'_, Arc<crate::acp::AcpManager>>,
     pty_manager: State<'_, Arc<PtyManager>>,
@@ -3248,6 +3249,8 @@ pub async fn remote_server_start(
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     workspace_manifest_store: State<'_, HostWorkspaceManifestStore>,
+    acp_catalog_store: State<'_, HostAcpCatalogStore>,
+    acp_install_store: State<'_, HostAcpInstallStore>,
     bind_mode: Option<String>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
     // Default to localhost only when the caller omits the bind mode; an
@@ -3265,6 +3268,17 @@ pub async fn remote_server_start(
     // manifest through the three `/workspace/*` routes. `None` degrades to
     // fresh-only mode (no host store attached).
     let workspace_manifest = workspace_manifest_store.store().map(Arc::clone);
+    // CAP-6 / Story 8: thread the desktop's `AcpCatalogService` (opened under
+    // `<app_data_dir>/acp-catalog` in `lib.rs`) through to `serve_router` so
+    // the web/remote client can resolve the catalog through `GET /acp/catalog`
+    // + WS `list_acp_catalog`. `None` degrades to `ACP_CATALOG_UNAVAILABLE`.
+    let acp_catalog = acp_catalog_store.store().map(Arc::clone);
+    // CAP-6 / Story 9: thread the desktop's `AcpInstallService` (opened under
+    // `<app_data_dir>/acp-registry-binaries` in `lib.rs`) through to
+    // `serve_router` so the web/remote client can install through
+    // `POST /acp/install` + WS `install_acp_agent`. `None` degrades to
+    // `ACP_INSTALL_UNAVAILABLE`.
+    let acp_install = acp_install_store.store().map(Arc::clone);
     let started = remote_state
         .start(
             acp_manager.inner().clone(),
@@ -3273,6 +3287,8 @@ pub async fn remote_server_start(
             project_registry.inner().clone(),
             bind_mode,
             workspace_manifest,
+            acp_catalog,
+            acp_install,
         )
         .await;
     match started {
@@ -4210,6 +4226,54 @@ impl HostWorkspaceManifestStore {
     /// Callers that need to clone the `Arc` should `.as_ref().map(Arc::clone)`.
     #[must_use]
     pub(crate) fn store(&self) -> Option<&Arc<crate::acp::WorkspaceManifestService>> {
+        self.0.as_ref()
+    }
+}
+
+/// Tauri state wrapper for the host-owned `AcpCatalogService` (CAP-6 / Story
+/// 8). Mirrors `HostWorkspaceManifestStore`: `None` degrades to
+/// `ACP_CATALOG_UNAVAILABLE` (the desktop could not open the catalog root at
+/// startup). Held as `Option<Arc<…>>` so the desktop's degraded path is
+/// graceful, not a boot failure.
+#[derive(Default)]
+pub struct HostAcpCatalogStore(Option<Arc<crate::acp::AcpCatalogService>>);
+
+impl HostAcpCatalogStore {
+    /// Construct from an already-opened `AcpCatalogService` (`None` for
+    /// degraded mode — the desktop could not open the store at startup).
+    #[must_use]
+    pub fn new(service: Option<Arc<crate::acp::AcpCatalogService>>) -> Self {
+        Self(service)
+    }
+
+    /// Access the inner `AcpCatalogService` (`None` in degraded mode).
+    /// Callers that need to clone the `Arc` should `.as_ref().map(Arc::clone)`.
+    #[must_use]
+    pub(crate) fn store(&self) -> Option<&Arc<crate::acp::AcpCatalogService>> {
+        self.0.as_ref()
+    }
+}
+
+/// Tauri state wrapper for the host-owned `AcpInstallService` (CAP-6 / Story
+/// 9). Mirrors `HostAcpCatalogStore`: `None` degrades to
+/// `ACP_INSTALL_UNAVAILABLE` (the desktop could not open the install root at
+/// startup). Held as `Option<Arc<…>>` so the desktop's degraded path is
+/// graceful, not a boot failure.
+#[derive(Default)]
+pub struct HostAcpInstallStore(Option<Arc<crate::acp::install::AcpInstallService>>);
+
+impl HostAcpInstallStore {
+    /// Construct from an already-opened `AcpInstallService` (`None` for
+    /// degraded mode — the desktop could not open the store at startup).
+    #[must_use]
+    pub fn new(service: Option<Arc<crate::acp::install::AcpInstallService>>) -> Self {
+        Self(service)
+    }
+
+    /// Access the inner `AcpInstallService` (`None` in degraded mode).
+    /// Callers that need to clone the `Arc` should `.as_ref().map(Arc::clone)`.
+    #[must_use]
+    pub(crate) fn store(&self) -> Option<&Arc<crate::acp::install::AcpInstallService>> {
         self.0.as_ref()
     }
 }

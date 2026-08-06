@@ -58,8 +58,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
   })
 
-  it('exports exactly 25 request types including ephemeral disposal and ping', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(25)
+  it('exports exactly 28 request types including ephemeral disposal, ping, catalog, and install', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(28)
     const expected = [
       'send_prompt',
       'cancel_prompt',
@@ -84,7 +84,12 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_persisted_sessions',
       'open_persisted_session',
       'get_session_payload',
-      'get_session_cursor'
+      'get_session_cursor',
+      // CAP-6 / Story 8: host-owned ACP catalog resolution.
+      'list_acp_catalog',
+      'set_catalog_opt_in',
+      // CAP-6 / Story 9: host-owned verified-atomic ACP install.
+      'install_acp_agent'
     ]
     for (const name of expected) {
       expect(WS_REQUEST_TYPES).toContain(name)

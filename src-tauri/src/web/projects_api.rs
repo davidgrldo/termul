@@ -232,6 +232,8 @@ mod tests {
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
             project_root: Arc::new(std::path::PathBuf::new()),
             workspace_manifest: None,
+            acp_catalog: None,
+            acp_install: None,
         }
     }
 
@@ -258,6 +260,8 @@ mod tests {
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
             project_root: Arc::new(std::path::PathBuf::new()),
             workspace_manifest: None,
+            acp_catalog: None,
+            acp_install: None,
         }
     }
 

@@ -36,10 +36,9 @@ import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { useAcpRegistryCatalog } from '@/hooks/use-acp-registry-catalog'
-import { useAcpRuntimeProbe } from '@/hooks/use-acp-runtime-probe'
 import { useAgentSkills } from '@/hooks/use-agent-skills'
 import { useMentionRecents } from '@/hooks/use-mention-recents'
+import { useResolvedSupportedAcpAgents } from '@/hooks/use-resolved-supported-acp-agents'
 import type { StoredAgentConfig } from '@/lib/acp-agents-persistence'
 import {
   type AuthMethod,
@@ -49,12 +48,10 @@ import {
   type ProbeStatus
 } from '@/lib/acp-api'
 import type { StoredMcpServer } from '@/lib/acp-mcp-persistence'
-import { currentPlatformArch } from '@/lib/agents/acp-registry'
 import type { PrepareChatError } from '@/lib/agents/acp-spawn-errors'
 import { findBundledIconByKey } from '@/lib/agents/agent-icon-catalog'
 import { sanitizeInlineAgentSvg } from '@/lib/agents/sanitize-agent-icon'
 import {
-  buildSupportedAcpAgents,
   filterSupportedAcpAgents,
   installedBinaryConfig,
   manualBinaryConfig,
@@ -127,13 +124,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const projectLabel = activeProject?.name ?? 'this folder'
   const projectRoot = activeProjectId ? getDefaultCwdForProject(activeProjectId) : undefined
   const { skills } = useAgentSkills(projectRoot)
-  const platformArch = useMemo(() => currentPlatformArch(), [])
-  const runtime = useAcpRuntimeProbe()
-  const { activeRegistry } = useAcpRegistryCatalog()
-  const supportedAgents = useMemo(
-    () => buildSupportedAcpAgents(acpConfigs, platformArch, activeRegistry, runtime),
-    [acpConfigs, platformArch, activeRegistry, runtime]
-  )
+  const supportedAgents = useResolvedSupportedAcpAgents(acpConfigs)
 
   const selectedEntry = useMemo(
     () =>
@@ -496,12 +487,12 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       persistSelection(entry.configId)
       setInstallingConfigId(entry.configId)
       try {
-        const installed = await acpApi.installRegistryBinary({
-          agentId: entry.agent.id,
-          archiveUrl: entry.install.archiveUrl,
-          cmd: entry.install.cmd,
-          args: entry.install.args
-        })
+        // CAP-6 / Story 9: host-owned verified-atomic install. The request is
+        // `{ agentId }` only; the host resolves everything (archive URL, cmd,
+        // args, sha256) from the trusted catalog. The outcome's
+        // `{ command, args }` flows through `installedBinaryConfig` →
+        // `saveAgentConfig` unchanged.
+        const installed = await acpApi.installAcpAgent(entry.agent.id)
         const config = installedBinaryConfig(entry.agent, installed, { env: entry.install.env })
         await saveAgentConfig(config)
         setSelectedConfigId(config.id)

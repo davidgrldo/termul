@@ -272,6 +272,152 @@ pub fn acp_probe_runtime() -> crate::acp::config::AcpRuntimeProbe {
     crate::acp::config::probe_registry_runtime()
 }
 
+/// `acp_list_catalog(refresh?: bool)` — resolve the host-owned ACP catalog
+/// (CAP-6 / Story 8). Returns the host's OS/arch/runtime availability + the
+/// per-agent resolved `SupportedAcpAgentStatus` (ready / install-required /
+/// needs-runtime / manual-install / unavailable). The catalog is
+/// credential-free, path-free, read-only host introspection — never carries
+/// `AgentConfig.env` (API keys) or resolved absolute executable paths.
+/// Mirrors `GET /acp/catalog` + WS `list_acp_catalog` byte-for-byte.
+#[tauri::command]
+pub async fn acp_list_catalog(
+    refresh: Option<bool>,
+    store: State<'_, crate::commands::HostAcpCatalogStore>,
+) -> Result<crate::commands::IpcResult<crate::acp::AcpCatalog>, String> {
+    let refresh = refresh.unwrap_or(false);
+    log::info!("[acp-catalog] list start refresh={refresh}");
+    let Some(service) = store.store().map(std::sync::Arc::clone) else {
+        log::warn!("[acp-catalog] list unavailable (no host store)");
+        return Ok(crate::commands::IpcResult::error(
+            "acp catalog store is unavailable",
+            "ACP_CATALOG_UNAVAILABLE",
+        ));
+    };
+    match service.list_catalog(refresh).await {
+        Ok(catalog) => {
+            log::info!(
+                "[acp-catalog] list success agents={}",
+                catalog.agents.len()
+            );
+            Ok(crate::commands::IpcResult::success(catalog))
+        }
+        Err(error) => {
+            log::error!("[acp-catalog] list failure error={error}");
+            Ok(crate::commands::IpcResult::error(
+                error.to_string(),
+                "CATALOG_LOAD_FAILED",
+            ))
+        }
+    }
+}
+
+/// `acp_set_catalog_opt_in(enabled: bool)` — persist the host opt-in flag that
+/// gates the CDN registry augmentation (CAP-6 / Story 8). When enabled, the
+/// next `list_catalog` includes CDN entries tagged `source: 'registry'` (if
+/// the fetch succeeds); when disabled, only bundled entries are served.
+/// Mirrors `POST /acp/catalog/opt-in` + WS `set_catalog_opt_in` byte-for-byte.
+#[tauri::command]
+pub async fn acp_set_catalog_opt_in(
+    enabled: bool,
+    store: State<'_, crate::commands::HostAcpCatalogStore>,
+) -> Result<crate::commands::IpcResult<()>, String> {
+    log::info!("[acp-catalog] set_opt_in start enabled={enabled}");
+    let Some(service) = store.store().map(std::sync::Arc::clone) else {
+        log::warn!("[acp-catalog] set_opt_in unavailable (no host store)");
+        return Ok(crate::commands::IpcResult::error(
+            "acp catalog store is unavailable",
+            "ACP_CATALOG_UNAVAILABLE",
+        ));
+    };
+    match service.set_opt_in(enabled) {
+        Ok(()) => {
+            log::info!("[acp-catalog] set_opt_in success enabled={enabled}");
+            Ok(crate::commands::IpcResult::success(()))
+        }
+        Err(error) => {
+            log::error!("[acp-catalog] set_opt_in failure error={error}");
+            Ok(crate::commands::IpcResult::error(
+                error.to_string(),
+                "ACP_CATALOG_OPT_IN_FAILED",
+            ))
+        }
+    }
+}
+
+/// `acp_install_agent(agentId)` — host-owned verified-atomic ACP install
+/// (CAP-6 / Story 9). Resolves the agent by id from the catalog, downloads the
+/// catalog-resolved HTTPS archive, verifies `sha256` (from the catalog's
+/// `binary.{os-arch}.sha256` field), extracts safely, atomically activates,
+/// serializes per-agent, records an installed-agents manifest, and returns
+/// `{ command: absolute_path, args }`. The request is `{ agentId }` only; the
+/// host resolves everything from the trusted catalog — never accepts
+/// browser-supplied URLs, commands, executable paths, or args.
+/// Mirrors `POST /acp/install` + WS `install_acp_agent` byte-for-byte.
+///
+/// The `request` arg is accepted as a raw `serde_json::Value` and manually
+/// deserialized with `deny_unknown_fields` so an extra-field rejection
+/// surfaces as `IpcResult::error(..., VALIDATION_ERROR)` — NOT a Tauri serde
+/// rejection (which the renderer would map to `INVOKE_ERROR`, breaking the
+/// transport parity with HTTP/WS where `deny_unknown_fields` →
+/// `VALIDATION_ERROR`). Mirrors `install_api.rs::install` + the WS
+/// `handle_install_acp_agent`.
+#[tauri::command]
+pub async fn acp_install_agent(
+    request: serde_json::Value,
+    store: State<'_, crate::commands::HostAcpInstallStore>,
+) -> Result<crate::commands::IpcResult<crate::acp::install::InstallOutcome>, String> {
+    let request: crate::acp::install::InstallRequest = match serde_json::from_value(request) {
+        Ok(req) => req,
+        Err(error) => {
+            log::warn!(
+                "[acp-install] {} install_agent validation failed: {error}",
+                crate::logging::session_id()
+            );
+            return Ok(crate::commands::IpcResult::error(
+                format!("payload validation failed: {error}"),
+                crate::acp::install::code::VALIDATION_ERROR,
+            ));
+        }
+    };
+    let agent_id_log = request.agent_id.clone();
+    log::info!(
+        "[acp-install] {} install_agent start agent={}",
+        crate::logging::session_id(),
+        agent_id_log
+    );
+    let Some(service) = store.store().map(std::sync::Arc::clone) else {
+        log::warn!(
+            "[acp-install] {} install_agent unavailable (no host store)",
+            crate::logging::session_id()
+        );
+        return Ok(crate::commands::IpcResult::error(
+            "acp install store is unavailable",
+            crate::acp::install::code::ACP_INSTALL_UNAVAILABLE,
+        ));
+    };
+    match service.install_by_id(&request.agent_id).await {
+        Ok(outcome) => {
+            log::info!(
+                "[acp-install] {} install_agent success agent={}",
+                crate::logging::session_id(),
+                agent_id_log
+            );
+            Ok(crate::commands::IpcResult::success(outcome))
+        }
+        Err(error) => {
+            let code = error.code();
+            log::error!(
+                "[acp-install] {} install_agent failure agent={} code={} msg={}",
+                crate::logging::session_id(),
+                agent_id_log,
+                code,
+                error.message
+            );
+            Ok(crate::commands::IpcResult::error(error.message, code))
+        }
+    }
+}
+
 /// On-demand MCP client probe. Takes a renderer-supplied `McpServerConfig`
 /// (stateless — no registry-store coupling), opens a fresh rmcp client
 /// connection, calls `initialize` + `tools/list`, then closes, and returns

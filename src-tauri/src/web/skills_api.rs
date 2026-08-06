@@ -182,6 +182,8 @@ mod tests {
                     .unwrap_or_else(|_| std::env::temp_dir()),
             ),
             workspace_manifest: None,
+            acp_catalog: None,
+            acp_install: None,
         }
     }
 

@@ -13,6 +13,7 @@
  * (`.message` is the human string callers already toast).
  */
 
+import type { IpcResult } from '@shared/types/ipc.types'
 import type {
   ProjectSwitchCompletedEvent,
   SwitchProjectReply
@@ -54,6 +55,21 @@ import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { webServerMcpProbe } from '@/lib/web-server-api'
 
+/**
+ * CAP-6 / Story 8: the host-resolved catalog shape returned by the WS
+ * `list_acp_catalog` request. Mirrors `AcpCatalog` from
+ * `@shared/types/acp-catalog.types` but kept local to avoid a cross-module
+ * import cycle (acp-transport ↔ acp-catalog-api). The shape is byte-identical.
+ */
+interface AcpCatalogFromHost {
+  host: {
+    os: string
+    arch: string
+    runtimes: { npx: boolean; uvx: boolean; node: boolean; bun: boolean; python3: boolean }
+  }
+  agents: unknown[]
+}
+
 /** Thrown on WS (and mapped) failures — callers may toast `.message`. */
 export class AcpTransportError extends Error {
   readonly code: string
@@ -69,6 +85,14 @@ export interface AcpTransport {
   installRegistryBinary(
     request: InstallAcpRegistryBinaryRequest
   ): Promise<InstallAcpRegistryBinaryOutcome>
+  /**
+   * CAP-6 / Story 9: host-owned verified-atomic install. The web/remote
+   * transport falls back to the `acpInstallApi` facade (Tauri vs HTTP
+   * resolved at runtime); the desktop transport delegates to the new
+   * `acp_install_agent` Tauri command. The request is `{ agentId }` only; the
+   * host resolves everything from the trusted catalog.
+   */
+  installAcpAgent(agentId: string): Promise<InstallAcpRegistryBinaryOutcome>
   probeRuntime(): Promise<AcpRuntimeAvailability>
   setTurnTimeout(secs: number | null): Promise<void>
   setTurnIdleTimeout(secs: number | null): Promise<void>
@@ -186,6 +210,22 @@ function createTauriAcpTransport(): AcpTransport {
   return {
     installRegistryBinary: (request) =>
       invoke<InstallAcpRegistryBinaryOutcome>('acp_install_registry_binary', { request }),
+    // CAP-6 / Story 9: the host-owned verified-atomic install. The Tauri
+    // adapter invokes the new `acp_install_agent` command (the host resolves
+    // the agent by id from the catalog — no browser-supplied URLs/args). The
+    // command returns `IpcResult<InstallOutcome>`; this adapter unwraps the
+    // envelope so the launcher's `installedBinaryConfig(installed, ...)` gets
+    // the bare `{ command, args }` (mirrors the web/WS transport). A failure
+    // throws `AcpTransportError` carrying the install error code.
+    installAcpAgent: async (agentId) => {
+      const result = await invoke<IpcResult<InstallAcpRegistryBinaryOutcome>>('acp_install_agent', {
+        request: { agentId }
+      })
+      if (result.success) {
+        return result.data
+      }
+      throw new AcpTransportError(result.code, result.error)
+    },
     probeRuntime: () => invoke<AcpRuntimeAvailability>('acp_probe_runtime'),
     setTurnTimeout: (secs) => invoke<void>('acp_set_turn_timeout', { secs }),
     setTurnIdleTimeout: (secs) => invoke<void>('acp_set_turn_idle_timeout', { secs }),
@@ -568,8 +608,50 @@ export class WsAcpTransport implements AcpTransport {
     throw new AcpTransportError('unsupported', 'Registry binary install is desktop-only')
   }
 
+  /**
+   * CAP-6 / Story 9: host-owned verified-atomic install. The WS transport
+   * delegates to the `acpInstallApi` facade (resolves Tauri vs HTTP at runtime),
+   * so the web client gets the same verified install path as the desktop. The
+   * facade maps the `IpcResult<InstallOutcome>` success/failure into the
+   * transport's throw-on-error contract — a failure throws `AcpTransportError`
+   * carrying the install error code.
+   */
+  async installAcpAgent(agentId: string): Promise<InstallAcpRegistryBinaryOutcome> {
+    // Lazy import avoids a static cycle (acp-transport ↔ acp-install-api) at
+    // module load; the facade owns the `isTauriContext()` branching.
+    const { acpInstallApi } = await import('./acp-install-api')
+    const result = await acpInstallApi.installAgent(agentId)
+    if (result.success) {
+      return result.data
+    }
+    throw new AcpTransportError(result.code, result.error)
+  }
+
+  /**
+   * CAP-6 / Story 8: probeRuntime is replaced by the host-resolved catalog.
+   * The web client calls `acpCatalogApi.listCatalog()` (the facade) which
+   * returns the host's `host.runtimes` block — the web client never probes
+   * `@tauri-apps/plugin-os` or PATH locally. This method now returns the
+   * host's runtime availability from the catalog; callers that only need the
+   * runtime probe (the existing `useAcpAgents` hook) switch to
+   * `listCatalog()` instead.
+   */
   async probeRuntime(): Promise<AcpRuntimeAvailability> {
-    return { npx: true, uvx: true }
+    // Delegate to the host-resolved catalog. The WS transport sends a
+    // `list_acp_catalog` request; the host probes npx/uvx/node/bun/python3
+    // and returns the result. This replaces the fake `{npx:true,uvx:true}`
+    // hardcoded stub (CAP-6: the host is the single source of truth).
+    try {
+      const catalog = await this.request<AcpCatalogFromHost>('list_acp_catalog', {})
+      return {
+        npx: catalog.host.runtimes.npx,
+        uvx: catalog.host.runtimes.uvx
+      }
+    } catch {
+      // Degrade gracefully: if the catalog is unavailable, assume no
+      // runtimes (the caller will mark agents as needs-runtime).
+      return { npx: false, uvx: false }
+    }
   }
 
   async probeMcpServer(server: McpServerConfig): Promise<ProbeResult> {
@@ -611,8 +693,30 @@ export class WsAcpTransport implements AcpTransport {
     // the first-prompt warmup timeout via TERMUL_ACP_FIRST_PROMPT_WARMUP_SECS.
   }
 
+  /**
+   * CAP-6 / Story 8: fetchRegistrySnapshot is replaced by the host-resolved
+   * catalog. The web client calls `acpCatalogApi.listCatalog()` (the facade)
+   * which returns the host's resolved catalog including CDN entries (when
+   * the opt-in is set). This method now delegates to the WS
+   * `list_acp_catalog` request; the fake `{agents:[]}` hardcoded stub is
+   * removed. Callers that need the full catalog (the registry-catalog hook)
+   * switch to `acpCatalogApi.listCatalog()` instead.
+   */
   async fetchRegistrySnapshot(_forceRefresh = false): Promise<AcpRegistrySnapshot> {
-    return { agents: [], source: 'empty', fetchedAt: null }
+    // Delegate to the host-resolved catalog. The host embeds the trusted
+    // bundled `agents.json` + optionally augments with the CDN snapshot
+    // (gated on the host-persisted opt-in). This replaces the fake
+    // `{agents:[], source:'empty'}` hardcoded stub.
+    try {
+      const catalog = await this.request<AcpCatalogFromHost>('list_acp_catalog', {})
+      return {
+        agents: catalog.agents,
+        source: 'network',
+        fetchedAt: null
+      }
+    } catch {
+      return { agents: [], source: 'empty', fetchedAt: null }
+    }
   }
 
   // --- Agent lifecycle (desktop parity over WS) ----------------------------

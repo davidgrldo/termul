@@ -15,9 +15,11 @@
 //! event log, cursor, tiers) is [`ws`] (Story 1.4).
 
 pub mod assets;
+pub mod catalog_api;
 pub mod config;
 pub mod fs_api;
 pub mod git_api;
+pub mod install_api;
 pub mod log_api;
 pub mod mcp_probe_api;
 pub mod mcp_servers_api;
@@ -88,6 +90,19 @@ pub(crate) fn test_pty_manager() -> Arc<PtyManager> {
 /// its own under `<app_data_dir>/workspace-manifests` (never shared across
 /// processes — `Never`-clause). `None` degrades to fresh-only mode.
 ///
+/// `acp_catalog` is the host-owned [`AcpCatalogService`] for CAP-6 / Story 8 —
+/// resolves the trusted ACP catalog (OS/arch/runtime + per-agent status). The
+/// standalone binary opens it under `<service_account_state_dir>/acp-catalog`;
+/// the desktop host opens its own under `<app_data_dir>/acp-catalog`. `None`
+/// degrades to `ACP_CATALOG_UNAVAILABLE`.
+///
+/// `acp_install` is the host-owned [`AcpInstallService`] for CAP-6 / Story 9 —
+/// downloads + verifies (sha256) + extracts + atomically activates ACP agent
+/// archives resolved from the catalog. The standalone binary opens it under
+/// `<service_account_state_dir>/acp-registry-binaries`; the desktop host opens
+/// its own under `<app_data_dir>/acp-registry-binaries`. `None` degrades to
+/// `ACP_INSTALL_UNAVAILABLE`.
+///
 /// The standalone binary owns its agent lifetime end-to-end, so it kills agents
 /// on exit. The desktop-hosted shared-live path calls [`serve_router`] directly
 /// and must NOT kill the desktop's live agents — see [`serve_router`].
@@ -105,6 +120,8 @@ pub async fn serve(
     projects_file: Option<PathBuf>,
     cfg: ServerConfig,
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
+    acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
+    acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_addr, handle) = serve_router(
         acp.clone(),
@@ -120,6 +137,8 @@ pub async fn serve(
         cfg,
         shutdown_signal_future(),
         workspace_manifest,
+        acp_catalog,
+        acp_install,
     )
     .await?;
 
@@ -187,6 +206,8 @@ pub async fn serve_router(
     cfg: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
+    acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
+    acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = cfg.bind_addr().ok_or_else(|| {
         format!(
@@ -230,6 +251,8 @@ pub async fn serve_router(
         cfg.project_root.clone(),
         history_mode,
         workspace_manifest,
+        acp_catalog,
+        acp_install,
     );
 
     let handle = tokio::spawn(async move {

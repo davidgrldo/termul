@@ -1,4 +1,5 @@
 // IPC Result pattern from architecture.md
+import type { AcpCatalog } from './acp-catalog.types'
 import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
 
 export type IpcResult<T> =
@@ -117,6 +118,29 @@ export type WorkspaceManifestIpcChannels = {
     manifest: WorkspaceManifest
   ) => IpcResult<WriteOutcome>
   'workspace:manifest:delete': (projectId: string) => IpcResult<void>
+}
+
+// CAP-6 / Story 8: ACP catalog IPC channels. Mirrors the two Tauri commands
+// (`acp_list_catalog` / `acp_set_catalog_opt_in`) and the two HTTP routes
+// (`GET /acp/catalog` / `POST /acp/catalog/opt-in`) — both transports return
+// the SAME `IpcResult<...>` shape byte-for-byte. The catalog is
+// credential-free, path-free, read-only host introspection. The opt-in is a
+// single boolean that gates CDN registry augmentation.
+export type AcpCatalogIpcChannels = {
+  'acp:catalog:list': (refresh?: boolean) => IpcResult<AcpCatalog>
+  'acp:catalog:set_opt_in': (enabled: boolean) => IpcResult<void>
+}
+
+// CAP-6 / Story 9: ACP install IPC channel. Mirrors the Tauri command
+// `acp_install_agent` and the HTTP route `POST /acp/install` — both transports
+// return the SAME `IpcResult<InstallOutcome>` shape byte-for-byte. The request
+// is `{ agentId }` only; the host resolves everything from the trusted catalog.
+// The declared channel type is honest about the actual invoke payload shape:
+// the Tauri adapter wraps `agentId` in a `request` object (Tauri's convention
+// for single-struct-arg commands), so the channel signature reflects that.
+import type { InstallOutcome } from './acp-install.types'
+export type AcpInstallIpcChannels = {
+  'acp:install:install_agent': (request: { agentId: string }) => IpcResult<InstallOutcome>
 }
 
 // Event types for main -> renderer communication

@@ -132,7 +132,20 @@ export const WS_REQUEST_TYPES = [
   // Unlike `recover_session_snapshot` (which re-registers a subscription),
   // this only returns the durable `{ sessionId, watermark }` so a refreshed
   // transport can seed `lastSeq` before its first subscribe.
-  'get_session_cursor'
+  'get_session_cursor',
+  // CAP-6 / Story 8: host-owned ACP catalog resolution. The web client
+  // resolves the catalog through `list_acp_catalog` (the host's OS/arch/
+  // runtime + per-agent `SupportedAcpAgentStatus`) + `set_catalog_opt_in`
+  // (the host-persisted opt-in that gates CDN registry augmentation). The
+  // web client never probes `@tauri-apps/plugin-os` or PATH locally — the
+  // host is the single source of truth.
+  'list_acp_catalog',
+  'set_catalog_opt_in',
+  // CAP-6 / Story 9: host-owned verified-atomic ACP install. The web client
+  // installs a catalog agent through `install_acp_agent` (the host downloads +
+  // verifies sha256 + extracts + atomically activates). The request is
+  // `{ agentId }` only; the host resolves everything from the trusted catalog.
+  'install_acp_agent'
 ] as const
 
 /** Union of all WS request `type` strings. */
