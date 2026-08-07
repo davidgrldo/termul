@@ -155,8 +155,9 @@ pub struct DeleteRequest {
 }
 
 /// `POST /fs/rename` body: `{ "from": "...", "to": "..." }`. Both endpoints
-/// are resolved through `check_within_root` so the destination stays inside
-/// the project root.
+/// are resolved via `resolve_request_path` (rejects `..`, canonicalizes; no
+/// `project_root` containment — intentional breadth per ADR-007).
+/// Loopback-guarded (`check_local_only`, `FORBIDDEN`).
 #[derive(Debug, Deserialize)]
 pub struct RenameRequest {
     pub from: String,
@@ -244,10 +245,18 @@ fn get_extension(name: &str) -> Option<String> {
 ///
 /// The project-root prefix-containment check that previously lived here was
 /// removed by explicit decision (spec-remove-web-fs-path-jail) so that any
-/// absolute path the client requests is resolved and served. The retained
-/// guards are: `..`-component rejection (defense-in-depth) and path
-/// canonicalization / ancestor-walking (symlink resolution + non-existing
-/// tail re-attach for `mkdir`/`write`).
+/// absolute path the client requests is resolved and served. This is the
+/// intentional `/fs/*` breadth policy (ADR-007): browse/read routes
+/// (`ls`/`browse`/`read`) are deliberately broader than `project_root` for
+/// desktop parity, the directory picker, and editor reads; the OPERATION
+/// routes (`/git/*`, `/skills`, `/search/content`) are confined separately
+/// via `git_api::ensure_within_project_boundary` (accepts the default
+/// `project_root` or any registered, non-archived project root; rejects
+/// with `OUTSIDE_PROJECT_ROOT`). `/fs/*` writes (`mkdir`/`write`/`delete`/
+/// `rename`/`copy`) and `/fs/info` are loopback-guarded (`check_local_only`,
+/// `FORBIDDEN`). The retained guards here are: `..`-component rejection
+/// (defense-in-depth) and path canonicalization / ancestor-walking (symlink
+/// resolution + non-existing tail re-attach for `mkdir`/`write`).
 ///
 /// Notes:
 /// - This is intentionally separate from the existing
@@ -544,11 +553,14 @@ pub async fn browse(
 /// `READ_ERROR` (missing/dir/io), `FILE_TOO_LARGE` (> 1 MiB, refused before
 /// read), or `BINARY_FILE` (NUL/control bytes in the first 512 bytes —
 /// mirrors the renderer's `isBinaryFile`). Paths outside the configured
-/// `project_root` are allowed (the prefix-containment jail was removed by
-/// spec-remove-web-fs-path-jail), matching `/fs/ls` + `/fs/browse`. A read
-/// route: intentionally NOT loopback-guarded, so desktop-hosted LAN clients
-/// can open files in the editor; mutations stay loopback-only
-/// (`delete`/`rename`/`copy`).
+/// `project_root` are allowed — this is the intentional `/fs/*` breadth
+/// policy (ADR-007: the prefix-containment jail was removed by
+/// spec-remove-web-fs-path-jail so the directory picker can navigate outside
+/// the project and the editor can read cross-project files; browse/read are
+/// deliberately broader than the operation routes, which remain confined
+/// via `ensure_within_project_boundary`). A read route: intentionally NOT
+/// loopback-guarded, so desktop-hosted LAN clients can open files in the
+/// editor; mutations stay loopback-only (`delete`/`rename`/`copy`).
 pub async fn read(State(_state): State<AppState>, Query(q): Query<PathQuery>) -> impl IntoResponse {
     let path = match resolve_request_path(Path::new(&q.path)) {
         Ok(safe) => safe,
@@ -913,7 +925,7 @@ fn sort_directory_entries(entries: &mut [DirectoryEntryDto]) {
 mod tests {
     use super::*;
     use crate::acp::AcpManager;
-    use crate::web::project_registry::ProjectRegistry;
+    use crate::web::project_registry::{ProjectRegistry, ProjectSummary};
     use crate::web::sink::WsRelaySink;
     use crate::web::test_pty_manager;
     use axum::body::Body;
@@ -959,10 +971,14 @@ mod tests {
     }
 
     /// PR-S4: build an `AppState` with the project-root boundary set to
-    /// `root`. The fs_api routes reject any request whose canonicalized path
-    /// is outside this root. Tests that previously used the default
-    /// `test_state()` keep working because the default root is the OS temp
-    /// dir (and the existing tests only touch temp dirs).
+    /// `root`. This is the containment boundary for the OPERATION routes
+    /// (`/git/*`, `/skills`, `/search/content` — enforced by
+    /// `git_api::ensure_within_project_boundary`, which accepts the default
+    /// `project_root` or any registered, non-archived project root). The `/fs/*` browse/read
+    /// routes are intentionally broader (no `project_root` containment —
+    /// ADR-007). Tests that previously used the default `test_state()` keep
+    /// working because the default root is the OS temp dir (and the existing
+    /// tests only touch temp dirs).
     fn test_state_with_root(root: &Path) -> AppState {
         let pty = test_pty_manager();
         AppState {
@@ -1017,6 +1033,9 @@ mod tests {
     }
 
     /// Build a router with all fs_api routes (no static fallback) for tests.
+    /// Also registers `/git/status` + `/skills` so the
+    /// `fs_containment_boundary_relationship` test can exercise the `/fs/*`
+    /// breadth vs the operations containment on one router (ADR-007).
     fn test_router(state: AppState) -> axum::Router {
         axum::Router::new()
             .route("/fs/mkdir", axum::routing::post(mkdir))
@@ -1029,6 +1048,8 @@ mod tests {
             .route("/fs/rename", axum::routing::post(rename))
             .route("/fs/copy", axum::routing::post(copy))
             .route("/git/init", axum::routing::post(git_init))
+            .route("/git/status", axum::routing::post(crate::web::git_api::get_status))
+            .route("/skills", axum::routing::get(crate::web::skills_api::list))
             .route("/shells", axum::routing::get(shells))
             .with_state(state)
     }
@@ -2064,5 +2085,224 @@ mod tests {
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
         assert!(!body.success, "traversal copy must be refused");
         assert_eq!(body.code.as_deref(), Some("PATH_TRAVERSAL"));
+    }
+
+    /// Boundary-relationship test (ADR-007): the `/fs/*` browse/read surface
+    /// is intentionally broader than the `/git/*` and `/skills` operation
+    /// surface. `/fs/ls` accepts a path outside `project_root` (intentional
+    /// breadth — desktop parity, directory picker, editor reads), while
+    /// `/git/status` and `/skills` reject the same outside path with
+    /// `OUTSIDE_PROJECT_ROOT` (server-side operations confined to
+    /// `project_root` via `ensure_within_project_boundary`).
+    #[tokio::test]
+    async fn fs_containment_boundary_relationship() {
+        let root = TempDir::new("boundary-root");
+        let inside = root.path().join("inside");
+        fs::create_dir_all(&inside).expect("mkdir inside");
+        fs::write(inside.join("marker.txt"), "x").expect("write inside marker");
+        let outside = TempDir::new("boundary-outside");
+        fs::write(outside.path().join("marker.txt"), "x").expect("write marker");
+        let state = test_state_with_root(root.path());
+
+        // --- WITHIN project_root: all routes accept (no OUTSIDE_PROJECT_ROOT) ---
+
+        // `/fs/ls` within project_root SUCCEEDS.
+        let ls_uri = format!(
+            "/fs/ls?path={}",
+            urlencoding(&inside.to_string_lossy())
+        );
+        let resp = get_request(state.clone(), &ls_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<Vec<DirectoryEntryDto>> = body_as_json(resp.into_body()).await;
+        assert!(
+            body.success,
+            "/fs/ls inside project_root must succeed: {:?}",
+            body.error
+        );
+        let entries = body.data.expect("entries");
+        assert!(
+            entries.iter().any(|e| e.name == "marker.txt"),
+            "inside-root entry must be listed: {entries:?}"
+        );
+
+        // `/git/status` within project_root is NOT rejected with
+        // OUTSIDE_PROJECT_ROOT (it may fail with a git error if the dir is
+        // not a repo, but the boundary check must pass).
+        let resp = post_json(
+            state.clone(),
+            "/git/status",
+            &serde_json::json!({ "cwd": inside.to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<serde_json::Value> = body_as_json(resp.into_body()).await;
+        assert_ne!(
+            body.code.as_deref(),
+            Some("OUTSIDE_PROJECT_ROOT"),
+            "/git/status inside project_root must not be rejected with OUTSIDE_PROJECT_ROOT"
+        );
+
+        // `/skills` within project_root is NOT rejected with
+        // OUTSIDE_PROJECT_ROOT.
+        let skills_uri = format!(
+            "/skills?projectRoot={}",
+            urlencoding(&inside.to_string_lossy())
+        );
+        let resp = get_request(state.clone(), &skills_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<serde_json::Value> = body_as_json(resp.into_body()).await;
+        assert_ne!(
+            body.code.as_deref(),
+            Some("OUTSIDE_PROJECT_ROOT"),
+            "/skills inside project_root must not be rejected with OUTSIDE_PROJECT_ROOT"
+        );
+
+        // --- OUTSIDE project_root: /fs accepts (intentional breadth),
+        //     operations reject (OUTSIDE_PROJECT_ROOT) ---
+        let ls_uri = format!(
+            "/fs/ls?path={}",
+            urlencoding(&outside.path().to_string_lossy())
+        );
+        let resp = get_request(state.clone(), &ls_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<Vec<DirectoryEntryDto>> = body_as_json(resp.into_body()).await;
+        assert!(
+            body.success,
+            "/fs/ls outside project_root must succeed (ADR-007 breadth): {:?}",
+            body.error
+        );
+        let entries = body.data.expect("entries");
+        assert!(
+            entries.iter().any(|e| e.name == "marker.txt"),
+            "outside-root entry must be listed: {entries:?}"
+        );
+
+        // `POST /git/status { cwd: <outside> }` REJECTS with
+        // `OUTSIDE_PROJECT_ROOT` — operations stay confined to project_root.
+        let resp = post_json(
+            state.clone(),
+            "/git/status",
+            &serde_json::json!({ "cwd": outside.path().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<()> = body_as_json(resp.into_body()).await;
+        assert!(
+            !body.success,
+            "/git/status outside project_root must be rejected"
+        );
+        assert_eq!(body.code.as_deref(), Some("OUTSIDE_PROJECT_ROOT"));
+
+        // `GET /skills?projectRoot=<outside>` REJECTS with
+        // `OUTSIDE_PROJECT_ROOT` — skills stay confined to project_root.
+        let skills_uri = format!(
+            "/skills?projectRoot={}",
+            urlencoding(&outside.path().to_string_lossy())
+        );
+        let resp = get_request(state, &skills_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<()> = body_as_json(resp.into_body()).await;
+        assert!(
+            !body.success,
+            "/skills outside project_root must be rejected"
+        );
+        assert_eq!(body.code.as_deref(), Some("OUTSIDE_PROJECT_ROOT"));
+    }
+
+    /// CAP-2: a web client that switched to a non-default registered project
+    /// (per-connection `switch_project`) can still run git/skills operations.
+    /// The containment boundary follows ANY registered project root, not just
+    /// the host default. An unregistered path is still rejected.
+    #[tokio::test]
+    async fn operations_accept_registered_non_default_project() {
+        let root = TempDir::new("registered-default");
+        let registered = TempDir::new("registered-other");
+        let outside = TempDir::new("registered-unregistered");
+        fs::write(registered.path().join("marker.txt"), "x").expect("write marker");
+        fs::write(outside.path().join("marker.txt"), "x").expect("write marker");
+        let state = test_state_with_root(root.path());
+
+        // Seed the registry with two projects: `root` (default) and
+        // `registered` (non-default, outside `root`). The `set` call's
+        // `rebind_project_root` is a no-op here (no handle registered in
+        // test state), so `project_root` stays as `root`.
+        state.registry.set(
+            vec![
+                ProjectSummary {
+                    id: "default".to_string(),
+                    name: "Default".to_string(),
+                    color: "blue".to_string(),
+                    path: Some(root.path().to_string_lossy().into_owned()),
+                    is_archived: false,
+                    is_default: true,
+                },
+                ProjectSummary {
+                    id: "registered".to_string(),
+                    name: "Registered".to_string(),
+                    color: "green".to_string(),
+                    path: Some(registered.path().to_string_lossy().into_owned()),
+                    is_archived: false,
+                    is_default: false,
+                },
+            ],
+            Some("default".to_string()),
+        );
+
+        // `/git/status` on the registered (non-default) project is NOT
+        // rejected — it's a registered project root.
+        let resp = post_json(
+            state.clone(),
+            "/git/status",
+            &serde_json::json!({ "cwd": registered.path().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<serde_json::Value> = body_as_json(resp.into_body()).await;
+        assert_ne!(
+            body.code.as_deref(),
+            Some("OUTSIDE_PROJECT_ROOT"),
+            "/git/status on registered non-default project must not be rejected"
+        );
+
+        // `/skills` on the registered (non-default) project is NOT rejected.
+        let skills_uri = format!(
+            "/skills?projectRoot={}",
+            urlencoding(&registered.path().to_string_lossy())
+        );
+        let resp = get_request(state.clone(), &skills_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<serde_json::Value> = body_as_json(resp.into_body()).await;
+        assert_ne!(
+            body.code.as_deref(),
+            Some("OUTSIDE_PROJECT_ROOT"),
+            "/skills on registered non-default project must not be rejected"
+        );
+
+        // An unregistered path (outside both root and registered) is still
+        // rejected — the boundary only follows registered projects.
+        let resp = post_json(
+            state.clone(),
+            "/git/status",
+            &serde_json::json!({ "cwd": outside.path().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<()> = body_as_json(resp.into_body()).await;
+        assert!(
+            !body.success,
+            "/git/status on unregistered path must be rejected"
+        );
+        assert_eq!(body.code.as_deref(), Some("OUTSIDE_PROJECT_ROOT"));
+
+        // `/fs/ls` on the registered (non-default) project also succeeds —
+        // intentional breadth (always accepted, registered or not).
+        let ls_uri = format!(
+            "/fs/ls?path={}",
+            urlencoding(&registered.path().to_string_lossy())
+        );
+        let resp = get_request(state, &ls_uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<Vec<DirectoryEntryDto>> = body_as_json(resp.into_body()).await;
+        assert!(body.success, "/fs/ls on registered project must succeed");
     }
 }
