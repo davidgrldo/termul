@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
+import { ChatRoute } from '@/components/ChatRoute'
 import { DirectoryPicker } from '@/components/DirectoryPicker'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toaster as Sonner } from '@/components/ui/sonner'
@@ -145,6 +146,7 @@ const router = createHashRouter(
       element: <WorkspaceLayout />,
       children: [
         { index: true, element: <WorkspaceDashboard /> },
+        { path: 'c/:sessionId', element: <ChatRoute /> },
         { path: 'snapshots', element: <WorkspaceSnapshots /> },
         { path: 'settings', element: <ProjectSettings /> },
         { path: 'preferences', element: <AppPreferences /> }
