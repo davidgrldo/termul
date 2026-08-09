@@ -1560,6 +1560,8 @@ pub fn run() {
             commands::git_get_diff,
             commands::git_stage,
             commands::git_unstage,
+            commands::git_stage_hunk,
+            commands::git_unstage_hunk,
             commands::git_discard,
             commands::git_get_log,
             commands::git_commit,
