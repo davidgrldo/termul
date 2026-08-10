@@ -10,7 +10,10 @@ use crate::remote;
 use crate::trackers::{
     CwdTracker, ExitCodeTracker, GitCommit, GitStatus, GitStatusDetail, GitTracker,
 };
-use crate::worktree::{BranchEntry, DirtyStatus, GitWorktreeEntry, RemoveResult, WorktreeManager};
+use crate::worktree::{
+    BaseBranchInfo, BranchEntry, DirtyStatus, GitWorktreeEntry, IncludeCopyResult, RemoveResult,
+    WorktreeManager,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
@@ -923,6 +926,45 @@ pub async fn worktree_merge_execute(
     match WorktreeManager::merge_execute(&validated_path, &target_branch) {
         Ok(result) => Ok(IpcResult::success(result)),
         Err(e) => Ok(IpcResult::error(e.to_string(), e.error_code())),
+    }
+}
+
+/// Resolve the default base branch for a new chat worktree (CAP-2).
+/// Returns the origin/HEAD default with a `main`/`master`/current fallback
+/// chain and a detached-HEAD flag so the launcher can force a base pick.
+#[tauri::command]
+pub async fn worktree_resolve_base_branch(
+    project_path: String,
+) -> Result<IpcResult<BaseBranchInfo>, String> {
+    let validated_path = validate_and_stringify!(&project_path);
+    match WorktreeManager::resolve_default_base_branch(&validated_path) {
+        Ok(info) => Ok(IpcResult::success(info)),
+        Err(e) => Ok(IpcResult::error(e.to_string(), e.error_code())),
+    }
+}
+
+/// Carry over untracked files listed in `.worktree-include` into a fresh
+/// worktree (CAP-5). Symlink/path-escape/already-present defenses run per
+/// file; the result reports `ran`/`copied`/`skipped` with per-file reasons.
+#[tauri::command]
+pub async fn worktree_copy_include_files(
+    project_path: String,
+    worktree_path: String,
+) -> Result<IpcResult<IncludeCopyResult>, String> {
+    let validated_project = validate_and_stringify!(&project_path);
+    let validated_worktree = validate_and_stringify!(&worktree_path);
+    // Filesystem walk + copy is blocking; offload from the async runtime.
+    match tokio::task::spawn_blocking(move || {
+        WorktreeManager::copy_worktree_include_files(&validated_project, &validated_worktree)
+    })
+    .await
+    {
+        Ok(Ok(result)) => Ok(IpcResult::success(result)),
+        Ok(Err(e)) => Ok(IpcResult::error(e.to_string(), e.error_code())),
+        Err(join_err) => Ok(IpcResult::error(
+            format!("worktree_copy_include_files join failed: {join_err}"),
+            "INTERNAL_ERROR",
+        )),
     }
 }
 
@@ -3679,6 +3721,8 @@ fn host_entry_to_desktop(entry: crate::acp::SessionIndexEntry) -> crate::acp::Ch
             crate::acp::PersistedSessionStatus::Error => crate::acp::ChatHistoryStatus::Error,
             crate::acp::PersistedSessionStatus::Closed => crate::acp::ChatHistoryStatus::Closed,
         },
+        worktree_path: entry.worktree_path,
+        worktree_branch: entry.worktree_branch,
     }
 }
 
@@ -4666,6 +4710,8 @@ mod tests {
             tool_count: 1,
             last_seq: 5,
             resume_eligible: true,
+            worktree_path: None,
+            worktree_branch: None,
         };
         let desktop = host_entry_to_desktop(entry);
         assert_eq!(desktop.id, "s-1");
@@ -4697,6 +4743,8 @@ mod tests {
             tool_count: 0,
             last_seq: 0,
             resume_eligible: false,
+            worktree_path: None,
+            worktree_branch: None,
         };
         let desktop = host_entry_to_desktop(bare);
         assert_eq!(desktop.agent_id, "");
