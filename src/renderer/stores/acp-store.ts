@@ -3257,19 +3257,37 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     if (pending.modeId) {
       await get().setMode(sessionId, pending.modeId)
     }
+    let modelConfigIdHandled: string | null = null
     if (pending.modelId) {
-      const hasNative =
-        session.models?.availableModels.some((m) => m.modelId === pending.modelId) ?? false
-      if (hasNative) {
-        await get().setModel(sessionId, pending.modelId)
-      } else {
+      let applied = false
+      if (session.models) {
+        try {
+          await get().setModel(sessionId, pending.modelId)
+          applied = true
+        } catch {
+          // native setModel rejected; fall through to a model config option
+        }
+      }
+      if (!applied) {
         const modelOpt = session.configOptions.find((o) => o.category === 'model')
         if (modelOpt) {
-          await get().setConfigOption(sessionId, modelOpt.id, pending.modelId)
+          try {
+            await get().setConfigOption(sessionId, modelOpt.id, pending.modelId)
+            applied = true
+            modelConfigIdHandled = modelOpt.id
+          } catch {
+            // leave applied false; show toast and continue applying other options
+          }
         }
+      }
+      if (!applied) {
+        toast.error('Selected model is not available in this session', {
+          description: `The model "${pending.modelId}" is not advertised by the agent and no model config option exists. Falling back to the agent's default model.`
+        })
       }
     }
     for (const [configId, valueId] of Object.entries(pending.configValues)) {
+      if (configId === modelConfigIdHandled) continue
       await get().setConfigOption(sessionId, configId, valueId)
     }
   },
