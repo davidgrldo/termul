@@ -24,8 +24,9 @@ use uuid::Uuid;
 
 use crate::acp::config::{AgentId, SessionId};
 use crate::acp::host_mcp::{
-    emit_plan_update, map_todos_to_plan_entries, FrameReply, FrameRequest, PlanStore,
+    emit_plan_update, map_todos_to_plan_entries, FrameKind, FrameReply, FrameRequest, PlanStore,
 };
+use crate::acp::session_persistence::SessionPersistence;
 use crate::web::EventSink;
 
 /// Per-session auth + routing context, keyed by the random token.
@@ -58,10 +59,14 @@ pub struct HostPlanServer {
     /// authoritative turn registry lets `process_request` repair that stale
     /// token binding when exactly one session for the agent is active.
     active_turns: Mutex<HashMap<String, HashSet<String>>>,
+    /// Sessions that already accepted a title during the current active turn.
+    title_calls_this_turn: Mutex<HashSet<String>>,
     /// Per-session plan cache (emit-and-cache). v1 doesn't persist; this is
     /// the seam a future persistence layer reads from on resume. Updated in
     /// `process_request` (set on emit) + `unregister_*` (drop on close).
     plan_store: PlanStore,
+    /// Durable store used by the title tool. Absent in live-only tests/modes.
+    persistence: Option<Arc<SessionPersistence>>,
 }
 
 impl HostPlanServer {
@@ -73,13 +78,18 @@ impl HostPlanServer {
     /// `WsRelaySink` on standalone). `fan_out` over zero sinks is a no-op, so a
     /// unit-test `HostPlanServer` with `vec![]` is legal (just emits nothing).
     #[must_use]
-    pub fn start(sinks: Vec<Arc<dyn EventSink>>) -> Arc<Self> {
+    pub fn start(
+        sinks: Vec<Arc<dyn EventSink>>,
+        persistence: Option<Arc<SessionPersistence>>,
+    ) -> Arc<Self> {
         let server = Arc::new(Self {
             port: std::sync::OnceLock::new(),
             sinks,
             sessions: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
+            title_calls_this_turn: Mutex::new(HashSet::new()),
             plan_store: PlanStore::new(),
+            persistence,
         });
         let server_for_thread = Arc::clone(&server);
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -121,7 +131,9 @@ impl HostPlanServer {
                                 let server = Arc::clone(&server_for_thread);
                                 tokio::spawn(async move {
                                     if let Err(e) = server.handle_conn(stream).await {
-                                        log::warn!("[host-mcp] conn from {peer} ended with error: {e}");
+                                        log::warn!(
+                                            "[host-mcp] conn from {peer} ended with error: {e}"
+                                        );
                                     }
                                 });
                             }
@@ -197,6 +209,7 @@ impl HostPlanServer {
 
     /// Mark an accepted prompt turn as active before the agent can call tools.
     pub fn begin_turn(&self, agent_id: &str, real_session_id: &str) {
+        self.title_calls_this_turn.lock().remove(real_session_id);
         self.active_turns
             .lock()
             .entry(agent_id.to_string())
@@ -216,6 +229,7 @@ impl HostPlanServer {
                 active_turns.remove(agent_id);
             }
         }
+        self.title_calls_this_turn.lock().remove(real_session_id);
         log::debug!(
             "[host-mcp] removed active plan route for session {real_session_id} (agent {agent_id})"
         );
@@ -235,6 +249,7 @@ impl HostPlanServer {
             !sessions.is_empty()
         });
         drop(active_turns);
+        self.title_calls_this_turn.lock().remove(real_session_id);
         self.plan_store.drop_session(real_session_id);
     }
 
@@ -244,9 +259,7 @@ impl HostPlanServer {
     pub fn unregister_by_token(&self, token: &str) {
         let real_sid = {
             let mut sessions = self.sessions.lock();
-            sessions
-                .remove(token)
-                .and_then(|auth| auth.real_session_id)
+            sessions.remove(token).and_then(|auth| auth.real_session_id)
         };
         if let Some(sid) = real_sid {
             self.plan_store.drop_session(&sid);
@@ -356,7 +369,7 @@ impl HostPlanServer {
                 Some(sessions) if sessions.len() == 1 => {
                     let active_session_id = sessions.iter().next().expect("len checked").clone();
                     log::info!(
-                        "[host-mcp] rerouted stale plan binding for agent {} from session {} to active session {}",
+                        "[host-mcp] rerouted stale binding for agent {} from session {} to active session {}",
                         auth.agent_id,
                         bound_session_id,
                         active_session_id
@@ -365,7 +378,7 @@ impl HostPlanServer {
                 }
                 Some(sessions) if sessions.len() > 1 => {
                     log::warn!(
-                        "[host-mcp] rejected ambiguous stale plan binding for agent {} (bound session {}, {} active turns)",
+                        "[host-mcp] rejected ambiguous stale binding for agent {} (bound session {}, {} active turns)",
                         auth.agent_id,
                         bound_session_id,
                         sessions.len()
@@ -374,7 +387,7 @@ impl HostPlanServer {
                 }
                 _ => {
                     log::warn!(
-                        "[host-mcp] rejected plan call for agent {} with no active turn (bound session {})",
+                        "[host-mcp] rejected tool call for agent {} with no active turn (bound session {})",
                         auth.agent_id,
                         bound_session_id
                     );
@@ -383,21 +396,60 @@ impl HostPlanServer {
             }
         };
 
-        // Map todos → PlanEntry + emit. Empty todos = clear (renderer drops).
-        let entries = map_todos_to_plan_entries(&req.todos);
-        let agent_id = AgentId(auth.agent_id.clone());
-        let session_id = SessionId(real_session_id.clone());
-        let count = entries.len();
-        // Cache the latest plan (emit-and-cache) so a future persistence layer
-        // can read it without re-deriving from replayed events.
-        self.plan_store.set(&real_session_id, entries.clone());
-        emit_plan_update(&self.sinks, &agent_id, &session_id, entries);
-        log::info!(
-            "[host-mcp] emitted plan_update for session {} ({} entries)",
-            session_id,
-            count
-        );
-        FrameReply::ok()
+        match req.kind {
+            FrameKind::Plan => {
+                if req.title.is_some() {
+                    return FrameReply::err("plan frame must not include title");
+                }
+                let entries = map_todos_to_plan_entries(&req.todos);
+                let agent_id = AgentId(auth.agent_id.clone());
+                let session_id = SessionId(real_session_id.clone());
+                let count = entries.len();
+                self.plan_store.set(&real_session_id, entries.clone());
+                emit_plan_update(&self.sinks, &agent_id, &session_id, entries);
+                log::info!(
+                    "[host-mcp] emitted plan_update for session {} ({} entries)",
+                    session_id,
+                    count
+                );
+                FrameReply::ok()
+            }
+            FrameKind::SetTitle => {
+                if !req.todos.is_empty() {
+                    return FrameReply::err("title frame must not include todos");
+                }
+                let Some(title) = req.title else {
+                    return FrameReply::err("title is required");
+                };
+                if !self
+                    .title_calls_this_turn
+                    .lock()
+                    .insert(real_session_id.clone())
+                {
+                    return FrameReply::err("title already set during this turn");
+                }
+                let Some(persistence) = self.persistence.as_ref() else {
+                    log::warn!("[host-mcp] title call rejected: persistence unavailable");
+                    return FrameReply::err("title persistence unavailable");
+                };
+                match crate::acp::manager::record_local_title(
+                    persistence,
+                    &self.sinks,
+                    AgentId(auth.agent_id),
+                    real_session_id.clone(),
+                    title,
+                )
+                .await
+                {
+                    Ok(()) => FrameReply::ok(),
+                    Err(error) => {
+                        self.title_calls_this_turn.lock().remove(&real_session_id);
+                        log::warn!("[host-mcp] title update rejected: {error}");
+                        FrameReply::err(error)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -416,7 +468,9 @@ mod tests {
 
     impl EventSink for CapturingSink {
         fn emit(&self, event: &crate::web::sink::AcpEvent) {
-            if event.type_ == crate::acp::events::EVENT_PLAN_UPDATE {
+            if event.type_ == crate::acp::events::EVENT_PLAN_UPDATE
+                || event.type_ == crate::acp::events::EVENT_SESSION_INFO_UPDATE
+            {
                 self.events
                     .lock()
                     .unwrap()
@@ -438,7 +492,7 @@ mod tests {
 
     #[test]
     fn register_returns_valid_port_token_provisional() {
-        let server = HostPlanServer::start(vec![]);
+        let server = HostPlanServer::start(vec![], None);
         let (port, token, provisional) = server.register_session("agent-1");
         assert!(port > 0, "port must be bound by the dedicated thread");
         assert!(!token.is_empty());
@@ -451,13 +505,14 @@ mod tests {
         // Before `bind_session` is called, the real session_id is unknown — a
         // call arriving in that window is rejected (the agent can't legally
         // call tools before `session/new` returns, but we defend anyway).
-        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())]);
+        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())], None);
         let (port, token, provisional) = server.register_session("agent-1");
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
             let frame = serde_json::json!({
                 "token": token,
                 "session_id": provisional,
+                "kind": "plan",
                 "todos": [{"content": "x"}],
             });
             let reply = connect_and_send(port, &frame).await;
@@ -470,13 +525,14 @@ mod tests {
     fn token_provisional_mismatch_is_rejected() {
         // A valid token paired with the wrong provisional session_id is
         // rejected (defense-in-depth against a leaked token + guessed sid).
-        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())]);
+        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())], None);
         let (port, token, _provisional) = server.register_session("agent-1");
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
             let frame = serde_json::json!({
                 "token": token,
                 "session_id": "wrong-provisional",
+                "kind": "plan",
                 "todos": [{"content": "x"}],
             });
             let reply = connect_and_send(port, &frame).await;
@@ -488,7 +544,7 @@ mod tests {
     #[test]
     fn bound_session_emits_plan_update() {
         let sink = Arc::new(CapturingSink::default());
-        let server = HostPlanServer::start(vec![sink.clone()]);
+        let server = HostPlanServer::start(vec![sink.clone()], None);
         let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-real");
         server.begin_turn("agent-1", "sess-real");
@@ -498,6 +554,7 @@ mod tests {
             let frame = serde_json::json!({
                 "token": token,
                 "session_id": provisional,
+                "kind": "plan",
                 "todos": [
                     {"content": "one"},
                     {"content": "two", "status": "in_progress", "priority": "high"},
@@ -514,7 +571,7 @@ mod tests {
     #[test]
     fn bound_session_without_an_active_turn_is_rejected() {
         let sink = Arc::new(CapturingSink::default());
-        let server = HostPlanServer::start(vec![sink.clone()]);
+        let server = HostPlanServer::start(vec![sink.clone()], None);
         let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-real");
 
@@ -536,7 +593,7 @@ mod tests {
     #[test]
     fn stale_binding_routes_to_the_agents_only_active_turn() {
         let sink = Arc::new(CapturingSink::default());
-        let server = HostPlanServer::start(vec![sink.clone()]);
+        let server = HostPlanServer::start(vec![sink.clone()], None);
         let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-old");
         server.begin_turn("agent-1", "sess-current");
@@ -562,7 +619,7 @@ mod tests {
     #[test]
     fn bound_active_session_wins_when_agent_has_multiple_active_turns() {
         let sink = Arc::new(CapturingSink::default());
-        let server = HostPlanServer::start(vec![sink.clone()]);
+        let server = HostPlanServer::start(vec![sink.clone()], None);
         let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-bound");
         server.begin_turn("agent-1", "sess-bound");
@@ -586,7 +643,7 @@ mod tests {
     #[test]
     fn ambiguous_stale_binding_is_rejected_instead_of_cross_routed() {
         let sink = Arc::new(CapturingSink::default());
-        let server = HostPlanServer::start(vec![sink.clone()]);
+        let server = HostPlanServer::start(vec![sink.clone()], None);
         let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-old");
         server.begin_turn("agent-1", "sess-a");
@@ -609,7 +666,7 @@ mod tests {
 
     #[test]
     fn end_turn_removes_routing_candidate() {
-        let server = HostPlanServer::start(vec![]);
+        let server = HostPlanServer::start(vec![], None);
         server.begin_turn("agent-1", "sess-current");
         server.end_turn("agent-1", "sess-current");
         assert!(server.active_turns.lock().get("agent-1").is_none());
@@ -618,18 +675,68 @@ mod tests {
     #[test]
     fn bad_token_alone_is_rejected() {
         // Unknown token — rejected even with a plausible provisional sid.
-        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())]);
+        let server = HostPlanServer::start(vec![Arc::new(CapturingSink::default())], None);
         let (port, _token, _provisional) = server.register_session("agent-1");
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
             let frame = serde_json::json!({
                 "token": "bogus-token",
                 "session_id": "bogus-sid",
+                "kind": "plan",
                 "todos": [{"content": "x"}],
             });
             let reply = connect_and_send(port, &frame).await;
             assert_eq!(reply["ok"], false);
             assert_eq!(reply["error"], "auth rejected");
+        });
+    }
+
+    #[test]
+    fn bound_title_call_persists_and_broadcasts() {
+        let root =
+            std::env::temp_dir().join(format!("termul-host-mcp-title-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let persistence = Arc::new(SessionPersistence::open(root.join("store")).await.unwrap());
+            persistence
+                .register_session(crate::acp::SessionRegistration {
+                    session_id: "sess-real".into(),
+                    stable_agent_namespace: Some("config:test".into()),
+                    runtime_agent_id: Some("agent-1".into()),
+                    project_id: None,
+                    cwd,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let sink = Arc::new(CapturingSink::default());
+            let server = HostPlanServer::start(vec![sink.clone()], Some(Arc::clone(&persistence)));
+            let (port, token, provisional) = server.register_session("agent-1");
+            server.bind_session(&token, "sess-real");
+            server.begin_turn("agent-1", "sess-real");
+            let frame = serde_json::json!({
+                "token": token,
+                "session_id": provisional,
+                "kind": "set_title",
+                "title": "**Fix login bug**\nignored",
+            });
+            let reply = connect_and_send(port, &frame).await;
+            assert_eq!(reply["ok"], true);
+            let metadata = persistence.metadata("sess-real").unwrap();
+            assert_eq!(metadata.title.as_deref(), Some("Fix login bug"));
+            assert_eq!(
+                metadata.title_source,
+                Some(crate::acp::session_persistence::TitleSource::BackgroundGenerated)
+            );
+            let records = persistence.replay_after("sess-real", 0).unwrap();
+            assert!(records
+                .iter()
+                .any(|record| record.type_ == "local_title_generated"));
+            assert_eq!(sink.events.lock().unwrap().len(), 1);
+            persistence.shutdown().await.unwrap();
+            let _ = std::fs::remove_dir_all(root);
         });
     }
 }

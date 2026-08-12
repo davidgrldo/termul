@@ -2,7 +2,7 @@ import { Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { groupSessionsByRecency, scopeSessionIndex } from '@/lib/acp-history-persistence'
-import { configIdFromReuseKey, discoveryKey, useAcpStore } from '@/stores/acp-store'
+import { agentReuseKey, configIdFromReuseKey, discoveryKey, useAcpStore } from '@/stores/acp-store'
 import { getActiveWorktreeFromStore, useActiveProject } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import { ChatHistoryEntryRow, type ChatHistorySidebarEntry } from './ChatHistoryEntryRow'
@@ -29,7 +29,6 @@ export function ChatHistoryTab({
   const openDiscoveredSession = useAcpStore((s) => s.openDiscoveredSession)
   const discoverSessions = useAcpStore((s) => s.discoverSessions)
   const deleteHistorySession = useAcpStore((s) => s.deleteHistorySession)
-  const activeSessionId = useAcpStore((s) => s.activeSessionId)
   const addAgentChatTab = useWorkspaceStore((s) => s.addAgentChatTab)
   // Subscribe to the full active-project record so the sidebar re-scopes when
   // the active worktree changes (not just when the active project id changes).
@@ -76,24 +75,44 @@ export function ChatHistoryTab({
   )
 
   // Build a unified sidebar list: local mirror + discovered sessions (deduped).
-  // AD-7: discovered sessions (agent-reported via ACP `session/list` but never
-  // recorded by termul) are filtered OUT of the sidebar, EXCEPT the currently-
-  // active session — so an open tab is never orphaned (the user opened it via
-  // `openDiscoveredSession` and it's the focused chat). The filter runs after
-  // `entries` is built so the active-session exemption is exact.
   const mergedEntries = useMemo(() => {
     const mirrorIds = new Set(scopedIndex.map((e) => e.id))
-    const entries: SidebarEntry[] = scopedIndex.map((e) => ({
-      id: e.id,
-      title: e.title,
-      messageCount: e.messageCount,
-      status: e.status,
-      discovered: false,
-      agentId: e.agentId,
-      agentConfigId: e.agentConfigId,
-      lastActivityAt: e.lastActivityAt,
-      canOpen: true
-    }))
+    const entries: SidebarEntry[] = scopedIndex.map((e) => {
+      if (!e.discovered) {
+        return {
+          id: e.id,
+          title: e.title,
+          messageCount: e.messageCount,
+          status: e.status,
+          discovered: false,
+          agentId: e.agentId,
+          agentConfigId: e.agentConfigId,
+          lastActivityAt: e.lastActivityAt,
+          canOpen: true
+        }
+      }
+      const liveAgentId = e.agentConfigId
+        ? configToLiveAgent[agentReuseKey(e.agentConfigId, activeCwd)]
+        : undefined
+      const liveAgent = liveAgentId ? agents[liveAgentId] : undefined
+      const canOpen =
+        liveAgentId != null &&
+        agentStatus[liveAgentId] === 'connected' &&
+        (liveAgent?.capabilities?.loadSession === true ||
+          liveAgent?.capabilities?.sessionCapabilities?.resume != null)
+      return {
+        id: e.id,
+        title: e.title,
+        messageCount: e.messageCount,
+        status: e.status,
+        discovered: true,
+        agentId: liveAgentId,
+        cwd: activeCwd,
+        agentConfigId: e.agentConfigId,
+        lastActivityAt: e.lastActivityAt,
+        canOpen
+      }
+    })
 
     // Add discovered sessions not already in the local mirror. Results are keyed
     // per (agent, cwd), so look up the active cwd's slot for each connected agent.
@@ -129,14 +148,7 @@ export function ChatHistoryTab({
       }
     }
 
-    // AD-7 sidebar display policy: hide discovered sessions that termul never
-    // recorded — EXCEPT the currently-active session (so the open tab is never
-    // orphaned). The filter is applied here (after building `entries`) so the
-    // active-session exemption is exact and the empty-state check below reflects
-    // the post-filter count.
-    return entries.filter(
-      (e) => !e.discovered || (activeSessionId != null && e.id === activeSessionId)
-    )
+    return entries
   }, [
     scopedIndex,
     discoveredSessions,
@@ -144,7 +156,7 @@ export function ChatHistoryTab({
     agentStatus,
     activeCwd,
     resolveAgentIdentity,
-    activeSessionId
+    configToLiveAgent
   ])
 
   const [query, setQuery] = useState('')

@@ -12,6 +12,7 @@ const {
   discoveredSessionsRef,
   agentsRef,
   agentStatusRef,
+  configToLiveAgentRef,
   activeSessionIdRef,
   projectRef
 } = vi.hoisted(() => ({
@@ -24,6 +25,7 @@ const {
   discoveredSessionsRef: { current: {} as Record<string, unknown[]> },
   agentsRef: { current: {} as Record<string, unknown> },
   agentStatusRef: { current: {} as Record<string, string> },
+  configToLiveAgentRef: { current: {} as Record<string, string> },
   activeSessionIdRef: { current: null as string | null },
   projectRef: {
     current: null as {
@@ -51,16 +53,17 @@ vi.mock('@/stores/acp-store', () => {
       agents: agentsRef.current,
       agentStatus: agentStatusRef.current,
       agentConfigs: [],
-      configToLiveAgent: {},
+      configToLiveAgent: configToLiveAgentRef.current,
       discoverSessions: mockDiscover,
       openDiscoveredSession: mockOpenDiscovered,
       activeSessionId: activeSessionIdRef.current
     })
   // Stubs for the store helpers the component imports.
+  const agentReuseKey = (configId: string, cwd: string) => `${configId}\0${cwd.trim()}`
   const configIdFromReuseKey = () => ''
   const discoveryKey = (agentId: string, cwd: string) => `${agentId}\0${cwd}`
   const useAgentTemplateId = () => null
-  return { useAcpStore, configIdFromReuseKey, discoveryKey, useAgentTemplateId }
+  return { useAcpStore, agentReuseKey, configIdFromReuseKey, discoveryKey, useAgentTemplateId }
 })
 
 vi.mock('@/stores/workspace-store', () => ({
@@ -110,6 +113,7 @@ describe('ChatHistoryTab scoping', () => {
     discoveredSessionsRef.current = {}
     agentsRef.current = {}
     agentStatusRef.current = {}
+    configToLiveAgentRef.current = {}
     activeSessionIdRef.current = null
     projectRef.current = {
       id: 'p1',
@@ -206,9 +210,6 @@ describe('ChatHistoryTab scoping', () => {
         { sessionId: 'cli-1', cwd: '/work', title: 'CLI chat', updatedAt: '2026-01-01' }
       ]
     }
-    // AD-7: the discovered session is only visible when it's the active
-    // session (exemption). Set it active so the click test can reach it.
-    activeSessionIdRef.current = 'cli-1'
     let resolveOpen: (() => void) | undefined
     mockOpenDiscovered.mockImplementationOnce(
       () =>
@@ -228,10 +229,7 @@ describe('ChatHistoryTab scoping', () => {
     resolveOpen?.()
   })
 
-  // AD-7: discovered sessions (agent-reported via ACP `session/list` but never
-  // recorded by termul) are hidden from the sidebar — EXCEPT the currently-
-  // active session so the open tab is never orphaned.
-  it('hides discovered sessions when no discovered session is active', () => {
+  it('shows all discovered sessions when no session is active', () => {
     agentsRef.current = {
       'agent-1': {
         id: 'agent-1',
@@ -241,19 +239,18 @@ describe('ChatHistoryTab scoping', () => {
     agentStatusRef.current = { 'agent-1': 'connected' }
     discoveredSessionsRef.current = {
       ['agent-1\0/work']: [
-        { sessionId: 'cli-1', cwd: '/work', title: 'Hidden CLI chat', updatedAt: '2026-01-01' },
-        { sessionId: 'cli-2', cwd: '/work', title: 'Another hidden', updatedAt: '2026-01-01' }
+        { sessionId: 'cli-1', cwd: '/work', title: 'CLI chat', updatedAt: '2026-01-01' },
+        { sessionId: 'cli-2', cwd: '/work', title: 'Another CLI chat', updatedAt: '2026-01-01' }
       ]
     }
-    // No active session — all discovered entries are filtered out.
     activeSessionIdRef.current = null
 
     render(<ChatHistoryTab />)
-    expect(screen.queryByText('Hidden CLI chat')).not.toBeInTheDocument()
-    expect(screen.queryByText('Another hidden')).not.toBeInTheDocument()
+    expect(screen.getByText('CLI chat')).toBeInTheDocument()
+    expect(screen.getByText('Another CLI chat')).toBeInTheDocument()
   })
 
-  it('shows the active discovered session despite the filter (active-session exemption)', () => {
+  it('shows discovered sessions regardless of which session is active', () => {
     agentsRef.current = {
       'agent-1': {
         id: 'agent-1',
@@ -264,16 +261,14 @@ describe('ChatHistoryTab scoping', () => {
     discoveredSessionsRef.current = {
       ['agent-1\0/work']: [
         { sessionId: 'cli-1', cwd: '/work', title: 'Active CLI chat', updatedAt: '2026-01-01' },
-        // A second discovered session is still hidden.
-        { sessionId: 'cli-2', cwd: '/work', title: 'Hidden other', updatedAt: '2026-01-01' }
+        { sessionId: 'cli-2', cwd: '/work', title: 'Other CLI chat', updatedAt: '2026-01-01' }
       ]
     }
-    // The user opened cli-1 via `openDiscoveredSession` — it's the active tab.
     activeSessionIdRef.current = 'cli-1'
 
     render(<ChatHistoryTab />)
     expect(screen.getByText('Active CLI chat')).toBeInTheDocument()
-    expect(screen.queryByText('Hidden other')).not.toBeInTheDocument()
+    expect(screen.getByText('Other CLI chat')).toBeInTheDocument()
   })
 
   it('does not hide local mirror sessions even when a discovered session is active', () => {
@@ -295,10 +290,35 @@ describe('ChatHistoryTab scoping', () => {
     activeSessionIdRef.current = 'cli-1'
 
     render(<ChatHistoryTab />)
-    // Local mirror stays visible (discovered filter only targets discovered:true).
     expect(screen.getByText('Local chat')).toBeInTheDocument()
-    // Active discovered session is exempted.
     expect(screen.getByText('Active discovered')).toBeInTheDocument()
+  })
+
+  it('opens promoted metadata-only sessions through the discovered-session path', async () => {
+    sessionIndexRef.current = [
+      entry('cli-1', {
+        agentId: 'agent-1',
+        title: 'Promoted CLI chat',
+        messageCount: 0,
+        status: 'active',
+        discovered: true,
+        agentConfigId: 'config-1'
+      })
+    ]
+    agentsRef.current = {
+      'agent-1': {
+        id: 'agent-1',
+        capabilities: { loadSession: true, sessionCapabilities: { list: {} } }
+      }
+    }
+    agentStatusRef.current = { 'agent-1': 'connected' }
+    configToLiveAgentRef.current = { ['config-1\0/work']: 'agent-1' }
+
+    render(<ChatHistoryTab />)
+    fireEvent.click(screen.getByText('Promoted CLI chat'))
+
+    expect(mockOpenDiscovered).toHaveBeenCalledWith('agent-1', 'cli-1', '/work', 'p1')
+    expect(mockOpen).not.toHaveBeenCalled()
   })
 
   it('caps the rendered rows and lazily loads more', () => {

@@ -117,6 +117,7 @@ export const WS_REQUEST_TYPES = [
   'close_session',
   'dispose_ephemeral_session',
   'list_sessions',
+  'register_discovered_session',
   'spawn_agent',
   'kill_agent',
   'list_agents',
@@ -281,6 +282,8 @@ export interface PersistedSessionSummary {
   messageCount: number
   toolCount: number
   lastSeq: number
+  /** Agent-owned metadata mirror; transcript remains authoritative in the agent. */
+  discovered?: boolean
   resumeEligible: boolean
   /**
    * Worktree path the agent runs in (CAP-3). Additive: absent on pre-feature
