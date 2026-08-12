@@ -1303,6 +1303,42 @@ mod tests {
         assert!(!option_id_is_valid(&json!(null), "allow"));
     }
 
+    #[test]
+    fn turn_claim_release_releases_exact_claim_when_cancelled() {
+        let watermark = TurnWatermark::new();
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-1")),
+            TurnClaim::Claimed
+        );
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-2")),
+            TurnClaim::Busy
+        );
+        watermark.release_claim("session-1", Some("turn-1"));
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-2")),
+            TurnClaim::Claimed
+        );
+    }
+
+    #[test]
+    fn turn_claim_completion_records_stale_watermark() {
+        let watermark = TurnWatermark::new();
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-1")),
+            TurnClaim::Claimed
+        );
+        watermark.record_completed("session-1", "turn-1");
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-1")),
+            TurnClaim::Completed
+        );
+        assert_eq!(
+            watermark.claim_turn("session-1", Some("turn-2")),
+            TurnClaim::Claimed
+        );
+    }
+
     // --- Rendezvous bookkeeping tests (Story 1.7 AC3) -------------------------
     //
     // These exercise the relay-side ticket table + the rendezvous policy
