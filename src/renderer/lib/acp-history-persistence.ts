@@ -276,11 +276,57 @@ export function groupSessionsByRecency<T extends { lastActivityAt: number }>(
 export function scopeSessionIndex(
   entries: SessionIndexEntry[],
   projectId: string,
-  cwd: string
+  cwd: string,
+  worktreePaths: string[] = []
 ): SessionIndexEntry[] {
   if (!projectId || !cwd) return []
-  const exact = entries.filter((entry) => entry.projectId === projectId && entry.cwd === cwd)
-  return exact.length > 0 ? exact : entries.filter((entry) => entry.projectId === projectId)
+  // ADR 0002 scoping with worktree-inclusive reachability: in addition to an
+  // exact-cwd match, a session whose cwd is one of the active project's
+  // registered worktree paths stays listed. This keeps a worktree chat
+  // reachable from the project root view and across restarts where
+  // `activeWorktreeId` is null (the sidebar would otherwise hide it because
+  // its cwd differs from the root). Falls back to projectId-only matching when
+  // the scoped set is empty, preserving the prior drift-tolerant behavior.
+  //
+  // `normalizeCwdForScope` is required: the host persists session cwds via Rust
+  // `Path::canonicalize`, which on Windows yields the verbatim `\\?\` prefix
+  // with backslash separators (`\\?\E:\…\wt`), while the project store's
+  // worktree paths come from `worktreeApi.list` in forward-slash form
+  // (`E:/…/wt`). A raw `===`/`Set.has` never equates the two and would
+  // silently hide worktree chats from the root view.
+  const normalizedCwd = normalizeCwdForScope(cwd)
+  const worktreePathSet =
+    worktreePaths.length > 0 ? new Set(worktreePaths.map(normalizeCwdForScope)) : null
+  const scoped = entries.filter((entry) => {
+    if (entry.projectId !== projectId) return false
+    const entryCwd = normalizeCwdForScope(entry.cwd)
+    if (entryCwd === normalizedCwd) return true
+    return worktreePathSet?.has(entryCwd) ?? false
+  })
+  return scoped.length > 0 ? scoped : entries.filter((entry) => entry.projectId === projectId)
+}
+
+// Canonicalize a cwd/path for comparison: strip the Windows verbatim `\\?\`
+// prefix, collapse the extended UNC verbatim prefix `\\?\UNC\` to `//` so it
+// matches standard UNC `\\server\share`, unify separators to `/`, and trim
+// trailing slashes. Shared between `scopeSessionIndex` (session cwd vs project
+// worktree paths) and the launcher's worktree-registration dedup (new worktree
+// path vs already-stored paths), so a trailing-slash or verbatim-prefix form
+// mismatch can't defeat either check. No lowercasing — preserves case-sensitive
+// matching on POSIX where the prefix and backslashes never occur (the transform
+// is a no-op there).
+export function normalizeCwdForScope(p: string): string {
+  if (!p) return p
+  return (
+    p
+      // Extended UNC verbatim prefix `\\?\UNC\server\share` → `//server/share`:
+      // collapse to `//` BEFORE the generic verbatim-prefix strip so extended and
+      // standard UNC (`\\server\share`) normalize identically.
+      .replace(/^\\\\\?\\UNC\\/i, '//')
+      .replace(/^\\\\\?\\/, '')
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, '')
+  )
 }
 
 function historyMode(): 'server' | 'live_only' | 'tauri_store' | undefined {
