@@ -1010,13 +1010,36 @@ function appendPlanSnapshot(
   const filteredBlocks = target.blocks.filter(
     (b) => b.type !== 'text' || !isTermulPlanFenceBlock(b.text)
   )
+  // CommonMark requires the opening ``` of a fenced code block to be at the
+  // start of a line. `blocksToText` joins text blocks with '', so a preceding
+  // prose block that does not end in '\n' would glue the fence opener onto the
+  // prose (e.g. "working on it```termul-plan") and Streamdown would not recognize
+  // the fence — the snapshot would render as plain text instead of a PlanPanel.
+  // `blocksToText` skips non-text blocks, so the block that ends up immediately
+  // before the fence in the joined text is the LAST non-empty text block —
+  // search backward for it (not just the last array element, which may be a
+  // non-text block like an image) and ensure it ends in a newline boundary.
+  let lastTextBlockIdx = -1
+  for (let i = filteredBlocks.length - 1; i >= 0; i -= 1) {
+    const block = filteredBlocks[i]
+    if (block.type === 'text' && (block.text ?? '').length > 0) {
+      lastTextBlockIdx = i
+      break
+    }
+  }
+  const blocksWithBoundary = filteredBlocks.map((b, i) => {
+    if (i !== lastTextBlockIdx || b.type !== 'text') return b
+    const text = b.text ?? ''
+    if (text.length === 0 || text.endsWith('\n')) return b
+    return { ...b, text: `${text}\n` }
+  })
   const fenceBlock: ContentBlock = {
     type: 'text',
     text: `\`\`\`termul-plan\n${JSON.stringify(plan)}\n\`\`\``
   }
   const updatedMessage: ChatMessage = {
     ...target,
-    blocks: [...filteredBlocks, fenceBlock]
+    blocks: [...blocksWithBoundary, fenceBlock]
   }
   const newList = [...list]
   newList[lastAgentIdx] = updatedMessage
@@ -1752,6 +1775,11 @@ function dropEphemeralSessionState(state: AcpState, sessionId: SessionId): Parti
 export function _resetEphemeralSessionIdsForTesting(): void {
   ephemeralSessionIds.clear()
   commitMessageCollectors.clear()
+}
+
+/** Test-only: mark a session as ephemeral (warm-pool seed) for persistence-skip tests. */
+export function _addEphemeralSessionIdForTesting(sessionId: SessionId): void {
+  ephemeralSessionIds.add(sessionId)
 }
 
 /**
