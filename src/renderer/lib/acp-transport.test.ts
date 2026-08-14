@@ -2094,6 +2094,131 @@ describe('WsAcpTransport visibility-triggered reconnect (web idle persist)', () 
   })
 })
 
+describe('WsAcpTransport background/foreground lifecycle signals (CAP-3)', () => {
+  afterEach(() => {
+    restoreVisibility()
+    _resetAcpTransportForTests(null)
+    vi.useRealTimers()
+  })
+
+  /** True if a raw frame of the given type was sent on the socket. */
+  const sentType = (sock: FakeWebSocket, type: string): boolean =>
+    sock.sent.some((raw) => {
+      try {
+        return (JSON.parse(raw) as { type?: string }).type === type
+      } catch {
+        return false
+      }
+    })
+
+  it('sends a background frame on tab hide and foreground on return', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    await transport.subscribeSession('sess-cap3')
+    const internals = transport as unknown as TransportInternals
+    const socket = internals.socket
+
+    dispatchVisibility('hidden')
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(sentType(socket, 'background')).toBe(true)
+
+    dispatchVisibility('visible')
+    await Promise.resolve()
+    expect(sentType(socket, 'foreground')).toBe(true)
+
+    transport.dispose()
+  })
+
+  it('does not send lifecycle signals before authentication completes', async () => {
+    vi.useFakeTimers()
+    DelayedOpenWebSocket.pending = []
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: DelayedOpenWebSocket as unknown as typeof WebSocket
+    })
+    const connecting = transport.connect()
+    await Promise.resolve()
+    const internals = transport as unknown as TransportInternals
+    const openingSocket = internals.socket as DelayedOpenWebSocket
+
+    // While CONNECTING (not OPEN, not authed), hide must not send background.
+    dispatchVisibility('hidden')
+    expect(sentType(openingSocket, 'background')).toBe(false)
+
+    openingSocket.openAndAuthenticate()
+    await connecting
+    transport.dispose()
+  })
+
+  it('does not send lifecycle signals after dispose', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    await transport.subscribeSession('sess-cap3')
+    const internals = transport as unknown as TransportInternals
+    const socket = internals.socket
+    transport.dispose()
+
+    dispatchVisibility('hidden')
+    expect(sentType(socket, 'background')).toBe(false)
+  })
+
+  it('sends a background signal when initial authentication completes while hidden', async () => {
+    vi.useFakeTimers()
+    DelayedOpenWebSocket.pending = []
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: DelayedOpenWebSocket as unknown as typeof WebSocket
+    })
+    const connecting = transport.connect()
+    await Promise.resolve()
+    const internals = transport as unknown as TransportInternals
+    const openingSocket = internals.socket as DelayedOpenWebSocket
+
+    // Hidden BEFORE auth completes — the hide handler's background signal was
+    // a no-op (not authed). Auth-completion must re-sync the server watchdog.
+    dispatchVisibility('hidden')
+    expect(sentType(openingSocket, 'background')).toBe(false)
+
+    openingSocket.openAndAuthenticate()
+    await connecting
+    expect(sentType(openingSocket, 'background')).toBe(true)
+    transport.dispose()
+  })
+
+  it('sends a background signal when reconnection authentication completes while hidden', async () => {
+    vi.useFakeTimers()
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    await transport.subscribeSession('sess-cap3b')
+    const internals = transport as unknown as TransportInternals
+    const oldSocket = internals.socket
+
+    // Tab hidden, then the server kills the socket → the reconnect's new
+    // socket authenticates while still hidden → server watchdog re-synced.
+    dispatchVisibility('hidden')
+    await vi.advanceTimersByTimeAsync(1_000)
+    oldSocket.close()
+    await vi.advanceTimersByTimeAsync(3_000)
+    await Promise.resolve()
+
+    const newSocket = internals.socket
+    expect(newSocket).not.toBe(oldSocket)
+    expect(sentType(newSocket, 'background')).toBe(true)
+    transport.dispose()
+  })
+})
+
 describe('createAcpTransport selection', () => {
   beforeEach(() => {
     _resetAcpTransportForTests(null)
