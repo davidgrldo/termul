@@ -77,6 +77,8 @@ pub fn router(
     acp_catalog: Option<Arc<AcpCatalogService>>,
     acp_install: Option<Arc<AcpInstallService>>,
     store: Option<Arc<WebStore>>,
+    allow_remote_writes: bool,
+    shared_live_writes_denied: bool,
 ) -> Router {
     let mut r = Router::new()
         .route("/health", get(health_check))
@@ -216,6 +218,8 @@ pub fn router(
         acp_catalog,
         acp_install,
         store,
+        allow_remote_writes,
+        shared_live_writes_denied,
         project_root: project_root_handle,
     })
 }
@@ -232,6 +236,7 @@ pub fn router(
 /// (the tests do not exercise the manifest routes); the doc comment
 /// surfaces the degraded behavior loudly enough that a production caller
 /// won't silently pick this variant.
+#[allow(clippy::too_many_arguments)]
 pub fn router_with_static(
     acp: Arc<AcpManager>,
     pty: Arc<PtyManager>,
@@ -239,6 +244,8 @@ pub fn router_with_static(
     registry: Arc<ProjectRegistry>,
     static_dir: &Path,
     project_root: PathBuf,
+    allow_remote_writes: bool,
+    shared_live_writes_denied: bool,
 ) -> Router {
     Router::new()
         .route("/health", get(health_check))
@@ -322,6 +329,8 @@ pub fn router_with_static(
                 acp_catalog: None,
                 acp_install: None,
                 store: None,
+                allow_remote_writes,
+                shared_live_writes_denied,
                 project_root: project_root_handle,
             }
         })
@@ -381,6 +390,8 @@ mod tests {
             Arc::new(crate::web::project_registry::ProjectRegistry::new()),
             dir,
             std::env::temp_dir(),
+            false,
+            false,
         )
     }
 

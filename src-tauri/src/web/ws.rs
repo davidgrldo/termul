@@ -351,10 +351,27 @@ pub struct AppState {
     /// `store_*` WS handlers return `STORE_UNAVAILABLE` (degraded mode). The
     /// standalone binary + desktop shared-live host both attach one.
     pub store: Option<Arc<WebStore>>,
-    /// PR-S4 / CAP-1: the project-root boundary for the fs_api / git / skills /
-    /// search routes. Requests whose canonicalized target path resolves outside
-    /// this root are refused with `code: "OUTSIDE_ROOT"` (or `PATH_TRAVERSAL`
-    /// for explicit `..` components). On the desktop shared-live path it is
+    /// Operator opt-in: admit non-loopback peers on the loopback-guarded
+    /// write routes (fs/git/workspace/projects/host-state). Default `false`
+    /// (the CWE-306 guard stays on); set `true` only by the standalone
+    /// `termul-server` `--allow-remote-writes` flag. The desktop shared-live
+    /// host leaves this `false` (LAN clients stay view-only for mutations).
+    pub allow_remote_writes: bool,
+    /// Deployment-mode deny: when `true`, the write guard refuses ALL write
+    /// routes BEFORE evaluating the peer address or `allow_remote_writes`.
+    /// Set `true` by the desktop shared-live host — it binds localhost and a
+    /// cloudflared quick-tunnel forwards public traffic to it from a loopback
+    /// source, so `is_loopback()` cannot distinguish cloudflared-forwarded
+    /// requests from genuine local callers. The standalone `termul-server`
+    /// sets this `false` (its `--allow-remote-writes` opt-in is the
+    /// admission path there). Closes the cloudflared loopback bypass.
+    pub shared_live_writes_denied: bool,
+    /// PR-S4 / CAP-1: the project-root boundary for the routes that enforce it
+    /// (`/git/*`, `/skills`, `/search/content` via
+    /// `git_api::ensure_within_project_boundary`). The `/fs/*` routes are
+    /// intentionally NOT confined to this root (ADR-007 breadth); they reject
+    /// only `..` traversal (`PATH_TRAVERSAL`), not paths outside the root.
+    /// On the desktop shared-live path it is
     /// derived from the `ProjectRegistry`'s default (active) project at start,
     /// falling back to the user home dir when the registry is empty or its
     /// default project path is invalid (fails canonicalization); on the
@@ -3084,6 +3101,11 @@ impl Drop for PromptClaim {
     }
 }
 
+// `WsReply` is large (carries the full reply envelope); clippy 1.98's
+// `result_large_err` flags this. Suppress rather than box: `WsReply` is the
+// hot-path return type, boxing would add an allocation per WS reply. The
+// Err-variant size is acceptable here.
+#[allow(clippy::result_large_err)]
 async fn accept_send_prompt(
     id: String,
     payload: &Value,
