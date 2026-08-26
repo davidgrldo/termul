@@ -1,4 +1,5 @@
 import { Trash2 } from 'lucide-react'
+import { formatRelativeTimeFromMs } from '@/lib/git-time'
 import { cn } from '@/lib/utils'
 import { useAgentIcon, useAgentTemplateId } from '@/stores/acp-store'
 import { AgentGlyph } from './AgentGlyph'
@@ -37,7 +38,10 @@ interface ChatHistoryEntryRowProps {
   onOpen: (entry: ChatHistorySidebarEntry) => void
   onDelete: (id: string) => void
 }
-
+/**
+ * A single chat-history row for the sidebar `ChatHistoryTab`: agent icon, title,
+ * and a compact relative last-activity time (replacing the old message count).
+ */
 export function ChatHistoryEntryRow({
   entry,
   onOpen,
@@ -71,7 +75,9 @@ export function ChatHistoryEntryRow({
             <span className="text-3xs text-muted-foreground/70 shrink-0">{entry.agentName}</span>
           ) : null
         ) : (
-          <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
+          <span className="text-3xs text-muted-foreground">
+            {formatRelativeTimeFromMs(entry.lastActivityAt)}
+          </span>
         )}
       </button>
       {!entry.discovered && (

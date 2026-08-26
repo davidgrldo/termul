@@ -12,6 +12,7 @@ import {
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 import { clipboardApi, openerApi } from '@/lib/api'
+import { formatRelativeTimeFromMs } from '@/lib/git-time'
 import { openTerminalAtCwd } from '@/lib/terminal-spawn'
 import { cn } from '@/lib/utils'
 import { useAcpStore, useAgentIcon, useAgentTemplateId } from '@/stores/acp-store'
@@ -288,7 +289,10 @@ interface ProjectChatRowProps {
   onCopyPath: (cwd: string) => void
   onDelete: (entry: ProjectChatEntry) => void
 }
-
+/**
+ * A single per-project chat row: title + relative last-activity time, with a
+ * context menu (open terminal / file explorer / copy path / delete).
+ */
 function ProjectChatRow({
   entry,
   onOpen,
@@ -315,7 +319,9 @@ function ProjectChatRow({
           >
             <ChatRowIcon agentId={entry.agentId} agentConfigId={entry.agentConfigId} />
             <span className="truncate flex-1 text-sidebar-foreground">{entry.title}</span>
-            <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
+            <span className="text-3xs text-muted-foreground">
+              {formatRelativeTimeFromMs(entry.lastActivityAt)}
+            </span>
           </button>
           <button
             type="button"
