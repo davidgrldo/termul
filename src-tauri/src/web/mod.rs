@@ -23,6 +23,7 @@ pub mod install_api;
 pub mod log_api;
 pub mod mcp_probe_api;
 pub mod mcp_servers_api;
+pub mod mcp_oauth_api;
 pub mod search_api;
 pub mod skills_api;
 pub mod permissions;
@@ -273,6 +274,13 @@ pub async fn serve_router(
         store,
         cfg.allow_remote_writes,
         shared_live_writes_denied,
+        // The effective externally reachable origin for OAuth redirect URIs.
+        // The bound address is known here (before `router()` is called), so
+        // the callback route's `redirect_uri` uses it instead of the
+        // hardcoded loopback default. Desktop shared-live denies all OAuth
+        // control routes before this is read, so it stays `http://127.0.0.1`
+        // (harmless — never used).
+        format!("http://{}", addr),
     );
 
     let handle = tokio::spawn(async move {

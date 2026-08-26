@@ -1136,6 +1136,10 @@ impl AcpManager {
         };
 
         let outcome = async {
+            // Inject OAuth Bearer tokens into HTTP/SSE MCP server configs so
+            // authenticated servers (e.g., Mobbin) work in agent sessions.
+            let combined_mcp_servers = inject_oauth_tokens(combined_mcp_servers);
+
             gate_mcp_servers(&caps, &combined_mcp_servers)?;
             let tx = self.command_tx(agent_id)?;
             send_command(&tx, |reply| AcpCommand::NewSession {
@@ -1750,22 +1754,68 @@ fn stable_agent_namespace(config: &AgentConfig) -> Option<String> {
 
 /// Validate project/session MCP transports against negotiated capabilities.
 /// Stdio is mandatory in ACP; HTTP/SSE require their advertised flags.
-fn gate_mcp_servers(caps: &AgentCapabilities, servers: &[McpServer]) -> Result<(), String> {
-    for server in servers {
-        match server {
-            McpServer::Stdio(_) => {}
-            McpServer::Http(_) if caps.mcp_capabilities.http => {}
-            McpServer::Sse(_) if caps.mcp_capabilities.sse => {}
-            McpServer::Http(_) => {
-                return Err("agent does not support HTTP MCP servers".to_string());
-            }
-            McpServer::Sse(_) => {
-                return Err("agent does not support SSE MCP servers".to_string());
-            }
-            _ => return Err("agent does not support this MCP transport".to_string()),
+fn gate_mcp_servers(caps: &AgentCapabilities, servers: &[McpServer]) -> Result<(), String> { for server in servers {
+    match server {
+        McpServer::Stdio(_) => {}
+        McpServer::Http(_) if caps.mcp_capabilities.http => {}
+        McpServer::Sse(_) if caps.mcp_capabilities.sse => {}
+        McpServer::Http(_) => {
+            return Err("agent does not support HTTP MCP servers".to_string());
         }
+        McpServer::Sse(_) => {
+            return Err("agent does not support SSE MCP servers".to_string());
+        }
+        _ => return Err("agent does not support this MCP transport".to_string()),
     }
-    Ok(())
+}
+Ok(()) }
+
+/// Inject OAuth Bearer tokens into HTTP/SSE MCP server configs before `session/new`. The token is loaded from the file store (written by `acp_mcp_oauth_start`). Only injects if the server has no existing Authorization header — never overrides a user-configured token.
+fn inject_oauth_tokens(mcp_servers: Vec<McpServer>) -> Vec<McpServer> {
+    mcp_servers
+        .into_iter()
+        .map(|server| match server {
+            McpServer::Http(mut http) => {
+                if !http.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Authorization")) {
+                    match crate::acp::mcp_oauth::get_valid_token_blocking(&http.url) {
+                        Ok(Some(token)) => {
+                            http.headers.push(agent_client_protocol::schema::v1::HttpHeader::new(
+                                "Authorization",
+                                format!("Bearer {token}"),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
+                            );
+                        }
+                    }
+                }
+                McpServer::Http(http)
+            }
+            McpServer::Sse(mut sse) => {
+                if !sse.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Authorization")) {
+                    match crate::acp::mcp_oauth::get_valid_token_blocking(&sse.url) {
+                        Ok(Some(token)) => {
+                            sse.headers.push(agent_client_protocol::schema::v1::HttpHeader::new(
+                                "Authorization",
+                                format!("Bearer {token}"),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
+                            );
+                        }
+                    }
+                }
+                McpServer::Sse(sse)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Build the internal `termul` MCP server config (for the `plan` tool; stdio self-spawn) to
