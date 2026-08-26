@@ -8,12 +8,14 @@ import {
   CMD_PILL_NODE,
   docOffsetToDisplayOffset,
   docToDisplayText,
+  FILE_PILL_NODE,
   SKILL_PILL_NODE
 } from '@/lib/composer/doc-to-prompt'
 import { draftFromTokens } from '@/lib/composer/draft-from-tokens'
 import { logFrontendError } from '@/lib/log-api'
 import { cn } from '@/lib/utils'
 import { CommandPill } from './CommandPillNode'
+import { FilePill } from './FilePillNode'
 import { SkillPill } from './SkillPillNode'
 
 export interface ChatComposerEditorProps {
@@ -137,7 +139,8 @@ function createComposerKeymap(
                     if (
                       prevNode &&
                       (prevNode.type.name === SKILL_PILL_NODE ||
-                        prevNode.type.name === CMD_PILL_NODE)
+                        prevNode.type.name === CMD_PILL_NODE ||
+                        prevNode.type.name === FILE_PILL_NODE)
                     ) {
                       before = prevNode
                       probePos = probePos - 1
@@ -145,7 +148,9 @@ function createComposerKeymap(
                   }
                   if (
                     before &&
-                    (before.type.name === SKILL_PILL_NODE || before.type.name === CMD_PILL_NODE)
+                    (before.type.name === SKILL_PILL_NODE ||
+                      before.type.name === CMD_PILL_NODE ||
+                      before.type.name === FILE_PILL_NODE)
                   ) {
                     event.preventDefault()
                     // Delete the pill + any trailing space the splicer appended
@@ -251,6 +256,7 @@ export function ChatComposerEditor({
       extensions: [
         SkillPill,
         CommandPill,
+        FilePill,
         createComposerKeymap(beforeKeyDownRef),
         Placeholder.configure({
           placeholder: () => placeholderRef.current,
@@ -301,7 +307,8 @@ export function ChatComposerEditor({
           // paste (no sentinel) falls through to ProseMirror's default (text
           // nodes). The skill sentinel `\uE000` and the command sentinel
           // `\uE004` both trigger the pill-paste path.
-          if (!text.includes('\uE000') && !text.includes('\uE004')) return false
+          if (!text.includes('\uE000') && !text.includes('\uE004') && !text.includes('\uE006'))
+            return false
           event.preventDefault()
           try {
             const parsed = view.state.schema.nodeFromJSON(
