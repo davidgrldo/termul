@@ -3,6 +3,7 @@ mod acp;
 mod acp_binary_install;
 mod acp_registry_snapshot;
 mod agent_registry;
+mod agentation;
 mod browser_tab_manager;
 mod commands;
 mod logging;
@@ -45,6 +46,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_store::StoreExt;
 
 #[cfg(not(target_os = "linux"))]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -1050,8 +1052,48 @@ pub fn run() {
 
             // Create Browser Tab Manager
             let browser_tab_manager =
-                Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
-            app.manage(browser_tab_manager);
+            Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
+            app.manage(browser_tab_manager.clone());
+
+            // Load persisted agentation enabled preference (issue #451 CodeRabbit).
+            // Falls back to true (enabled by default) when no stored value exists.
+            if let Ok(store) = handle.store("settings.json") {
+                let enabled = store
+                    .get("agentation/enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                browser_tab_manager.set_agentation_enabled(enabled);
+                log::info!("[agentation] loaded persisted enabled={}", enabled);
+            }
+            // Start the agentation annotation service (issue #451, Epic 1).
+            // Spawns the axum HTTP/SSE server on a dynamic port and opens SQLite.
+            // The endpoint is wired to BrowserTabManager for toolbar injection.
+            {
+                let app_data = handle
+                    .path()
+                    .app_data_dir()
+                    .map_err(|e| format!("agentation: app_data_dir: {e}"))?;
+                let db_path = agentation::db_path(&app_data);
+                match tauri::async_runtime::block_on(agentation::AgentationService::start(&db_path)) {
+                    Ok(service) => {
+                        let port = service.http_port();
+                        let endpoint = format!("http://127.0.0.1:{port}");
+
+                        // Wire the endpoint into the browser tab manager
+                        if let Some(bt_manager) =
+                            app.try_state::<Arc<browser_tab_manager::BrowserTabManager>>()
+                        {
+                            bt_manager.set_agentation_endpoint(endpoint);
+                        }
+
+                        app.manage(service);
+                        log::info!("[agentation] service started");
+                    }
+                    Err(e) => {
+                        log::error!("[agentation] failed to start service: {e}");
+                    }
+                }
+            }
 
             // Desktop renderer chat history lives outside tauri-plugin-store so
             // loading unrelated preferences never materializes full transcripts
@@ -1506,17 +1548,12 @@ pub fn run() {
             commands::browser_tab_go_forward,
             commands::browser_tab_reload,
             commands::browser_tab_open_devtools,
-            commands::browser_tab_inject_annotation,
-            commands::browser_tab_remove_annotation_overlay,
-            commands::browser_tab_inject_annotation_markers,
-            commands::browser_tab_update_annotation_marker_selection,
             // Browser tab URL sync commands (called by injected JS)
             commands::browser_tab_report_url,
             commands::browser_tab_report_loaded,
-            commands::browser_tab_report_region_captured,
-            commands::browser_tab_report_element_captured,
             commands::browser_tab_report_title,
-            commands::browser_tab_report_annotation_marker_clicked,
+            // Agentation toolbar injection (on-demand)
+            commands::browser_tab_inject_agentation,
             // Worktree commands
             commands::worktree_list,
             commands::worktree_create,
@@ -1662,6 +1699,18 @@ pub fn run() {
             commands::workspace_manifest_get,
             commands::workspace_manifest_write,
             commands::workspace_manifest_delete,
+            // Agentation annotation service (issue #451, Epic 1)
+            agentation::agentation_create_session,
+            agentation::agentation_list_sessions,
+            agentation::agentation_get_session,
+            agentation::agentation_get_pending,
+            agentation::agentation_get_all_pending,
+            agentation::agentation_acknowledge,
+            agentation::agentation_resolve,
+            agentation::agentation_dismiss,
+            agentation::agentation_reply,
+            agentation::agentation_set_enabled,
+            agentation::agentation_is_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
