@@ -15,6 +15,7 @@ import { useAcpMessages, useAcpSession, useAcpStore, usePromptQueue } from '@/st
 import { isAgentDeadError } from '@/stores/prompt-queue-orchestration'
 import { AgentConnectionLamp } from './AgentConnectionLamp'
 import { AskUserQuestion } from './AskUserQuestion'
+import { ChatChangedFilesPanel } from './ChatChangedFilesPanel'
 import { ChatErrorNotice } from './ChatErrorNotice'
 import { ChatInputBar } from './ChatInputBar'
 import { ChatMessageList } from './ChatMessageList'
@@ -94,6 +95,10 @@ export function AgentChatPanel({
   )
   const commands = useAcpStore((s) => s.commands[sessionId] ?? EMPTY_COMMANDS)
   const toolCalls = useAcpStore((s) => s.toolCalls[sessionId] ?? EMPTY_TOOL_CALLS)
+  const hasFileChanges = useMemo(
+    () => toolCalls.some((t) => t.kind === 'edit' || t.kind === 'delete' || t.kind === 'move'),
+    [toolCalls]
+  )
   const plan = useAcpStore((s) => s.plans[sessionId] ?? EMPTY_PLAN)
   // The oldest pending permission for THIS session (resolve one to reveal the next).
   const pendingPermission = useAcpStore(
@@ -501,28 +506,32 @@ export function AgentChatPanel({
       {pendingQuestion && !isClosed ? (
         <AskUserQuestion key={pendingQuestion.questionId} question={pendingQuestion} />
       ) : (
-        <ChatInputBar
-          session={session}
-          projectRoot={skillsProjectRoot}
-          busy={session.activeTurn}
-          disabled={isClosed}
-          imageCapable={imageCapable}
-          embedCapable={embedCapable}
-          onSend={handleSend}
-          onSendBlocks={handleSendBlocks}
-          onCancel={handleCancel}
-          queue={promptQueue}
-          onRemoveQueued={handleRemoveQueued}
-          onSendQueuedNow={handleSendQueuedNow}
-          commands={commands}
-          configOptions={session.configOptions}
-          modes={session.modes}
-          onSetConfig={handleSetConfig}
-          onSetMode={handleSetMode}
-          onSetModel={handleSetModel}
-          seedText={seed?.text}
-          seedNonce={seed?.nonce}
-        />
+        <>
+          <ChatChangedFilesPanel cwd={session.cwd} toolCalls={toolCalls} />
+          <ChatInputBar
+            session={session}
+            projectRoot={skillsProjectRoot}
+            busy={session.activeTurn}
+            disabled={isClosed}
+            imageCapable={imageCapable}
+            embedCapable={embedCapable}
+            onSend={handleSend}
+            onSendBlocks={handleSendBlocks}
+            onCancel={handleCancel}
+            queue={promptQueue}
+            onRemoveQueued={handleRemoveQueued}
+            onSendQueuedNow={handleSendQueuedNow}
+            commands={commands}
+            configOptions={session.configOptions}
+            modes={session.modes}
+            onSetConfig={handleSetConfig}
+            onSetMode={handleSetMode}
+            onSetModel={handleSetModel}
+            seedText={seed?.text}
+            seedNonce={seed?.nonce}
+            compactTop={hasFileChanges}
+          />
+        </>
       )}
       {pendingPermission && !isClosed && <PermissionDialog permission={pendingPermission} />}
     </div>
