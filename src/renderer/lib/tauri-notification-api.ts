@@ -91,6 +91,11 @@ async function performInitNotificationPermissions(): Promise<void> {
   }
 }
 
+export type DesktopNotificationOptions = {
+  /** Web Notifications `onclick`. Desktop OS click still focuses the app. */
+  onClick?: () => void
+}
+
 /**
  * Send a desktop notification.
  * No-op if permission was denied or not yet initialized.
@@ -98,7 +103,11 @@ async function performInitNotificationPermissions(): Promise<void> {
  * @param title - Notification title (e.g., project name)
  * @param body - Notification body text (e.g., terminal name)
  */
-export async function sendDesktopNotification(title: string, body: string): Promise<void> {
+export async function sendDesktopNotification(
+  title: string,
+  body: string,
+  options?: DesktopNotificationOptions
+): Promise<void> {
   if (permissionGranted === null) {
     // Permission not yet initialized — try to init now
     await initNotificationPermissions()
@@ -125,7 +134,13 @@ export async function sendDesktopNotification(title: string, body: string): Prom
   if (typeof Notification === 'undefined') return
 
   try {
-    new Notification(title, { body })
+    const notification = new Notification(title, { body })
+    if (options?.onClick && notification && typeof notification === 'object') {
+      notification.onclick = () => {
+        window.focus()
+        options.onClick?.()
+      }
+    }
   } catch (error) {
     // Swallow — best-effort facade. A notification failure must never throw.
     console.error('[Notification] Failed to send web notification:', error)

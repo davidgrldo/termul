@@ -193,6 +193,22 @@ describe('tauri-notification-api (web vs desktop branch)', () => {
   })
 
   describe('sendDesktopNotification', () => {
+    it('web: wires Notification.onclick when onClick is provided', async () => {
+      mockIsTauriContext.mockReturnValue(false)
+      mockNotificationRequestPermission.mockResolvedValue('granted')
+      await initNotificationPermissions()
+      const onClick = vi.fn()
+
+      await sendDesktopNotification('Project', 'term — idle', { onClick })
+
+      const instance = (
+        NotificationStub as unknown as { mock: { instances: Array<{ onclick: () => void }> } }
+      ).mock.instances[0]
+      expect(instance.onclick).toEqual(expect.any(Function))
+      instance.onclick()
+      expect(onClick).toHaveBeenCalledTimes(1)
+    })
+
     it('web: calls new Notification(title, { body }) when permissionGranted', async () => {
       mockIsTauriContext.mockReturnValue(false)
       mockNotificationRequestPermission.mockResolvedValue('granted')
