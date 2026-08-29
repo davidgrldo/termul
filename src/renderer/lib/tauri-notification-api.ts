@@ -15,6 +15,7 @@ import {
   requestPermission,
   sendNotification
 } from '@tauri-apps/plugin-notification'
+import { logFrontendError } from './log-api'
 import { isTauriContext } from './tauri-runtime'
 
 /** Cached permission state to avoid repeated OS prompts */
@@ -137,8 +138,19 @@ export async function sendDesktopNotification(
     const notification = new Notification(title, { body })
     if (options?.onClick && notification && typeof notification === 'object') {
       notification.onclick = () => {
-        window.focus()
-        options.onClick?.()
+        // Runs after the outer try has returned, so it needs its own boundary:
+        // an unhandled throw here would be lost with DevTools closed.
+        try {
+          window.focus()
+          options.onClick?.()
+        } catch (error) {
+          void logFrontendError({
+            level: 'warn',
+            message: error instanceof Error ? error.message : String(error),
+            source: 'tauri-notification-api:onclick',
+            stack: error instanceof Error ? error.stack : undefined
+          })
+        }
       }
     }
   } catch (error) {

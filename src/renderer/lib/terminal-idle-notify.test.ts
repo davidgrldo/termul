@@ -35,6 +35,18 @@ describe('terminal idle notify state machine', () => {
     expect(evaluateTerminalIdleNotify(state, afterQuiet, opts).kind).toBe('none')
   })
 
+  it('does not count the quiet stretch toward the busy threshold', () => {
+    // Output spans only minBusyMs - quietMs, so the burst is too short even
+    // though the wall-clock gap from the first chunk reaches minBusyMs.
+    const lastOutput = TERMINAL_IDLE_NOTIFY_MIN_BUSY_MS - TERMINAL_IDLE_NOTIFY_QUIET_MS
+    let state = createTerminalIdleNotifyState()
+    state = recordTerminalOutput(state, 0)
+    state = recordTerminalOutput(state, lastOutput)
+    const now = lastOutput + TERMINAL_IDLE_NOTIFY_QUIET_MS
+    expect(now).toBe(TERMINAL_IDLE_NOTIFY_MIN_BUSY_MS)
+    expect(evaluateTerminalIdleNotify(state, now, opts).kind).toBe('none')
+  })
+
   it('notifies after a long busy period then quiet', () => {
     let state = createTerminalIdleNotifyState()
     state = recordTerminalOutput(state, 0)

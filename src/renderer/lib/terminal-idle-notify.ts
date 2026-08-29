@@ -52,7 +52,9 @@ export function evaluateTerminalIdleNotify(
   if (now - lastOutputAt < opts.quietMs) {
     return { kind: 'none', next: state }
   }
-  if (now - busySince < opts.minBusyMs) {
+  // Span of actual output, not wall-clock: `now` already includes `quietMs`, so
+  // using it here would let a burst reach the threshold while sitting silent.
+  if (lastOutputAt - busySince < opts.minBusyMs) {
     return { kind: 'none', next: idle }
   }
   return { kind: 'notify', next: idle }
