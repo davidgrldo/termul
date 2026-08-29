@@ -42,7 +42,11 @@ vi.mock('@/lib/acp-history-persistence', async (orig) => {
     // Read-through the module-level cache so tests can seed payloads via
     // setCachedSessionPayload (preferred over per-test mockResolvedValue).
     loadSessionPayload: vi.fn(async (id: string) => actual.getCachedSessionPayload(id) ?? null),
-    deleteSessionPayload: vi.fn(async () => {})
+    // Tail-first: the store calls `loadSessionPayloadTail` first, then falls
+    // back to `loadSessionPayload`. Mock both to the same cache-backed fn so
+    // per-test `mockResolvedValueOnce` on `loadSessionPayload` still fires
+    // (the tail mock returns null when no cache is seeded → fallback runs).
+    loadSessionPayloadTail: vi.fn(async () => null)
   }
 })
 vi.mock('@/lib/acp-mcp-persistence', async (orig) => {
@@ -5195,7 +5199,7 @@ describe('acp-store multi-project isolation', () => {
       configToLiveAgent: { ...s.configToLiveAgent, [agentReuseKey('cfg-1', '/b')]: 'agent-b' }
     }))
     const identity = selectAgentIdentity(useAcpStore.getState(), 'agent-b')
-    expect(identity).toEqual({ name: 'Claude', templateId: 'claude-acp' })
+    expect(identity).toEqual({ name: 'Claude', templateId: 'claude-acp', icon: null })
   })
 
   it('selectAgentIdentity falls back to sessionIndex agentConfigId when live map is cold', async () => {
@@ -5225,7 +5229,7 @@ describe('acp-store multi-project isolation', () => {
       ]
     })
     const identity = selectAgentIdentity(useAcpStore.getState(), 'agent-hist')
-    expect(identity).toEqual({ name: 'Cursor', templateId: 'cursor' })
+    expect(identity).toEqual({ name: 'Cursor', templateId: 'cursor', icon: null })
   })
 
   it('agent_error with session_id sets lastError on that session', () => {

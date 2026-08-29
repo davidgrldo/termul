@@ -3,6 +3,7 @@ mod acp;
 mod acp_binary_install;
 mod acp_registry_snapshot;
 mod agent_registry;
+mod agentation;
 mod browser_tab_manager;
 mod commands;
 mod logging;
@@ -45,6 +46,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_store::StoreExt;
 
 #[cfg(not(target_os = "linux"))]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -452,6 +454,51 @@ fn get_main_webview_window<R: tauri::Runtime>(
 ) -> Result<tauri::WebviewWindow<R>, String> {
     app.get_webview_window("main")
         .ok_or_else(|| "Main webview window not found".to_string())
+}
+/// Defense-in-depth navigation policy for the main app webview (issue #406).
+///
+/// The primary chat-link interception already lives in the renderer
+/// (Streamdown + the global context-menu block from #623), so a stray
+/// `<a href>` left-click is routed to the system browser before the WebView
+/// can navigate. This native guard is the backstop: even if a future markdown
+/// change regresses the renderer path, the main window can never be torn down
+/// by a top-level navigation to an external URL.
+///
+/// Only the `main` webview is restricted. Browser-tab webviews (created with
+/// dynamic labels in `browser_tab_manager::create`) intentionally load
+/// external URLs and must stay unrestricted — the policy gates on `label()`.
+///
+/// Allowed: the app's own document/scheme (`tauri`, `tauri-index.html`), the
+/// IPC bridge (`ipc`), `blob:` object URLs the renderer emits, the Windows
+/// production app origin (`http://tauri.localhost` — Tauri 2's default when
+/// `useHttpsScheme` is unset, which this project does not override), and
+/// dev-server pages (`http(s)://localhost`/`127.0.0.1` while `cfg!(dev)`).
+/// Everything else (an external `https://example.com` from a chat link, or an
+/// active `data:text/html,<script>` document) is rejected so the WebView
+/// stays on the SPA. `data:` is deliberately excluded: a top-level navigation
+/// to `data:text/html` replaces the SPA document, and `<img src="data:">` is a
+/// resource load (not navigation), so excluding it here does not break images.
+fn main_webview_allows_navigation(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "ipc" | "blob" => true,
+        "http" | "https" => {
+            // Windows production origin: Tauri 2 serves the SPA at
+            // http://tauri.localhost (no explicit port) on Windows in
+            // packaged builds (no useHttpsScheme override). macOS/Linux
+            // use the `tauri` scheme, handled above. Only the exact
+            // Windows HTTP origin is allowed — not HTTPS, not an explicit
+            // port, and not on non-Windows targets.
+            if cfg!(all(not(dev), target_os = "windows"))
+                && url.scheme() == "http"
+                && url.host_str() == Some("tauri.localhost")
+                && url.port().is_none()
+            {
+                return true;
+            }
+            cfg!(dev) && matches!(url.host_str(), Some("localhost") | Some("127.0.0.1"))
+        }
+        _ => false,
+    }
 }
 
 fn set_zoom_factor<R: tauri::Runtime>(
@@ -992,6 +1039,32 @@ pub fn run() {
     // MCP Bridge in all builds
     builder = builder.plugin(tauri_plugin_mcp_bridge::init());
 
+    // Defense-in-depth: reject top-level navigation on the main app webview so
+    // a stray chat-link click (or any external anchor) can never tear down the
+    // SPA (issue #406). Only the `main` webview is restricted — browser-tab
+    // webviews load external URLs by design and stay unrestricted.
+    builder = builder.plugin(tauri::plugin::Builder::<_, ()>::new("main-navigation-guard")
+        .on_navigation(|webview, url| {
+            if webview.label() == "main" {
+                let allow = main_webview_allows_navigation(url);
+                if !allow {
+                    // Log only the scheme and host — a blocked URL's query,
+                    // fragment, or userinfo may carry secrets/PII (CWE-532).
+                    let scheme = url.scheme();
+                    let host = url.host_str().unwrap_or("(unknown)");
+                    log::warn!(
+                        "[navigation] blocked top-level navigation on main webview: {}://{}",
+                        scheme,
+                        host
+                    );
+                }
+                allow
+            } else {
+                true
+            }
+        })
+        .build());
+
     let app = builder
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1050,8 +1123,48 @@ pub fn run() {
 
             // Create Browser Tab Manager
             let browser_tab_manager =
-                Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
-            app.manage(browser_tab_manager);
+            Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
+            app.manage(browser_tab_manager.clone());
+
+            // Load persisted agentation enabled preference (issue #451 CodeRabbit).
+            // Falls back to true (enabled by default) when no stored value exists.
+            if let Ok(store) = handle.store("settings.json") {
+                let enabled = store
+                    .get("agentation/enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                browser_tab_manager.set_agentation_enabled(enabled);
+                log::info!("[agentation] loaded persisted enabled={}", enabled);
+            }
+            // Start the agentation annotation service (issue #451, Epic 1).
+            // Spawns the axum HTTP/SSE server on a dynamic port and opens SQLite.
+            // The endpoint is wired to BrowserTabManager for toolbar injection.
+            {
+                let app_data = handle
+                    .path()
+                    .app_data_dir()
+                    .map_err(|e| format!("agentation: app_data_dir: {e}"))?;
+                let db_path = agentation::db_path(&app_data);
+                match tauri::async_runtime::block_on(agentation::AgentationService::start(&db_path)) {
+                    Ok(service) => {
+                        let port = service.http_port();
+                        let endpoint = format!("http://127.0.0.1:{port}");
+
+                        // Wire the endpoint into the browser tab manager
+                        if let Some(bt_manager) =
+                            app.try_state::<Arc<browser_tab_manager::BrowserTabManager>>()
+                        {
+                            bt_manager.set_agentation_endpoint(endpoint);
+                        }
+
+                        app.manage(service);
+                        log::info!("[agentation] service started");
+                    }
+                    Err(e) => {
+                        log::error!("[agentation] failed to start service: {e}");
+                    }
+                }
+            }
 
             // Desktop renderer chat history lives outside tauri-plugin-store so
             // loading unrelated preferences never materializes full transcripts
@@ -1506,17 +1619,12 @@ pub fn run() {
             commands::browser_tab_go_forward,
             commands::browser_tab_reload,
             commands::browser_tab_open_devtools,
-            commands::browser_tab_inject_annotation,
-            commands::browser_tab_remove_annotation_overlay,
-            commands::browser_tab_inject_annotation_markers,
-            commands::browser_tab_update_annotation_marker_selection,
             // Browser tab URL sync commands (called by injected JS)
             commands::browser_tab_report_url,
             commands::browser_tab_report_loaded,
-            commands::browser_tab_report_region_captured,
-            commands::browser_tab_report_element_captured,
             commands::browser_tab_report_title,
-            commands::browser_tab_report_annotation_marker_clicked,
+            // Agentation toolbar injection (on-demand)
+            commands::browser_tab_inject_agentation,
             // Worktree commands
             commands::worktree_list,
             commands::worktree_create,
@@ -1625,6 +1733,9 @@ pub fn run() {
             acp::commands::acp_set_session_reopen_timeout,
             acp::commands::acp_set_first_prompt_warmup_timeout,
             acp::commands::acp_probe_mcp_server,
+            acp::commands::acp_mcp_oauth_start,
+            acp::commands::acp_mcp_oauth_has_token,
+            acp::commands::acp_mcp_oauth_disconnect,
             // CAP-6 / Story 8: ACP catalog (host-owned resolution).
             acp::commands::acp_list_catalog,
             acp::commands::acp_set_catalog_opt_in,
@@ -1650,6 +1761,7 @@ pub fn run() {
             commands::acp_history_list,
             commands::acp_history_get,
             commands::acp_history_save,
+            commands::acp_history_get_tail,
             commands::acp_history_delete,
             commands::acp_history_flush,
             commands::acp_history_mark_legacy_import_complete,
@@ -1661,6 +1773,18 @@ pub fn run() {
             commands::workspace_manifest_get,
             commands::workspace_manifest_write,
             commands::workspace_manifest_delete,
+            // Agentation annotation service (issue #451, Epic 1)
+            agentation::agentation_create_session,
+            agentation::agentation_list_sessions,
+            agentation::agentation_get_session,
+            agentation::agentation_get_pending,
+            agentation::agentation_get_all_pending,
+            agentation::agentation_acknowledge,
+            agentation::agentation_resolve,
+            agentation::agentation_dismiss,
+            agentation::agentation_reply,
+            agentation::agentation_set_enabled,
+            agentation::agentation_is_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1886,5 +2010,87 @@ mod tests {
     fn test_git_bash_shell_display_name() {
         let display_name = shell_display_name("git-bash");
         assert_eq!(display_name, "Git Bash");
+    }
+    #[test]
+    fn test_main_webview_allows_app_internal_schemes() {
+        assert!(main_webview_allows_navigation(&"tauri://localhost".parse().unwrap()));
+        assert!(main_webview_allows_navigation(&"ipc://localhost".parse().unwrap()));
+        assert!(main_webview_allows_navigation(&"blob:https://termul.app/".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_main_webview_allows_windows_production_origin_in_release() {
+        // Tauri 2 serves the SPA at http://tauri.localhost (no explicit port)
+        // on Windows in packaged builds (no useHttpsScheme override in
+        // tauri.conf.json). The policy must allow this exact origin or the
+        // main webview stays blank.
+        let windows_app_origin = "http://tauri.localhost/tauri-index.html"
+            .parse::<tauri::Url>()
+            .unwrap();
+        if cfg!(all(not(dev), target_os = "windows")) {
+            assert!(main_webview_allows_navigation(&windows_app_origin));
+        } else {
+            // In dev (Vite on localhost) or on non-Windows release (uses the
+            // `tauri` scheme, not tauri.localhost), the Windows origin must
+            // be rejected.
+            assert!(!main_webview_allows_navigation(&windows_app_origin));
+        }
+
+        // The exact-origin restriction: HTTPS, explicit ports, and the same
+        // host on a non-Windows target are all rejected. These hold
+        // regardless of dev/release because the allow-list gates on
+        // cfg!(all(not(dev), target_os = "windows")).
+        assert!(!main_webview_allows_navigation(
+            &"https://tauri.localhost/tauri-index.html".parse().unwrap()
+        ));
+        assert!(!main_webview_allows_navigation(
+            &"http://tauri.localhost:8080/tauri-index.html".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_main_webview_allows_dev_localhost_only_when_dev() {
+        // The dev allowance is a compile-time gate. In a dev build, localhost
+        // navigations are allowed (Vite dev server); in a release build they
+        // are rejected because the main webview is the SPA document only
+        // (Windows release uses tauri.localhost, tested above).
+        let localhost = "http://localhost:5180/tauri-index.html"
+            .parse::<tauri::Url>()
+            .unwrap();
+        let external = "https://example.com".parse::<tauri::Url>().unwrap();
+
+        if cfg!(dev) {
+            assert!(main_webview_allows_navigation(&localhost));
+            // External URLs are still blocked in dev so a chat link cannot
+            // tear down the SPA — only the local dev server is trusted.
+            assert!(!main_webview_allows_navigation(&external));
+        } else {
+            assert!(!main_webview_allows_navigation(&localhost));
+            assert!(!main_webview_allows_navigation(&external));
+        }
+    }
+
+    #[test]
+    fn test_main_webview_rejects_active_data_documents() {
+        // A top-level navigation to data:text/html can replace the SPA with an
+        // active document (arbitrary inline script). Reject it. Note: this
+        // does not affect <img src="data:"> resource loads, only navigation.
+        assert!(!main_webview_allows_navigation(
+            &"data:text/html,<script>alert(1)</script>"
+                .parse()
+                .unwrap()
+        ));
+        assert!(!main_webview_allows_navigation(&"data:text/plain,hello".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_main_webview_rejects_external_urls() {
+        // The core invariant of issue #406: a chat-link click to an external
+        // site must never replace the app. This holds in both dev and release.
+        assert!(!main_webview_allows_navigation(&"https://example.com".parse().unwrap()));
+        assert!(!main_webview_allows_navigation(&"https://tauri.app/guide".parse().unwrap()));
+        assert!(!main_webview_allows_navigation(&"http://example.com".parse().unwrap()));
+        assert!(!main_webview_allows_navigation(&"ftp://example.com".parse().unwrap()));
+        assert!(!main_webview_allows_navigation(&"market://details?id=app".parse().unwrap()));
     }
 }

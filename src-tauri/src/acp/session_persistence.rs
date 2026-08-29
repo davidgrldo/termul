@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::acp::atomic_file;
-
+use crate::path_validation::strip_verbatim_prefix;
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 const INDEX_FILE: &str = "sessions.json";
 const METADATA_FILE: &str = "metadata.json";
@@ -326,15 +326,10 @@ impl SessionPersistence {
         &self,
         registration: SessionRegistration,
     ) -> Result<SessionMetadata> {
-        let cwd = registration
-            .cwd
-            .canonicalize()
-            .map_err(SessionPersistenceError::Io)?;
-        if !cwd.is_dir() {
-            return Err(SessionPersistenceError::Io(io::Error::other(
-                "session cwd is not a directory",
-            )));
-        }
+        // Idempotent catalog check BEFORE path validation: a duplicate
+        // registration must return the existing entry even when its cwd is
+        // unavailable (deleted between calls). Canonicalizing first would
+        // surface an `Io` error for a path the session was never going to use.
         let _guard = self.inner.registration_lock.lock().await;
         if self
             .inner
@@ -344,6 +339,22 @@ impl SessionPersistence {
         {
             return self.metadata(&registration.session_id);
         }
+        let canonical = registration
+            .cwd
+            .canonicalize()
+            .map_err(SessionPersistenceError::Io)?;
+        if !canonical.is_dir() {
+            return Err(SessionPersistenceError::Io(io::Error::other(
+                "session cwd is not a directory",
+            )));
+        }
+        // `canonicalize()` prepends the `\\?\` verbatim prefix on Windows.
+        // Strip it so the persisted `cwd` stays tool-friendly (matches every
+        // other canonicalize call site via `strip_verbatim_prefix`). Without
+        // this, `session/resume` passes `\\?\E:\…` to the agent, whose cwd→dir
+        // sanitizer keeps the `?` → an illegal Windows folder name → `mkdir`
+        // fails with ENOENT and the resume is skipped (read-only transcript).
+        let cwd = strip_verbatim_prefix(&canonical.to_string_lossy()).into_owned();
         let storage_key = Uuid::new_v4().to_string();
         let now = now_millis();
         let metadata = SessionMetadata {
@@ -353,7 +364,7 @@ impl SessionPersistence {
             stable_agent_namespace: registration.stable_agent_namespace,
             runtime_agent_id: registration.runtime_agent_id,
             project_id: registration.project_id,
-            cwd: cwd.to_string_lossy().into_owned(),
+            cwd: cwd.clone(),
             title: None,
             title_source: None,
             created_at: now,
@@ -374,6 +385,11 @@ impl SessionPersistence {
             let _ = fs::remove_dir_all(self.session_dir(&metadata.storage_key)?);
             return Err(error);
         }
+        log::info!(
+            "[acp-history] session registered storage_key={} session_id={}",
+            metadata.storage_key,
+            crate::logging::redact_session_id(&metadata.session_id)
+        );
         Ok(metadata)
     }
 
@@ -387,7 +403,7 @@ impl SessionPersistence {
         updated_at: Option<u64>,
     ) -> Result<SessionMetadata> {
         let session_id = registration.session_id.trim();
-        let cwd = registration.cwd.to_string_lossy();
+        let cwd = strip_verbatim_prefix(&registration.cwd.to_string_lossy()).into_owned();
         if session_id.is_empty() || cwd.trim().is_empty() {
             return Err(SessionPersistenceError::Io(io::Error::other(
                 "discovered session id and cwd are required",
@@ -437,9 +453,9 @@ impl SessionPersistence {
             storage_key,
             session_id: session_id.to_string(),
             stable_agent_namespace: registration.stable_agent_namespace,
-            runtime_agent_id: registration.runtime_agent_id,
             project_id: registration.project_id,
-            cwd: cwd.into_owned(),
+            runtime_agent_id: registration.runtime_agent_id,
+            cwd: cwd.clone(),
             title: normalized_title,
             title_source,
             created_at: now,
@@ -462,6 +478,11 @@ impl SessionPersistence {
             let _ = fs::remove_dir_all(self.session_dir(&metadata.storage_key)?);
             return Err(error);
         }
+        log::info!(
+            "[acp-history] discovered session registered storage_key={} session_id={}",
+            metadata.storage_key,
+            crate::logging::redact_session_id(&metadata.session_id)
+        );
         Ok(metadata)
     }
 
@@ -498,7 +519,7 @@ impl SessionPersistence {
             stable_agent_namespace: registration.stable_agent_namespace,
             runtime_agent_id: registration.runtime_agent_id,
             project_id: registration.project_id,
-            cwd: registration.cwd.to_string_lossy().into_owned(),
+            cwd: strip_verbatim_prefix(&registration.cwd.to_string_lossy()).into_owned(),
             title,
             title_source: None,
             created_at,
@@ -519,6 +540,11 @@ impl SessionPersistence {
             let _ = fs::remove_dir_all(self.session_dir(&metadata.storage_key)?);
             return Err(error);
         }
+        log::info!(
+            "[acp-history] imported session registered storage_key={} session_id={}",
+            metadata.storage_key,
+            crate::logging::redact_session_id(&metadata.session_id)
+        );
         Ok(metadata)
     }
 
@@ -816,6 +842,114 @@ impl SessionPersistence {
         *self.replay_hook.lock() = Some(hook);
     }
 
+    /// Tail-first replay: reads only the last `limit` message records from
+    /// `messages.jsonl` (via [`load_jsonl_tail`]) plus ALL tool-call records
+    /// from `tool-calls.jsonl` (bounded by the persist-time limit of 500),
+    /// filters tool calls to those whose `seq` ≥ the oldest tail message seq,
+    /// and merges + sorts. Returns a seq-sorted `Vec<PersistedEventRecord>`
+    /// covering only the tail — the caller folds these into messages.
+    ///
+    /// After loading the tail records, scans backward to verify the first
+    /// message record is at a fold boundary (`user_prompt`, `tool_call`, or
+    /// `prompt_complete`). If the first message record is a `message_chunk`
+    /// with no preceding boundary in the loaded set, it may be a continuation
+    /// of an earlier coalesced run — fall back to a full replay so the tail
+    /// fold produces correct bubble ids matching the full materialize.
+    pub fn replay_tail(&self, session_id: &str, limit: usize) -> Result<Vec<PersistedEventRecord>> {
+        let metadata = self.metadata(session_id)?;
+        let dir = self.session_dir(&metadata.storage_key)?;
+        let messages_path = dir.join(MESSAGES_FILE);
+        let tool_calls_path = dir.join(TOOL_CALLS_FILE);
+        // Read the last `limit * 4` message lines — only the tail of the file
+        // is deserialized, not the full transcript.
+        let max_lines = limit.saturating_mul(4).max(limit + 4);
+        let mut records = load_jsonl_tail(&messages_path, session_id, max_lines)?;
+        // Tool calls are bounded at persist time (PERSISTED_TOOL_CALLS_LIMIT
+        // = 500), so reading all of them is cheap. Filter to those whose seq
+        // falls within the tail message range after the records are sorted.
+        records.extend(load_jsonl(&tool_calls_path, session_id, false)?);
+        validate_and_sort(&mut records)?;
+        // Determine the oldest message-record seq in the tail so tool calls
+        // older than the tail are dropped (they belong to scrolled-away
+        // messages the renderer no longer shows).
+        let oldest_tail_seq = records
+            .iter()
+            .filter(|r| !is_tool_event(&r.type_))
+            .map(|r| r.seq)
+            .min()
+            .unwrap_or(0);
+        // Keep tool calls within the tail range; keep all message records
+        // (the tail scan already bounded them). Tool calls with no seq (a
+        // corrupt edge) are always retained — the renderer tolerates them.
+        records.retain(|r| !is_tool_event(&r.type_) || r.seq >= oldest_tail_seq);
+        // Fold-boundary check: if the first message record is a
+        // `message_chunk`, it may be a continuation of an earlier coalesced
+        // run that started before the loaded tail. The fold would assign it a
+        // fresh bubble id (`snapshot:<role>:<seq>`) that differs from the
+        // full-fold's id (where it was merged into an earlier bubble). This
+        // id mismatch causes duplicate content when `loadOlderMessages`
+        // prepends the full payload. Fall back to a full replay so the tail
+        // fold starts at a boundary and produces matching ids.
+        let first_msg = records.iter().find(|r| !is_tool_event(&r.type_));
+        let needs_full = match first_msg.map(|r| r.type_.as_str()) {
+            Some("message_chunk") => {
+                // Scan backward through the loaded records: is there a fold
+                // boundary (user_prompt, tool_call, prompt_complete) before
+                // the first message_chunk? If yes, the first chunk is safe
+                // (open_role would be None at that point). If no, it may be a
+                // continuation — fall back to full replay.
+                let first_chunk_seq = first_msg.map(|r| r.seq).unwrap_or(0);
+                let has_boundary_before = records.iter().any(|r| {
+                    r.seq < first_chunk_seq
+                        && matches!(
+                            r.type_.as_str(),
+                            "user_prompt" | "tool_call" | "prompt_complete"
+                        )
+                });
+                !has_boundary_before
+            }
+            _ => false,
+        };
+        if needs_full {
+            log::info!(
+                "[acp-history] replay_tail session_id={} limit={} tail_records={} \
+                 fallback=full (first record may continue an earlier run)",
+                crate::logging::redact_session_id(session_id),
+                records.len(),
+                limit
+            );
+            return self.replay_after(session_id, 0);
+        }
+        log::info!(
+            "[acp-history] replay_tail session_id={} limit={} tail_records={} oldest_seq={}",
+            crate::logging::redact_session_id(session_id),
+            limit,
+            records.len(),
+            oldest_tail_seq
+        );
+        Ok(records)
+    }
+
+    /// Async wrapper for [`replay_tail`] on Tokio's blocking pool so the JSONL
+    /// tail scan never stalls the async WS runtime.
+    pub async fn replay_tail_async(
+        self: &Arc<Self>,
+        session_id: String,
+        limit: usize,
+    ) -> Result<Vec<PersistedEventRecord>> {
+        let persistence = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let records = persistence.replay_tail(&session_id, limit);
+            #[cfg(test)]
+            if let Some(hook) = persistence.replay_hook.lock().clone() {
+                hook.wait();
+            }
+            records
+        })
+        .await
+        .map_err(|error| SessionPersistenceError::PersistenceUnhealthy(error.to_string()))?
+    }
+
     /// Materialize the renderer-shaped `SessionPayload` for a session from its
     /// durable records (standalone `get_session_payload` source).
     ///
@@ -834,6 +968,57 @@ impl SessionPersistence {
         Ok(crate::acp::session_payload::materialize_session_payload(
             &metadata, &records,
         ))
+    }
+
+    /// Tail-first variant of [`session_payload_async`]: reads only the last
+    /// `limit` message records from `messages.jsonl` (via [`replay_tail`]),
+    /// folds ONLY those records into messages, then slices the last `limit`
+    /// messages. This avoids deserializing + folding the entire transcript
+    /// for a long chat — only the tail records hit disk + serde. Falls back to
+    /// the full [`session_payload_async`] when the tail fold produces fewer
+    /// than `limit` messages (session is small enough that the full read is
+    /// trivial, or the heuristic under-read missed records). The metadata's
+    /// `messageCount` reflects the tail slice so the renderer knows how many
+    /// messages it received.
+    pub async fn session_payload_tail_async(
+        self: &Arc<Self>,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<crate::acp::session_payload::MaterializedSessionPayload> {
+        self.flush_session(session_id).await?;
+        let metadata = self.metadata(session_id)?;
+        let records = self
+            .replay_tail_async(session_id.to_string(), limit)
+            .await?;
+        let mut payload =
+            crate::acp::session_payload::materialize_session_payload(&metadata, &records);
+        // If the tail fold produced fewer than `limit` messages AND the
+        // session has more on disk (metadata.message_count > tail len), the
+        // heuristic under-read (the 4× line ratio wasn't enough). Fall back
+        // to the full materialize so the tail is always correct.
+        if payload.messages.len() < limit && metadata.message_count > payload.messages.len() as u64
+        {
+            log::info!(
+                "[acp-history] session_payload_tail session_id={} limit={} \
+                 tail_messages={} on_disk={} fallback=full",
+                crate::logging::redact_session_id(session_id),
+                limit,
+                payload.messages.len(),
+                metadata.message_count
+            );
+            let full = self.session_payload_async(session_id).await?;
+            let mut full = full;
+            if full.messages.len() > limit {
+                full.messages = full.messages.split_off(full.messages.len() - limit);
+                full.metadata.message_count = full.messages.len() as u64;
+            }
+            return Ok(full);
+        }
+        if payload.messages.len() > limit {
+            payload.messages = payload.messages.split_off(payload.messages.len() - limit);
+            payload.metadata.message_count = payload.messages.len() as u64;
+        }
+        Ok(payload)
     }
 
     /// Completed client turn ids reconstructed from durable prompt-complete
@@ -927,6 +1112,17 @@ impl SessionPersistence {
                 .filter(|record| is_tool_event(&record.type_))
                 .count() as u64;
             metadata.last_seq = records.last().map_or(0, |record| record.seq);
+            // Repair a verbatim (`\\?\`) cwd persisted by an older build that
+            // did not strip the prefix after `canonicalize()`. The prefix
+            // breaks agent-side cwd→dir sanitization (`?` is illegal in
+            let stripped = strip_verbatim_prefix(&metadata.cwd).into_owned();
+            if stripped != metadata.cwd {
+                log::info!(
+                    "[acp-history] recover() healed verbatim cwd prefix for session_id={}",
+                    crate::logging::redact_session_id(&metadata.session_id)
+                );
+                metadata.cwd = stripped;
+            }
             // Agent subprocesses cannot survive a host restart. A session that
             // was still `Active` at shutdown has no live agent or writer to
             // restore, so mark it `Closed` before persisting: resume hooks
@@ -1274,6 +1470,140 @@ fn load_jsonl(
     Ok(records)
 }
 
+/// Read only the last `max_lines` newline-terminated records from a JSONL
+/// file. Seeks backward from the file end in bounded blocks (4 KiB) until
+/// `max_lines` complete records are located, then reads and deserializes
+/// only the resulting byte range. This avoids reading the entire file for
+/// long transcripts. Returns records in file order (seq order for a
+/// well-formed session).
+///
+/// Only the final unterminated line (no trailing newline, possibly
+/// mid-write) is tolerated. Any malformed or session/schema-mismatched
+/// newline-terminated line propagates as `CorruptSession` — matching
+/// `load_jsonl`'s fail-closed behavior so a corrupt file never yields a
+/// partial tail payload.
+fn load_jsonl_tail(
+    path: &Path,
+    session_id: &str,
+    max_lines: usize,
+) -> Result<Vec<PersistedEventRecord>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            return SessionPersistenceError::SessionNotFound;
+        }
+        SessionPersistenceError::Io(error)
+    })?;
+
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Seek backward in 4 KiB blocks, counting newlines until we have
+    // `max_lines` complete records or reach the file start.
+    const BLOCK: usize = 4 * 1024;
+    let mut newline_count = 0usize;
+    let mut tail_start = file_len as usize;
+    let mut buf = Vec::with_capacity(BLOCK);
+
+    while tail_start > 0 && newline_count < max_lines {
+        let read_start = tail_start.saturating_sub(BLOCK);
+        let read_len = tail_start - read_start;
+        file.seek(SeekFrom::Start(read_start as u64))?;
+        buf.clear();
+        buf.resize(read_len, 0);
+        file.read_exact(&mut buf)?;
+
+        // Count newlines in this block (backward).
+        for &byte in buf.iter().rev() {
+            if byte == b'\n' {
+                newline_count += 1;
+                if newline_count >= max_lines {
+                    break;
+                }
+            }
+        }
+        tail_start = read_start;
+    }
+
+    // `tail_start` is now the offset of the block containing the max_lines-th
+    // newline from the end. Read from the byte AFTER that newline to the file
+    // end. If we ran out of newlines (file has fewer than max_lines), read
+    // from offset 0.
+    let read_offset = if newline_count >= max_lines {
+        // Find the (newline_count - max_lines + 1)-th newline from the end of
+        // the accumulated data. Since we scanned backward, the first newline
+        // we hit is the last in the file, etc. We need the position of the
+        // max_lines-th newline from the end, then start reading after it.
+        // Re-scan the accumulated range to find the exact offset.
+        let full_start = tail_start;
+        let full_len = file_len as usize - full_start;
+        file.seek(SeekFrom::Start(full_start as u64))?;
+        let mut full_buf = vec![0u8; full_len];
+        file.read_exact(&mut full_buf)?;
+        // Count newlines from the end to find the max_lines-th.
+        let mut nl_from_end = 0usize;
+        let mut content_start = 0usize;
+        for (i, &byte) in full_buf.iter().enumerate().rev() {
+            if byte == b'\n' {
+                nl_from_end += 1;
+                if nl_from_end == max_lines {
+                    content_start = full_start + i + 1;
+                    break;
+                }
+            }
+        }
+        content_start
+    } else {
+        0
+    };
+
+    // Read the tail byte range and deserialize line by line.
+    let tail_len = file_len as usize - read_offset;
+    if tail_len == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(read_offset as u64))?;
+    let mut tail_bytes = vec![0u8; tail_len];
+    file.read_exact(&mut tail_bytes)?;
+
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset < tail_bytes.len() {
+        let remainder = &tail_bytes[offset..];
+        let newline = remainder.iter().position(|byte| *byte == b'\n');
+        let (line, next_offset, terminated) = match newline {
+            Some(position) => (&remainder[..position], offset + position + 1, true),
+            None => (remainder, tail_bytes.len(), false),
+        };
+        if line.is_empty() {
+            offset = next_offset;
+            continue;
+        }
+        let is_final_unterminated = !terminated && next_offset == tail_bytes.len();
+        match serde_json::from_slice::<PersistedEventRecord>(line) {
+            Ok(record)
+                if record.schema_version == SESSION_SCHEMA_VERSION
+                    && record.session_id == session_id =>
+            {
+                records.push(record)
+            }
+            Ok(_) => return Err(SessionPersistenceError::CorruptSession),
+            Err(_) if is_final_unterminated => {
+                // A torn final line (no trailing newline, possibly mid-write)
+                // is tolerated — skip it so a concurrent writer can't crash
+                // the tail read. Matches `load_jsonl`'s repair_torn_tail.
+                break;
+            }
+            Err(_) => return Err(SessionPersistenceError::CorruptSession),
+        }
+        offset = next_offset;
+    }
+    Ok(records)
+}
+
 fn validate_and_sort(records: &mut [PersistedEventRecord]) -> Result<()> {
     records.sort_by_key(|record| record.seq);
     let mut previous = 0;
@@ -1604,6 +1934,66 @@ mod tests {
         assert_eq!(
             reopened.metadata("session-1").unwrap().storage_key,
             metadata.storage_key
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn register_session_strips_verbatim_cwd_prefix_on_windows() {
+        // `canonicalize()` prepends `\\?\` on Windows. The persisted `cwd`
+        // must be stripped so `session/resume` passes a tool-friendly path
+        // to the agent (whose cwd→dir sanitizer keeps `?` → illegal folder
+        // name → `mkdir` ENOENT → resume skipped). This test creates a real
+        // temp dir, canonicalizes it (so the verbatim prefix is present in
+        // the `PathBuf`), and asserts the persisted `cwd` has no prefix.
+        let root = temp_dir("verbatim-strip");
+        let cwd = root.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        // `canonicalize()` yields `\\?\C:\…\cwd` on Windows.
+        let canonical_cwd = cwd.canonicalize().unwrap();
+        assert!(
+            canonical_cwd.to_string_lossy().starts_with(r"\\?\"),
+            "sanity: canonicalize should produce a verbatim prefix on Windows"
+        );
+        let persistence = SessionPersistence::open(root.join("store")).await.unwrap();
+        let metadata = persistence
+            .register_session(SessionRegistration {
+                session_id: "session-verbatim".to_string(),
+                stable_agent_namespace: Some("config:test".to_string()),
+                runtime_agent_id: Some("runtime-1".to_string()),
+                project_id: Some("project-1".to_string()),
+                cwd: canonical_cwd,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !metadata.cwd.starts_with(r"\\?\"),
+            "persisted cwd must not carry the verbatim prefix, got: {}",
+            metadata.cwd
+        );
+        // `recover()` must heal a verbatim cwd persisted by an older build.
+        // Manually corrupt the metadata on disk AFTER shutdown (which
+        // persists the in-memory stripped metadata), so the reopen step
+        // actually tests recover() healing a legacy verbatim prefix.
+        persistence.shutdown().await.unwrap();
+        {
+            let metadata_path = persistence
+                .session_dir(&metadata.storage_key)
+                .unwrap()
+                .join(METADATA_FILE);
+            let mut corrupt = metadata.clone();
+            corrupt.cwd = format!(r"\\?\{}", corrupt.cwd);
+            let bytes = serde_json::to_vec_pretty(&corrupt).unwrap();
+            std::fs::write(&metadata_path, &bytes).unwrap();
+        }
+        let reopened = SessionPersistence::open(root.join("store")).await.unwrap();
+        let healed = reopened.metadata("session-verbatim").unwrap();
+        assert!(
+            !healed.cwd.starts_with(r"\\?\"),
+            "recover() must strip a verbatim prefix from a legacy persisted cwd, got: {}",
+            healed.cwd
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -2089,6 +2479,240 @@ mod tests {
         assert_eq!(before["messages"], after["messages"]);
         assert_eq!(before["metadata"]["id"], after["metadata"]["id"]);
         assert_eq!(before["metadata"]["lastSeq"], after["metadata"]["lastSeq"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_payload_tail_reads_only_last_n_messages_from_long_session() {
+        let root = temp_dir("payload-tail");
+        let (persistence, _) = registered(&root).await;
+        // Enqueue 10 turns (30 records: user_prompt + message_chunk +
+        // prompt_complete per turn). Each turn produces 2 folded messages
+        // (user + agent), so the full payload has 20 messages.
+        for i in 0..10u64 {
+            let seq = i * 3 + 1;
+            enqueue_turn(
+                &persistence,
+                seq,
+                &format!("turn-{i}"),
+                &format!("prompt-{i}"),
+                &format!("reply-{i}"),
+            );
+        }
+        persistence.flush_session("session-1").await.unwrap();
+
+        // Tail with limit 5: should return the last 5 folded messages.
+        let tail = persistence
+            .session_payload_tail_async("session-1", 5)
+            .await
+            .unwrap();
+        assert_eq!(tail.messages.len(), 5);
+        // The last 5 messages are turns 7 (agent), 8 (user+agent), 9 (user+agent).
+        // Verify the last message is the agent reply of turn 9.
+        let last = tail.messages.last().unwrap();
+        assert_eq!(last.role, "agent");
+        assert_eq!(last.seq, 9 * 3 + 2); // message_chunk seq of turn 9
+                                         // Verify the first tail message is turn 7's agent reply.
+        let first = tail.messages.first().unwrap();
+        assert_eq!(first.role, "agent");
+        assert_eq!(first.seq, 7 * 3 + 2);
+
+        // Tail with limit 50 (exceeds the 20-message session): returns all 20.
+        let big_tail = persistence
+            .session_payload_tail_async("session-1", 50)
+            .await
+            .unwrap();
+        assert_eq!(big_tail.messages.len(), 20);
+
+        // The tail must match the tail of the full payload (same ids + seqs).
+        let full = persistence
+            .session_payload_async("session-1")
+            .await
+            .unwrap();
+        let full_tail: Vec<_> = full.messages.iter().rev().take(5).rev().collect();
+        assert_eq!(
+            tail.messages
+                .iter()
+                .map(|m| (m.id.as_str(), m.seq))
+                .collect::<Vec<_>>(),
+            full_tail
+                .iter()
+                .map(|m| (m.id.as_str(), m.seq))
+                .collect::<Vec<_>>(),
+            "tail payload ids+seqs must match the full payload's last 5 messages"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_payload_tail_with_tool_calls_includes_matching_tail_range() {
+        let root = temp_dir("payload-tail-tools");
+        let (persistence, _) = registered(&root).await;
+        // Turn 1: user + agent + tool_call + agent + prompt_complete.
+        enqueue_turn(&persistence, 1, "turn-1", "hello", "world");
+        persistence
+            .enqueue_event(payload_record(
+                4,
+                "tool_call",
+                json!({
+                    "agentId": "runtime-1",
+                    "sessionId": "session-1",
+                    "toolCall": {"toolCallId": "t-1", "kind": "execute", "status": "completed"},
+                }),
+            ))
+            .unwrap();
+        persistence
+            .enqueue_event(payload_record(
+                5,
+                "message_chunk",
+                json!({
+                    "agentId": "runtime-1",
+                    "sessionId": "session-1",
+                    "role": "agent",
+                    "content": {"type": "text", "text": "after tool"},
+                }),
+            ))
+            .unwrap();
+        persistence
+            .enqueue_event(payload_record(
+                6,
+                "prompt_complete",
+                json!({"sessionId": "session-1", "turnId": "turn-1", "stopReason": "end_turn"}),
+            ))
+            .unwrap();
+        // Turn 2: another user + agent.
+        enqueue_turn(&persistence, 7, "turn-2", "again", "reply2");
+        persistence.flush_session("session-1").await.unwrap();
+
+        // Full payload: 4 messages (user, agent, agent, user, agent) → actually
+        // turn-1 has 3 (user, agent, agent-after-tool) + turn-2 has 2 (user,
+        // agent) = 5 messages.
+        let full = persistence
+            .session_payload_async("session-1")
+            .await
+            .unwrap();
+        assert_eq!(full.messages.len(), 5);
+
+        // Tail limit 2: last 2 messages (turn-2 user + agent).
+        let tail = persistence
+            .session_payload_tail_async("session-1", 2)
+            .await
+            .unwrap();
+        assert_eq!(tail.messages.len(), 2);
+        // The tool call from turn-1 (seq 4) is older than the tail's oldest
+        // message (seq 7) and should NOT appear in the tail records.
+        // (Tool calls are not materialized into messages by the fold, but the
+        // tail records must not include the old tool call — it would be
+        // filtered by the seq-range guard.)
+        assert_eq!(tail.messages[0].id, "turn:turn-2");
+        assert_eq!(tail.messages[1].id, "snapshot:agent:8");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_payload_tail_handles_long_agent_run_with_many_chunks() {
+        // records. The tail must include all chunks and produce a single
+        // folded agent bubble (not split or truncated). The fold-boundary
+        // check must correctly fall back to full replay when the tail starts
+        // mid-run, so the bubble id matches the full payload.
+        let root = temp_dir("payload-tail-many-chunks");
+        let (persistence, _) = registered(&root).await;
+        // Turn 1: user_prompt + 1 chunk + prompt_complete.
+        enqueue_turn(&persistence, 1, "turn-1", "hello", "world");
+        // Turn 2: user_prompt + 6 chunks (no tool_call or prompt_complete
+        // between them → they coalesce into one agent bubble) + prompt_complete.
+        persistence
+            .enqueue_event(payload_record(
+                4,
+                "user_prompt",
+                json!({
+                    "agentId": "runtime-1",
+                    "sessionId": "session-1",
+                    "turnId": "turn-2",
+                    "content": [{"type": "text", "text": "again"}],
+                }),
+            ))
+            .unwrap();
+        for i in 0..6u64 {
+            persistence
+                .enqueue_event(payload_record(
+                    5 + i,
+                    "message_chunk",
+                    json!({
+                        "agentId": "runtime-1",
+                        "sessionId": "session-1",
+                        "role": "agent",
+                        "content": {"type": "text", "text": format!("chunk-{i}")},
+                    }),
+                ))
+                .unwrap();
+        }
+        persistence
+            .enqueue_event(payload_record(
+                11,
+                "prompt_complete",
+                json!({"sessionId": "session-1", "turnId": "turn-2", "stopReason": "end_turn"}),
+            ))
+            .unwrap();
+        persistence.flush_session("session-1").await.unwrap();
+
+        // Full payload: 3 messages (user-1, agent-1, user-2 + agent-2).
+        // Wait — turn-2 has user_prompt(4) + 6 chunks(5-10) + prompt_complete(11).
+        // Fold: user_prompt(1) + agent(2) + user_prompt(4) + agent(5-10 coalesced) = 4 messages.
+        let full = persistence
+            .session_payload_async("session-1")
+            .await
+            .unwrap();
+        assert_eq!(full.messages.len(), 4);
+        // The last message is the coalesced agent bubble from chunks 5-10.
+        assert_eq!(full.messages[3].role, "agent");
+        assert_eq!(full.messages[3].seq, 5); // first chunk's seq
+
+        // Tail limit 2: last 2 messages (user-2 + agent-2 coalesced).
+        let tail = persistence
+            .session_payload_tail_async("session-1", 2)
+            .await
+            .unwrap();
+        assert_eq!(tail.messages.len(), 2);
+        assert_eq!(tail.messages[0].id, "turn:turn-2");
+        assert_eq!(tail.messages[1].id, "snapshot:agent:5");
+        // The tail's agent bubble id must match the full payload's.
+        assert_eq!(tail.messages[1].id, full.messages[3].id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_payload_tail_corrupt_newline_record_returns_error_not_partial() {
+        // A malformed newline-terminated line in messages.jsonl must surface
+        // as CorruptSession — NOT a partial tail payload. Only the final
+        // unterminated line (no trailing newline) is tolerated.
+        let root = temp_dir("payload-tail-corrupt");
+        let (persistence, _) = registered(&root).await;
+        enqueue_turn(&persistence, 1, "turn-1", "hello", "world");
+        persistence.flush_session("session-1").await.unwrap();
+
+        // Corrupt messages.jsonl: append a malformed newline-terminated line
+        // (valid JSON line followed by a garbage line with a newline).
+        let metadata = persistence.metadata("session-1").unwrap();
+        let messages_path = persistence
+            .session_dir(&metadata.storage_key)
+            .unwrap()
+            .join(MESSAGES_FILE);
+        let original = fs::read(&messages_path).unwrap();
+        let mut corrupted = original;
+        corrupted.extend_from_slice(b"{\"broken\":\n"); // malformed + newline-terminated
+        fs::write(&messages_path, &corrupted).unwrap();
+
+        // The tail read must fail with CorruptSession, not return a partial payload.
+        let result = persistence.session_payload_tail_async("session-1", 5).await;
+        assert!(
+            matches!(result, Err(SessionPersistenceError::CorruptSession)),
+            "expected CorruptSession for malformed newline-terminated record, got: {result:?}"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

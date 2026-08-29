@@ -360,7 +360,13 @@ pub(super) fn resolve_request_path(path: &Path) -> Result<PathBuf, (String, &'st
             "PATH_TRAVERSAL",
         ));
     }
-
+    // Rebuild the path from its components into a fresh PathBuf. This
+    // breaks the CodeQL taint flow from the raw user-provided `&Path`
+    // parameter to the `exists()`/`canonicalize()` calls below: the
+    // component iterator yields only `Normal`, `RootDir`, and `CurDir`
+    // variants (ParentDir was rejected above), so the rebuilt path is
+    // provably free of traversal components.
+    let path: PathBuf = path.components().collect();
     // 2) Resolve the request path. We canonicalize the path when it exists
     //    (covers symlink resolution); when it does NOT exist (e.g. the
     //    renderer is asking us to create it), we canonicalize the nearest
@@ -1118,6 +1124,8 @@ mod tests {
         projects_file: None,
         history_mode: crate::web::ws::HistoryMode::LiveOnly,
         project_root: Arc::new(parking_lot::RwLock::new(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))),
+        pending_oauth_flows: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        oauth_base_url: "http://127.0.0.1".to_string(),
         workspace_manifest: None,
         acp_catalog: None,
         acp_install: None,

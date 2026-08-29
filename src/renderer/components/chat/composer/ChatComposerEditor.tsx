@@ -8,12 +8,14 @@ import {
   CMD_PILL_NODE,
   docOffsetToDisplayOffset,
   docToDisplayText,
+  FILE_PILL_NODE,
   SKILL_PILL_NODE
 } from '@/lib/composer/doc-to-prompt'
 import { draftFromTokens } from '@/lib/composer/draft-from-tokens'
 import { logFrontendError } from '@/lib/log-api'
 import { cn } from '@/lib/utils'
 import { CommandPill } from './CommandPillNode'
+import { FilePill } from './FilePillNode'
 import { SkillPill } from './SkillPillNode'
 
 export interface ChatComposerEditorProps {
@@ -62,9 +64,12 @@ export interface ChatComposerEditorProps {
   placeholder?: string
   ariaLabel?: string
   autoFocus?: boolean
-  /** Min/max heights (CSS px). The editor grows with content up to `maxHeight`,
-   * then scrolls — replaces the old textarea `clampHeight`/`resetHeight`. */
+  /** Min height (CSS px) applied to the editable surface so the full area is
+   *  clickable — the ProseMirror element itself stretches to this height, so
+   *  clicks anywhere inside place the caret (no dead space below short text). */
   minHeight?: number
+  /** Max height (CSS px). The editor grows with content up to this height,
+   *  then the scroll area engages. */
   maxHeight?: number
   className?: string
   editorClassName?: string
@@ -134,7 +139,8 @@ function createComposerKeymap(
                     if (
                       prevNode &&
                       (prevNode.type.name === SKILL_PILL_NODE ||
-                        prevNode.type.name === CMD_PILL_NODE)
+                        prevNode.type.name === CMD_PILL_NODE ||
+                        prevNode.type.name === FILE_PILL_NODE)
                     ) {
                       before = prevNode
                       probePos = probePos - 1
@@ -142,7 +148,9 @@ function createComposerKeymap(
                   }
                   if (
                     before &&
-                    (before.type.name === SKILL_PILL_NODE || before.type.name === CMD_PILL_NODE)
+                    (before.type.name === SKILL_PILL_NODE ||
+                      before.type.name === CMD_PILL_NODE ||
+                      before.type.name === FILE_PILL_NODE)
                   ) {
                     event.preventDefault()
                     // Delete the pill + any trailing space the splicer appended
@@ -201,7 +209,10 @@ export function ChatComposerEditor({
   placeholder,
   ariaLabel,
   autoFocus = false,
-  minHeight = 52,
+  // 26px = 1 line: text-base (16px) × leading-relaxed (1.625). Applied to the
+  // ProseMirror element via the `--composer-min-h` CSS var (index.css) so the
+  // full area is clickable — no dead space below short/empty text.
+  minHeight = 26,
   maxHeight = 160,
   className,
   editorClassName
@@ -245,6 +256,7 @@ export function ChatComposerEditor({
       extensions: [
         SkillPill,
         CommandPill,
+        FilePill,
         createComposerKeymap(beforeKeyDownRef),
         Placeholder.configure({
           placeholder: () => placeholderRef.current,
@@ -295,7 +307,8 @@ export function ChatComposerEditor({
           // paste (no sentinel) falls through to ProseMirror's default (text
           // nodes). The skill sentinel `\uE000` and the command sentinel
           // `\uE004` both trigger the pill-paste path.
-          if (!text.includes('\uE000') && !text.includes('\uE004')) return false
+          if (!text.includes('\uE000') && !text.includes('\uE004') && !text.includes('\uE006'))
+            return false
           event.preventDefault()
           try {
             const parsed = view.state.schema.nodeFromJSON(
@@ -456,11 +469,16 @@ export function ChatComposerEditor({
   }, [editor, disabled])
 
   return (
-    <div
-      className={cn('relative w-full overflow-hidden', disabled && 'opacity-60', className)}
-      style={{ minHeight: `${minHeight}px`, maxHeight: `${maxHeight}px` }}
-    >
-      <div className="h-full w-full overflow-y-auto">
+    <div className={cn('relative w-full overflow-hidden', disabled && 'opacity-60', className)}>
+      <div
+        className="w-full overflow-y-auto overscroll-contain"
+        style={
+          {
+            maxHeight: `${maxHeight}px`,
+            '--composer-min-h': `${minHeight}px`
+          } as React.CSSProperties
+        }
+      >
         <EditorContent editor={editor} innerRef={editorContentRef} />
       </div>
     </div>

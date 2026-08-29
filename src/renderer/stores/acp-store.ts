@@ -89,6 +89,7 @@ import {
   getCachedSessionPayload,
   loadSessionIndex as loadSessionIndexFromDisk,
   loadSessionPayload,
+  loadSessionPayloadTail,
   markSessionPayloadPinned,
   maxPayloadSeq,
   queueSessionPayloadDelete,
@@ -346,6 +347,10 @@ interface AcpState {
    * and as the chatbox "Probe failed" tooltip so failures are diagnosable.
    */
   mcpProbeError: Record<string, string | undefined>
+  /** Per-server OAuth connecting state (true while the browser OAuth flow is in progress). */
+  mcpOAuthConnecting: Record<string, boolean>
+  /** Per-server OAuth connected state (true when a stored token exists). */
+  mcpOAuthConnected: Record<string, boolean>
 
   // Sessions
   sessions: Record<SessionId, AcpSession>
@@ -594,6 +599,13 @@ interface AcpState {
    * loaded; otherwise delegates to `probeMcpServer(id)`.
    */
   loadMcpTools: (id: string) => Promise<void>
+  /** Start the OAuth flow for an HTTP/SSE MCP server that returned `authRequired`.
+   * Opens the system browser, waits for the callback, stores the token. */
+  connectMcpOAuth: (id: string) => Promise<void>
+  /** Check whether a stored OAuth token exists and update `mcpOAuthConnected`. */
+  checkMcpOAuthStatus: (id: string) => Promise<void>
+  /** Delete the stored OAuth token (the "Disconnect" action). */
+  disconnectMcpOAuth: (id: string) => Promise<void>
 
   // Actions — conversation
   sendPrompt: (sessionId: SessionId, text: string) => Promise<void>
@@ -2251,7 +2263,18 @@ async function openHistorySessionInner(
     })
   }
 
-  const payload = await loadSessionPayload(id)
+  // Tail-first: fetch only the recent messages so the pane shows the
+  // conversation immediately. The full payload loads lazily on scroll-up
+  // via `loadOlderMessages`. Falls back to the full `loadSessionPayload`
+  let payload = await loadSessionPayloadTail(id).catch((err) => {
+    void logFrontendError({
+      level: 'warn',
+      source: 'acp.openHistorySession.tailFetch',
+      message: `Tail fetch failed for session ${id}, falling back to full load: ${String(err)}`
+    })
+    return null
+  })
+  if (!payload) payload = await loadSessionPayload(id)
   if (!isCurrentSessionReopen(id, reopenGeneration)) return
   if (!payload) throw new Error(`no persisted history for ${id}`)
   const meta = payload.metadata
@@ -2835,6 +2858,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   mcpServers: [],
   mcpServersLoaded: false,
   mcpProbeStatus: {},
+  mcpOAuthConnecting: {},
+  mcpOAuthConnected: {},
   mcpTools: {},
   mcpToolsLoaded: {},
   mcpProbing: {},
@@ -4018,7 +4043,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     // on refresh. The backend `gate_resume_session` enforces the capability
     // (reused — not duplicated); a rejection rejects here so the bootstrap hook
     // can record `acp-resume-skipped` and keep the transcript read-only.
-    const payload = await loadSessionPayload(id)
+    // Tail-first: fetch only the recent messages for fast resume. The full
+    // payload loads lazily on scroll-up via `loadOlderMessages`. Falls back
+    let payload = await loadSessionPayloadTail(id).catch((err) => {
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp.resumeLiveSession.tailFetch',
+        message: `Tail fetch failed for session ${id}, falling back to full load: ${String(err)}`
+      })
+      return null
+    })
+    if (!payload) payload = await loadSessionPayload(id)
     if (!payload) throw new Error(`no persisted history for ${id}`)
     const meta = payload.metadata
     rebaseSeqCounter(maxPayloadSeq(payload))
@@ -4637,6 +4672,76 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     // Auto-probe on first expand — no-op if already loaded (or in flight).
     if (get().mcpToolsLoaded[id] || get().mcpProbing[id]) return
     await get().probeMcpServer(id)
+  },
+  connectMcpOAuth: async (id) => {
+    const server = get().mcpServers.find((s) => s.id === id)
+    if (!server) return
+    const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
+    if (!url) return
+    set((s) => ({ mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: true } }))
+    void logFrontendError({
+      source: 'acp-store.connectMcpOAuth',
+      message: `OAuth flow started for server '${server.name}'`
+    })
+    try {
+      await acpApi.startMcpOAuth(url)
+      // startMcpOAuth now blocks until the token is stored (desktop: the
+      // Tauri command blocks; web: polls the status endpoint). Setting
+      // connected state here is correct — the token is confirmed.
+      set((s) => ({
+        mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: true },
+        mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: false }
+      }))
+      void logFrontendError({
+        source: 'acp-store.connectMcpOAuth',
+        message: `OAuth token confirmed for server '${server.name}'`
+      })
+      // Re-probe now that we have a token — should succeed.
+      await get().probeMcpServer(id)
+    } catch (err) {
+      set((s) => ({ mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: false } }))
+      void logFrontendError({
+        source: 'acp-store.connectMcpOAuth',
+        message: `OAuth flow failed for server '${server.name}' (${String(err)})`
+      })
+      throw err
+    }
+  },
+
+  checkMcpOAuthStatus: async (id) => {
+    const server = get().mcpServers.find((s) => s.id === id)
+    if (!server) return
+    const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
+    if (!url) return
+    try {
+      const hasToken = await acpApi.hasMcpOAuthToken(url)
+      set((s) => ({ mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: hasToken } }))
+    } catch {
+      // Best-effort — the probe will still detect authRequired.
+    }
+  },
+
+  disconnectMcpOAuth: async (id) => {
+    const server = get().mcpServers.find((s) => s.id === id)
+    if (!server) return
+    const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
+    if (!url) return
+    try {
+      await acpApi.disconnectMcpOAuth(url)
+      set((s) => ({ mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: false } }))
+      void logFrontendError({
+        source: 'acp-store.disconnectMcpOAuth',
+        message: `OAuth disconnect completed for server '${server.name}'`
+      })
+      // Re-probe — should return authRequired again.
+      await get().probeMcpServer(id)
+    } catch (err) {
+      void logFrontendError({
+        source: 'acp-store.disconnectMcpOAuth',
+        message: `OAuth disconnect failed for server '${server.name}' (${String(err)})`
+      })
+      throw err
+    }
   },
 
   sendPrompt: (sessionId, text) =>
@@ -5941,16 +6046,18 @@ export interface AgentIdentity {
   name: string | null
   /** Template id used to resolve the agent icon, when known. */
   templateId: string | null
+  /** Persisted custom icon SVG (bundled or uploaded), when present. */
+  icon: string | null
 }
 
 /**
- * Resolve the configured agent's display name + template (for icon) behind a
- * live session, via the configToLiveAgent mapping. Falls back to the session
+ * Resolve the configured agent's display name + template + custom icon behind
+ * a live session, via the configToLiveAgent mapping. Falls back to the session
  * index `agentConfigId` when the live map is cold (history reopen / empty
  * state) so `AgentGlyph` still resolves the registry icon instead of Bot.
  */
 export function selectAgentIdentity(state: AcpState, agentId: AgentId | null): AgentIdentity {
-  if (!agentId) return { name: null, templateId: null }
+  if (!agentId) return { name: null, templateId: null, icon: null }
   const reuseKey = Object.keys(state.configToLiveAgent).find(
     (k) => state.configToLiveAgent[k] === agentId
   )
@@ -5960,7 +6067,11 @@ export function selectAgentIdentity(state: AcpState, agentId: AgentId | null): A
     configId = indexed?.agentConfigId
   }
   const config = configId ? state.agentConfigs.find((c) => c.id === configId) : undefined
-  return { name: config?.name ?? null, templateId: config?.templateId ?? null }
+  return {
+    name: config?.name ?? null,
+    templateId: config?.templateId ?? null,
+    icon: config?.icon ?? null
+  }
 }
 
 export const useAgentIdentity = (agentId: AgentId | null): AgentIdentity =>
@@ -5978,6 +6089,28 @@ export function useAgentTemplateId(agentId: AgentId | null, agentConfigId?: stri
         if (config?.templateId) return config.templateId
       }
       return selectAgentIdentity(s, agentId).templateId
+    })
+  )
+}
+
+/**
+ * Resolve an agent's persisted custom icon (bundled or uploaded) by
+ * `agentConfigId` (from a history entry) when the agent isn't live. Falls
+ * back to `useAgentIdentity` for live sessions. Returns null when no custom
+ * icon is set (the caller should fall back to the bundled catalog).
+ */
+export function useAgentIcon(agentId: AgentId | null, agentConfigId?: string): string | null {
+  return useAcpStore(
+    useShallow((s) => {
+      if (agentConfigId) {
+        const config = s.agentConfigs.find((c) => c.id === agentConfigId)
+        if (config?.icon) return config.icon
+        // Config found but no icon — short-circuit to null so we don't
+        // redundantly scan configToLiveAgent + agentConfigs again via
+        // selectAgentIdentity when the result would be the same null.
+        if (config) return null
+      }
+      return selectAgentIdentity(s, agentId).icon
     })
   )
 }

@@ -95,6 +95,8 @@ interface ChatInputBarProps {
   queue?: QueuedPrompt[]
   onRemoveQueued?: (queueId: string) => void
   onSendQueuedNow?: (queueId: string) => void
+  /** When true, removes top padding so the changed-files panel sits flush behind the chatbox. */
+  compactTop?: boolean
 }
 
 export function ChatInputBar({
@@ -117,7 +119,8 @@ export function ChatInputBar({
   seedNonce,
   queue = [],
   onRemoveQueued,
-  onSendQueuedNow
+  onSendQueuedNow,
+  compactTop = false
 }: ChatInputBarProps): React.JSX.Element {
   const usableConfigOptions = configOptions.filter((o) => o.options.length > 0)
   const hasConfigOptions = usableConfigOptions.length > 0
@@ -154,7 +157,7 @@ export function ChatInputBar({
   const { skills: availableSkills } = useAgentSkills(projectRoot ?? session.cwd)
   const sessionUsage = useSessionUsage(session.id)
   const messages = useAcpMessages(session.id)
-  const { templateId: agentTemplateId } = useAgentIdentity(session.agentId)
+  const { templateId: agentTemplateId, icon: agentIcon } = useAgentIdentity(session.agentId)
   // Prefer project/session-scoped MCP context. Older/local sessions without a
   // recorded count retain the existing global-registry fallback.
   const globalMcpCount = useAcpStore((s) => s.mcpServers.length)
@@ -264,7 +267,6 @@ export function ChatInputBar({
     attachments,
     addFiles,
     pickFiles,
-    addFileRef,
     handlePaste,
     removeAttachment,
     clearAttachments,
@@ -287,7 +289,6 @@ export function ChatInputBar({
     disabled,
     recents: mentionRecents,
     onStageFileRef: (m) => {
-      addFileRef(m)
       pushMentionRecent(m)
     }
   })
@@ -384,18 +385,28 @@ export function ChatInputBar({
       // skill paths, and inline command token. Throws `Skill '<name>' is
       // missing a path` when a selected skill has no resolvable path (Block If)
       // — caught below.
-      const { hasSkills, wireWithCommand, displayWithCommand, wireTrimmed, displayTrimmed } =
-        buildPromptParts()
-      if (!wireTrimmed && !hasAttachments) return
+      const {
+        hasSkills,
+        wireWithCommand,
+        displayWithCommand,
+        wireTrimmed,
+        displayTrimmed,
+        fileBlocks
+      } = buildPromptParts()
+      const hasFileRefs = fileBlocks.length > 0
+      if (!wireTrimmed && !hasAttachments && !hasFileRefs) return
 
       if (hasAttachments) {
         const wireBlocks: ContentBlock[] = []
         if (wireTrimmed) wireBlocks.push({ type: 'text', text: wireWithCommand })
         for (const a of attachments) wireBlocks.push(attachmentToBlock(a))
+        wireBlocks.push(...fileBlocks)
         const wire = dedupeAttachmentBlocks(wireBlocks)
-        // Only split display from wire when skills are present; otherwise
-        // display == wire and a single-arg call preserves the existing contract.
-        if (hasSkills) {
+        // Split display from wire when skills OR file-mention pills are
+        // present: skills carry framing tokens, file mentions carry inline
+        // pill tokens — both need the display to keep the raw token text so
+        // the timeline renders inline chips. Without either, display == wire.
+        if (hasSkills || hasFileRefs) {
           const displayBlocks: ContentBlock[] = []
           if (displayTrimmed) displayBlocks.push({ type: 'text', text: displayWithCommand })
           for (const a of attachments) displayBlocks.push(attachmentToBlock(a))
@@ -406,8 +417,28 @@ export function ChatInputBar({
         }
       } else if (hasSkills) {
         // Skills (tokens) present: split display (tokens) from wire (framing).
+        // File-mention `resource_link` blocks append to the wire only — the
+        // display keeps the raw token text so the timeline renders inline
+        // file pills.
+        const wireBlocks: ContentBlock[] = wireTrimmed
+          ? [{ type: 'text', text: wireWithCommand }]
+          : []
+        wireBlocks.push(...fileBlocks)
         onSendBlocks(
-          wireTrimmed ? [{ type: 'text', text: wireWithCommand }] : [],
+          dedupeAttachmentBlocks(wireBlocks),
+          displayTrimmed ? [{ type: 'text', text: displayWithCommand }] : []
+        )
+      } else if (hasFileRefs) {
+        // File-mention pills present (no skills, no attachments): the wire
+        // carries the text (tokens → `(display)`) + `resource_link` blocks for
+        // each unique file. Display keeps the token text so the timeline
+        // renders inline file pills.
+        const wireBlocks: ContentBlock[] = wireTrimmed
+          ? [{ type: 'text', text: wireWithCommand }]
+          : []
+        wireBlocks.push(...fileBlocks)
+        onSendBlocks(
+          dedupeAttachmentBlocks(wireBlocks),
           displayTrimmed ? [{ type: 'text', text: displayWithCommand }] : []
         )
       } else {
@@ -516,7 +547,12 @@ export function ChatInputBar({
       searchable
       maxVisibleOptions={5}
       leading={
-        <AgentGlyph templateId={agentTemplateId} size={13} className="text-muted-foreground" />
+        <AgentGlyph
+          templateId={agentTemplateId}
+          icon={agentIcon}
+          size={13}
+          className="text-muted-foreground"
+        />
       }
       onSelect={(valueId) =>
         modelSource === 'models' ? onSetModel(valueId) : onSetConfig(modelOption.id, valueId)
@@ -576,9 +612,15 @@ export function ChatInputBar({
       }}
     />
   )
-
   return (
-    <div ref={rootRef} className={cn(CHAT_GUTTER_X, 'pb-2 pt-3')}>
+    <div
+      ref={rootRef}
+      className={cn(
+        CHAT_GUTTER_X,
+        compactTop ? 'pb-2 pt-0' : 'pb-2 pt-3',
+        compactTop && 'relative z-10'
+      )}
+    >
       <div className="relative mx-auto w-full max-w-3xl">
         {disabled && (
           <div
@@ -648,8 +690,8 @@ export function ChatInputBar({
                 editorRef={editorRef}
                 inputRef={composerInputRef}
                 disabled={disabled || sending}
-                minHeight={52}
-                maxHeight={160}
+                minHeight={26} /* 1 line: 16px × 1.625 */
+                maxHeight={78} /* 3 lines: 3 × 26px, then scroll */
                 placeholder={
                   disabled
                     ? 'Composer unavailable'

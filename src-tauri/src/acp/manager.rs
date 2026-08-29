@@ -498,8 +498,9 @@ where
             .map_err(|e| e.to_string()),
         Err(_) => {
             log::warn!(
-                "[acp] session {session_id} {op} timed out after {timeout:?}; \
-                 check agent stderr in RUST_LOG=debug"
+                "[acp] session {} {op} timed out after {timeout:?}; \
+                 check agent stderr in RUST_LOG=debug",
+                crate::logging::redact_session_id(session_id)
             );
             Err(format!("{op} timed out after {timeout:?}"))
         }
@@ -815,7 +816,7 @@ pub(crate) async fn record_local_title(
         return Err("title must not be empty".to_string());
     }
     let metadata = persistence.metadata(&session_id).map_err(|error| {
-        log::warn!("[acp-title] metadata lookup failed for session {session_id}: {error}");
+        log::warn!("[acp-title] metadata lookup failed for session {}: {error}", crate::logging::redact_session_id(&session_id));
         "could not read title metadata".to_string()
     })?;
     if metadata.title_source == Some(TitleSource::LocalAlias) {
@@ -830,14 +831,14 @@ pub(crate) async fn record_local_title(
         .append_local_title(&session_id, title.clone())
         .await
         .map_err(|error| {
-            log::warn!("[acp-title] title persistence failed for session {session_id}: {error}");
+            log::warn!("[acp-title] title persistence failed for session {}: {error}", crate::logging::redact_session_id(&session_id));
             "failed to persist title".to_string()
         })?;
     persistence
         .flush_session(&session_id)
         .await
         .map_err(|error| {
-            log::warn!("[acp-title] title flush failed for session {session_id}: {error}");
+            log::warn!("[acp-title] title flush failed for session {}: {error}", crate::logging::redact_session_id(&session_id));
             "failed to flush title".to_string()
         })?;
     let event = SessionInfoUpdateEvent {
@@ -852,7 +853,8 @@ pub(crate) async fn record_local_title(
         &event,
     );
     log::info!(
-        "[acp-title] title persisted and broadcast for session {session_id} (seq={next_seq}, title_len={} chars)",
+        "[acp-title] title persisted and broadcast for session {} (seq={next_seq}, title_len={} chars)",
+        crate::logging::redact_session_id(&session_id),
         title.chars().count()
     );
     Ok(())
@@ -1136,6 +1138,10 @@ impl AcpManager {
         };
 
         let outcome = async {
+            // Inject OAuth Bearer tokens into HTTP/SSE MCP server configs so
+            // authenticated servers (e.g., Mobbin) work in agent sessions.
+            let combined_mcp_servers = inject_oauth_tokens(combined_mcp_servers);
+
             gate_mcp_servers(&caps, &combined_mcp_servers)?;
             let tx = self.command_tx(agent_id)?;
             send_command(&tx, |reply| AcpCommand::NewSession {
@@ -1750,22 +1756,68 @@ fn stable_agent_namespace(config: &AgentConfig) -> Option<String> {
 
 /// Validate project/session MCP transports against negotiated capabilities.
 /// Stdio is mandatory in ACP; HTTP/SSE require their advertised flags.
-fn gate_mcp_servers(caps: &AgentCapabilities, servers: &[McpServer]) -> Result<(), String> {
-    for server in servers {
-        match server {
-            McpServer::Stdio(_) => {}
-            McpServer::Http(_) if caps.mcp_capabilities.http => {}
-            McpServer::Sse(_) if caps.mcp_capabilities.sse => {}
-            McpServer::Http(_) => {
-                return Err("agent does not support HTTP MCP servers".to_string());
-            }
-            McpServer::Sse(_) => {
-                return Err("agent does not support SSE MCP servers".to_string());
-            }
-            _ => return Err("agent does not support this MCP transport".to_string()),
+fn gate_mcp_servers(caps: &AgentCapabilities, servers: &[McpServer]) -> Result<(), String> { for server in servers {
+    match server {
+        McpServer::Stdio(_) => {}
+        McpServer::Http(_) if caps.mcp_capabilities.http => {}
+        McpServer::Sse(_) if caps.mcp_capabilities.sse => {}
+        McpServer::Http(_) => {
+            return Err("agent does not support HTTP MCP servers".to_string());
         }
+        McpServer::Sse(_) => {
+            return Err("agent does not support SSE MCP servers".to_string());
+        }
+        _ => return Err("agent does not support this MCP transport".to_string()),
     }
-    Ok(())
+}
+Ok(()) }
+
+/// Inject OAuth Bearer tokens into HTTP/SSE MCP server configs before `session/new`. The token is loaded from the file store (written by `acp_mcp_oauth_start`). Only injects if the server has no existing Authorization header — never overrides a user-configured token.
+fn inject_oauth_tokens(mcp_servers: Vec<McpServer>) -> Vec<McpServer> {
+    mcp_servers
+        .into_iter()
+        .map(|server| match server {
+            McpServer::Http(mut http) => {
+                if !http.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Authorization")) {
+                    match crate::acp::mcp_oauth::get_valid_token_blocking(&http.url) {
+                        Ok(Some(token)) => {
+                            http.headers.push(agent_client_protocol::schema::v1::HttpHeader::new(
+                                "Authorization",
+                                format!("Bearer {token}"),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
+                            );
+                        }
+                    }
+                }
+                McpServer::Http(http)
+            }
+            McpServer::Sse(mut sse) => {
+                if !sse.headers.iter().any(|h| h.name.eq_ignore_ascii_case("Authorization")) {
+                    match crate::acp::mcp_oauth::get_valid_token_blocking(&sse.url) {
+                        Ok(Some(token)) => {
+                            sse.headers.push(agent_client_protocol::schema::v1::HttpHeader::new(
+                                "Authorization",
+                                format!("Bearer {token}"),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
+                            );
+                        }
+                    }
+                }
+                McpServer::Sse(sse)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Build the internal `termul` MCP server config (for the `plan` tool; stdio self-spawn) to
@@ -2213,7 +2265,8 @@ async fn drive_connection(
                 );
                 if is_protected_info_update {
                     log::debug!(
-                        "[acp] session {session_id}: suppressed native session_info_update (title_source is BackgroundGenerated/LocalAlias)"
+                        "[acp] session {}: suppressed native session_info_update (title_source is BackgroundGenerated/LocalAlias)",
+                        crate::logging::redact_session_id(&session_id)
                     );
                     return Ok(());
                 }
@@ -2907,7 +2960,7 @@ async fn run_command_loop(
                         if let Err(error) = persistence.reopen_writer(&session_id.0).await {
                             log::warn!(
                                 "[acp] session {} reopen_writer failed: {error} (continuing load)",
-                                session_id.0
+                                crate::logging::redact_session_id(&session_id.0)
                             );
                         }
                     }
@@ -2945,7 +2998,7 @@ async fn run_command_loop(
                         if let Err(error) = persistence.reopen_writer(&session_id.0).await {
                             log::warn!(
                                 "[acp] session {} reopen_writer failed: {error} (continuing resume)",
-                                session_id.0
+                                crate::logging::redact_session_id(&session_id.0)
                             );
                         }
                     }
@@ -3119,10 +3172,10 @@ async fn run_command_loop(
                     match &outcome {
                         Ok(stop_reason) => log::info!(
                             "[acp] session {} turn complete: stop_reason={stop_reason:?}",
-                            log_session.0
+                            crate::logging::redact_session_id(&log_session.0)
                         ),
                         Err(message) => {
-                            log::warn!("[acp] session {} turn failed: {message}", log_session.0)
+                            log::warn!("[acp] session {} turn failed: {message}", crate::logging::redact_session_id(&log_session.0))
                         }
                     }
 
@@ -3331,11 +3384,11 @@ async fn run_command_loop(
                             Ok(Ok(_)) => {}
                             Ok(Err(error)) => log::debug!(
                                 "[acp] ephemeral session {} close failed: {error}",
-                                session_id.0
+                                crate::logging::redact_session_id(&session_id.0)
                             ),
                             Err(_) => log::warn!(
                                 "[acp] ephemeral session {} close timed out after {close_timeout:?}",
-                                session_id.0
+                                crate::logging::redact_session_id(&session_id.0)
                             ),
                         }
                     }

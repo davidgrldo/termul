@@ -12,9 +12,10 @@ import {
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 import { clipboardApi, openerApi } from '@/lib/api'
+import { formatRelativeTimeFromMs } from '@/lib/git-time'
 import { openTerminalAtCwd } from '@/lib/terminal-spawn'
 import { cn } from '@/lib/utils'
-import { useAcpStore, useAgentTemplateId } from '@/stores/acp-store'
+import { useAcpStore, useAgentIcon, useAgentTemplateId } from '@/stores/acp-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
 /** Hard cap of rendered chat rows per project before lazy pagination kicks in. */
@@ -288,7 +289,10 @@ interface ProjectChatRowProps {
   onCopyPath: (cwd: string) => void
   onDelete: (entry: ProjectChatEntry) => void
 }
-
+/**
+ * A single per-project chat row: title + relative last-activity time, with a
+ * context menu (open terminal / file explorer / copy path / delete).
+ */
 function ProjectChatRow({
   entry,
   onOpen,
@@ -315,7 +319,9 @@ function ProjectChatRow({
           >
             <ChatRowIcon agentId={entry.agentId} agentConfigId={entry.agentConfigId} />
             <span className="truncate flex-1 text-sidebar-foreground">{entry.title}</span>
-            <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
+            <span className="text-3xs text-muted-foreground">
+              {formatRelativeTimeFromMs(entry.lastActivityAt)}
+            </span>
           </button>
           <button
             type="button"
@@ -377,5 +383,8 @@ function ChatRowIcon({
   agentConfigId?: string
 }): React.JSX.Element {
   const templateId = useAgentTemplateId(agentId ?? null, agentConfigId)
-  return <AgentGlyph templateId={templateId} size={12} className="text-muted-foreground" />
+  const icon = useAgentIcon(agentId ?? null, agentConfigId)
+  return (
+    <AgentGlyph templateId={templateId} icon={icon} size={12} className="text-muted-foreground" />
+  )
 }

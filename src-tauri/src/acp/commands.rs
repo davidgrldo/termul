@@ -173,7 +173,7 @@ pub async fn acp_register_discovered_session(
         .map_err(|error| error.to_string())?;
     log::info!(
         "[acp-history] discovered session promoted session_id={} storage_key={}",
-        metadata.session_id,
+        crate::logging::redact_session_id(&metadata.session_id),
         metadata.storage_key
     );
     Ok(SessionIndexEntry::from(&metadata))
@@ -226,7 +226,7 @@ pub async fn acp_send_prompt(
         Err(error) => {
             log::warn!(
                 "[acp] failed to resolve ephemeral state for session {} (agent {}): {error}",
-                session_id.0,
+                crate::logging::redact_session_id(&session_id.0),
                 agent_id.0
             );
             return Err(error);
@@ -241,7 +241,7 @@ pub async fn acp_send_prompt(
             // — never the prompt content.
             log::warn!(
                 "[acp] failed to persist accepted prompt for session {} (agent {}): {error}",
-                session_id.0,
+                crate::logging::redact_session_id(&session_id.0),
                 agent_id.0
             );
             return Err(format!("failed to persist accepted prompt: {error}"));
@@ -509,7 +509,7 @@ pub async fn acp_install_agent(
         Err(error) => {
             log::warn!(
                 "[acp-install] {} install_agent validation failed: {error}",
-                crate::logging::session_id()
+                crate::logging::run_id()
             );
             return Ok(crate::commands::IpcResult::error(
                 format!("payload validation failed: {error}"),
@@ -520,13 +520,13 @@ pub async fn acp_install_agent(
     let agent_id_log = request.agent_id.clone();
     log::info!(
         "[acp-install] {} install_agent start agent={}",
-        crate::logging::session_id(),
+        crate::logging::run_id(),
         agent_id_log
     );
     let Some(service) = store.store().map(std::sync::Arc::clone) else {
         log::warn!(
             "[acp-install] {} install_agent unavailable (no host store)",
-            crate::logging::session_id()
+            crate::logging::run_id()
         );
         return Ok(crate::commands::IpcResult::error(
             "acp install store is unavailable",
@@ -537,7 +537,7 @@ pub async fn acp_install_agent(
         Ok(outcome) => {
             log::info!(
                 "[acp-install] {} install_agent success agent={}",
-                crate::logging::session_id(),
+                crate::logging::run_id(),
                 agent_id_log
             );
             Ok(crate::commands::IpcResult::success(outcome))
@@ -546,7 +546,7 @@ pub async fn acp_install_agent(
             let code = error.code();
             log::error!(
                 "[acp-install] {} install_agent failure agent={} code={} msg={}",
-                crate::logging::session_id(),
+                crate::logging::run_id(),
                 agent_id_log,
                 code,
                 error.message
@@ -567,6 +567,186 @@ pub async fn acp_probe_mcp_server(
     server: crate::acp::mcp_probe::McpServerConfig,
 ) -> Result<crate::acp::mcp_probe::ProbeResult, String> {
     Ok(crate::acp::mcp_probe::probe(server).await)
+}
+/// Start the MCP OAuth flow for a server URL. Discovers the OAuth endpoints,
+/// registers a client (PKCE), opens the authorization URL in the system
+/// browser, and waits for the callback redirect on a local HTTP server.
+/// Returns the stored token on success. Desktop-only: the standalone server
+/// has no UI to drive the browser flow.
+#[tauri::command]
+pub async fn acp_mcp_oauth_start(app: tauri::AppHandle, server_url: String) -> Result<(), String> {
+    use std::net::TcpListener;
+    use tauri_plugin_opener::OpenerExt;
+    use rmcp::transport::auth::{AuthorizationManager, AuthorizationSession, OAuthState};
+
+    // Bind a local TCP listener on an OS-assigned port for the OAuth callback.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("failed to bind callback listener: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("failed to get callback port: {e}"))?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{port}{}", crate::acp::mcp_oauth::OAUTH_REDIRECT_PATH);
+
+    // Set the listener to non-blocking so we can poll it with a timeout.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set non-blocking: {e}"))?;
+
+    // 1. Create AuthorizationManager + discover metadata + register client
+    let mut manager = AuthorizationManager::new(&server_url)
+        .await
+        .map_err(|e| format!("OAuth discovery failed: {e}"))?;
+    let metadata = manager
+        .discover_metadata()
+        .await
+        .map_err(|e| format!("OAuth discovery failed: {e}"))?;
+    manager.set_metadata(metadata);
+
+    // 2. Create the authorization session (handles dynamic registration + PKCE).
+    //    The session holds the PKCE verifier in its InMemoryStateStore — we MUST
+    //    keep it alive until the callback arrives, then use it for the token exchange.
+    let session = AuthorizationSession::new(
+        manager,
+        &[],
+        &redirect_uri,
+        Some("Termul"),
+        None,
+    )
+    .await
+    .map_err(|e| format!("OAuth registration failed: {e}"))?;
+
+    let auth_url = session.get_authorization_url().to_string();
+
+    log::info!("[mcp-oauth] opening browser for server (url redacted), redirect_uri={redirect_uri}");
+
+    // 3. Open the authorization URL in the user's system browser.
+    app.opener()
+        .open_url(&auth_url, None::<&str>)
+        .map_err(|e| format!("failed to open browser: {e}"))?;
+
+    // 4. Wait for the callback on the local TCP listener.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(crate::acp::mcp_oauth::OAUTH_FLOW_TIMEOUT_SECS);
+    let callback_url = loop {
+        if std::time::Instant::now() > deadline {
+            return Err("OAuth flow timed out — user did not complete authorization in time".to_string());
+        }
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                use std::io::{BufRead, BufReader, Write};
+                let reader = BufReader::new(&mut stream);
+                let mut lines = reader.lines();
+                if let Some(Ok(first_line)) = lines.next() {
+                    // Parse the request target. Stray browser requests
+                    // (preconnect, favicon, malformed) must not break the
+                    // loop — only the callback path with a `code` param
+                    // completes the flow. Respond to non-callback requests
+                    // with a 404 and continue waiting.
+                    let target = first_line.split(' ').nth(1).unwrap_or("/").to_string();
+                    let path = target.split('?').next().unwrap_or("/");
+                    let is_callback = path == crate::acp::mcp_oauth::OAUTH_REDIRECT_PATH
+                        && target.contains("code=");
+                    if !is_callback {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = stream.flush();
+                        continue;
+                    }
+                    let full_url = format!("http://127.0.0.1:{port}{target}");
+                    let body = "<!DOCTYPE html><html><body><h2>Authorization complete</h2><p>You can close this tab and return to Termul.</p><script>window.close();</script></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    break full_url;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                return Err(format!("callback listener error: {e}"));
+            }
+        }
+    };
+    // 5. Exchange the authorization code for tokens using the SAME session
+    //    (which holds the PKCE verifier). After handle_callback succeeds, the
+    //    OAuthState transitions to Authorized(manager) — the token is stored
+    //    in the manager's InMemoryCredentialStore. We read it from there.
+    let mut oauth_state = OAuthState::Session(session);
+
+    let callback = rmcp::transport::auth::AuthorizationCallback::from_redirect_url(&callback_url)
+        .map_err(|e| format!("callback parse failed: {e}"))?;
+
+    oauth_state
+        .handle_callback(&callback.code, &callback.csrf_token)
+        .await
+        .map_err(|e| format!("token exchange failed: {e}"))?;
+
+    // After handle_callback, oauth_state is now Authorized(manager).
+    // Call get_access_token on the MANAGER (not on OAuthState, which returns
+    // "Already authorized" for the Authorized variant).
+    let (access_token, client_id, refresh_token, expires_at) = match &oauth_state {
+        OAuthState::Authorized(manager) | OAuthState::Unauthorized(manager) => {
+            use oauth2::TokenResponse;
+            let token = manager.get_access_token().await
+                .map_err(|e| {
+                    log::warn!("[mcp-oauth] failed to retrieve access token (url redacted): {e}");
+                    format!("failed to get access token: {e}")
+                })?;
+            let creds = manager.get_credentials().await
+                .map_err(|e| {
+                    log::warn!("[mcp-oauth] failed to retrieve credentials (url redacted): {e}");
+                    format!("failed to get credentials: {e}")
+                })?;
+            let refresh = creds.1.as_ref().and_then(|tr| tr.refresh_token().map(|t| t.secret().to_string()));
+            let exp = creds.1.as_ref().and_then(|tr| tr.expires_in()).map(|d| {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|n| n.as_secs() + d.as_secs()).unwrap_or(0)
+            });
+            (token, creds.0, refresh, exp)
+        }
+        _ => return Err("unexpected OAuth state after callback".to_string()),
+    };
+
+    // 6. Store the token in the file store.
+    let stored = crate::acp::mcp_oauth::StoredToken {
+        access_token,
+        refresh_token,
+        expires_at,
+        client_id,
+        issuer: server_url.clone(),
+        server_url: server_url.clone(),
+    };
+    crate::acp::mcp_oauth::store_token(&server_url, &stored)
+        .map_err(|e| format!("failed to store token: {e}"))?;
+
+    log::info!(
+        "[mcp-oauth] OAuth flow completed for server (url redacted), has refresh token: {}",
+        stored.refresh_token.is_some()
+    );
+
+    Ok(())
+}
+
+/// Check whether a stored OAuth token exists for a server URL. Returns `true`
+/// when a token is found (the renderer shows "Connected" / "Disconnect"
+/// instead of "Connect"). Does NOT check token validity — the next probe
+/// handles refresh/expiry transparently.
+#[tauri::command]
+pub fn acp_mcp_oauth_has_token(server_url: String) -> Result<bool, String> {
+    Ok(crate::acp::mcp_oauth::load_stored_token(&server_url)
+        .map(|t| t.is_some())
+        .unwrap_or(false))
+}
+
+/// Delete the stored OAuth token for a server URL (the "Disconnect" action).
+/// After this, the next probe will return `AuthRequired` again and the user
+/// can re-connect.
+#[tauri::command]
+pub fn acp_mcp_oauth_disconnect(server_url: String) -> Result<(), String> {
+    crate::acp::mcp_oauth::delete_stored_token(&server_url)
+        .map_err(|e| e.to_string())
 }
 
 /// Set the in-process ACP turn (hard-cap) timeout override, in seconds, or

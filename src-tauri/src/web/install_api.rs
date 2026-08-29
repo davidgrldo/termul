@@ -62,7 +62,7 @@ pub async fn install(
         Err(error) => {
             warn!(
                 target: "termul::web::install_api",
-                session = crate::logging::session_id(),
+                session = crate::logging::run_id(),
                 error = %error,
                 "install: payload validation failed (deny_unknown_fields or malformed JSON)"
             );
@@ -88,7 +88,7 @@ pub async fn install(
         Ok(outcome) => {
             info!(
                 target: "termul::web::install_api",
-                session = crate::logging::session_id(),
+                session = crate::logging::run_id(),
                 agent = %req.agent_id,
                 "install: success"
             );
@@ -98,7 +98,7 @@ pub async fn install(
             let code = error.code();
             warn!(
                 target: "termul::web::install_api",
-                session = crate::logging::session_id(),
+                session = crate::logging::run_id(),
                 agent = %req.agent_id,
                 code,
                 msg = %error.message,
@@ -188,6 +188,8 @@ mod tests {
         projects_file: None,
         history_mode: HistoryMode::LiveOnly,
         project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
+        pending_oauth_flows: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        oauth_base_url: "http://127.0.0.1".to_string(),
         workspace_manifest: None,
         acp_catalog: None,
         acp_install: Some(store),
@@ -208,6 +210,8 @@ mod tests {
         projects_file: None,
         history_mode: HistoryMode::LiveOnly,
         project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
+        pending_oauth_flows: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        oauth_base_url: "http://127.0.0.1".to_string(),
         workspace_manifest: None,
         acp_catalog: None,
         acp_install: None,

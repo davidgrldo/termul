@@ -75,7 +75,6 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
         })
       })
   }, [browserTabId])
-
   // Create / destroy webview lifecycle
   useEffect(() => {
     mountedRef.current = true
@@ -92,7 +91,14 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
     browserTabCreate(browserTabId, urlRef.current, bounds)
       .then((result) => {
         if (!mountedRef.current || mountToken !== mountTokenRef.current) {
-          browserTabDestroy(browserTabId).catch(console.error)
+          browserTabDestroy(browserTabId).catch((e) => {
+            void logFrontendError({
+              message: `browserTabDestroy after stale mount for tab ${browserTabId}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+              source: 'useBrowserWebview'
+            })
+          })
           return
         }
         if (result.success) {
@@ -180,13 +186,21 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
             void resyncAndShow()
           })
         } else {
-          console.error('[BrowserWebview] create failed:', result.error)
+          void logFrontendError({
+            message: `browserTabCreate failed for tab ${browserTabId}: ${result.error ?? 'unknown'} [${result.code ?? 'NO_CODE'}]`,
+            source: 'useBrowserWebview'
+          })
           clearLoadingTimeout()
           useBrowserSessionStore.getState().setLoading(browserTabId, false)
         }
       })
       .catch((err) => {
-        console.error('[BrowserWebview] create error:', err)
+        void logFrontendError({
+          message: `browserTabCreate rejected for tab ${browserTabId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          source: 'useBrowserWebview'
+        })
         clearLoadingTimeout()
         useBrowserSessionStore.getState().setLoading(browserTabId, false)
       })
@@ -198,10 +212,20 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
       browserTabDestroy(browserTabId)
         .then((result) => {
           if (!result.success) {
-            console.error('[BrowserWebview] destroy failed:', result.error)
+            void logFrontendError({
+              message: `browserTabDestroy failed for tab ${browserTabId}: ${result.error ?? 'unknown'}`,
+              source: 'useBrowserWebview'
+            })
           }
         })
-        .catch(console.error)
+        .catch((e) => {
+          void logFrontendError({
+            message: `browserTabDestroy rejected for tab ${browserTabId}: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+            source: 'useBrowserWebview'
+          })
+        })
       createdRef.current = false
     }
   }, [browserTabId, clearLoadingTimeout, armLoadingTimeout, updateBounds])
@@ -214,15 +238,39 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
       updateBounds()
       browserTabShow(browserTabId)
         .then((r) => {
-          if (!r.success) console.error('[BrowserWebview] show failed:', r.error)
+          if (!r.success) {
+            void logFrontendError({
+              message: `browserTabShow failed for tab ${browserTabId}: ${r.error}`,
+              source: 'useBrowserWebview'
+            })
+          }
         })
-        .catch(console.error)
+        .catch((err) => {
+          void logFrontendError({
+            message: `browserTabShow rejected for tab ${browserTabId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            source: 'useBrowserWebview'
+          })
+        })
     } else {
       browserTabHide(browserTabId)
         .then((r) => {
-          if (!r.success) console.error('[BrowserWebview] hide failed:', r.error)
+          if (!r.success) {
+            void logFrontendError({
+              message: `browserTabHide failed for tab ${browserTabId}: ${r.error}`,
+              source: 'useBrowserWebview'
+            })
+          }
         })
-        .catch(console.error)
+        .catch((err) => {
+          void logFrontendError({
+            message: `browserTabHide rejected for tab ${browserTabId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            source: 'useBrowserWebview'
+          })
+        })
     }
   }, [isVisible, browserTabId, updateBounds])
 
@@ -236,13 +284,21 @@ export function useBrowserWebview(browserTabId: string, isVisible: boolean, url:
     browserTabNavigate(browserTabId, url)
       .then((result) => {
         if (!result.success) {
-          console.error('[BrowserWebview] navigate failed:', result.error)
+          void logFrontendError({
+            message: `browserTabNavigate failed for tab ${browserTabId}: ${result.error}`,
+            source: 'useBrowserWebview'
+          })
           clearLoadingTimeout()
           useBrowserSessionStore.getState().setLoading(browserTabId, false)
         }
       })
       .catch((err) => {
-        console.error('[BrowserWebview] navigate error:', err)
+        void logFrontendError({
+          message: `browserTabNavigate rejected for tab ${browserTabId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          source: 'useBrowserWebview'
+        })
         clearLoadingTimeout()
         useBrowserSessionStore.getState().setLoading(browserTabId, false)
       })
