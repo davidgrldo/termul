@@ -25,6 +25,29 @@ describe('extractSuggestedCommands', () => {
     ])
   })
 
+  it('never offers multi-line or control-character commands for insertion', () => {
+    // #689 review (CWE-78): terminalApi.write feeds the PTY directly, so a
+    // newline or control byte inside a suggested block would execute it —
+    // the extractor must refuse such blocks outright.
+    const markdown = [
+      'Do this:',
+      '',
+      '```sh',
+      'echo one',
+      'echo two',
+      '```',
+      '',
+      '```sh',
+      'ping \x1b[C example.com',
+      '```',
+      '',
+      '```sh',
+      'safe --single-line',
+      '```'
+    ].join('\n')
+    expect(extractSuggestedCommands(markdown)).toEqual(['safe --single-line'])
+  })
+
   it('returns nothing when there are no code blocks', () => {
     expect(extractSuggestedCommands('just prose, no fences')).toEqual([])
   })

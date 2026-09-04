@@ -405,9 +405,12 @@ function ConnectedTerminalComponent({
         const text = await useAcpStore
           .getState()
           .assistTerminal(kind, record.cwd, selection, record.lastExitCode ?? null)
-        setAssistPanel({ kind, status: 'done', text })
+        // Functional update: if the user closed the panel while the request
+        // was in flight, the settled response must not reopen it (#689
+        // review).
+        setAssistPanel((prev) => (prev ? { kind, status: 'done', text } : prev))
       } catch (error) {
-        setAssistPanel({ kind, status: 'error', error: String(error) })
+        setAssistPanel((prev) => (prev ? { kind, status: 'error', error: String(error) } : prev))
       }
     },
     [terminalInstance]
@@ -415,9 +418,20 @@ function ConnectedTerminalComponent({
 
   // #259: insertion only — the suggested command lands at the prompt for
   // review and is never executed automatically (no trailing newline).
+  // Defense in depth: anything carrying a newline/control character is
+  // refused outright — `terminalApi.write` feeds the PTY directly.
   const insertAssistCommand = useCallback(async (command: string) => {
     const ptyId = ptyIdRef.current
     if (!ptyId) return
+    for (const ch of command) {
+      const code = ch.charCodeAt(0)
+      if (code < 0x20 || code === 0x7f) {
+        if (onErrorRef.current) {
+          onErrorRef.current('Refused to insert a command containing control characters')
+        }
+        return
+      }
+    }
     try {
       const result = await terminalApi.write(ptyId, command)
       if (!result.success && onErrorRef.current) {
