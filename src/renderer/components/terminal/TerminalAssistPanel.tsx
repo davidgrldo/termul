@@ -53,8 +53,7 @@ export function TerminalAssistPanel({
   const title = state.kind === 'fix' ? 'Fix command' : 'Explain output'
 
   return (
-    <div
-      role="complementary"
+    <aside
       aria-label={`Terminal AI assist — ${title}`}
       className="absolute bottom-3 right-3 z-20 w-[420px] max-w-[calc(100%-1.5rem)] rounded-lg border border-border/70 bg-card shadow-lg"
     >
@@ -107,6 +106,6 @@ export function TerminalAssistPanel({
           ))}
         </div>
       ) : null}
-    </div>
+    </aside>
   )
 }
