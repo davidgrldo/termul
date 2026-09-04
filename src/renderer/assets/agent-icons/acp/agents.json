@@ -102,11 +102,11 @@
   {
     "id": "claude-acp",
     "name": "Claude Agent",
-    "version": "0.73.0",
+    "version": "0.74.0",
     "description": "ACP wrapper for Anthropic's Claude",
     "distribution": {
       "npx": {
-        "package": "@agentclientprotocol/claude-agent-acp@0.73.0"
+        "package": "@agentclientprotocol/claude-agent-acp@0.74.0"
       }
     }
   },
@@ -137,11 +137,11 @@
   {
     "id": "codex-acp",
     "name": "Codex",
-    "version": "1.8.0",
+    "version": "1.9.0",
     "description": "ACP adapter for OpenAI's coding assistant",
     "distribution": {
       "npx": {
-        "package": "@agentclientprotocol/codex-acp@1.8.0"
+        "package": "@agentclientprotocol/codex-acp@1.9.0"
       }
     }
   },
@@ -364,11 +364,11 @@
   {
     "id": "factory-droid",
     "name": "Factory Droid",
-    "version": "0.211.0",
+    "version": "0.212.0",
     "description": "Factory Droid - AI coding agent powered by Factory AI",
     "distribution": {
       "npx": {
-        "package": "droid@0.211.0",
+        "package": "droid@0.212.0",
         "args": ["exec", "--output-format", "acp-daemon"],
         "env": {
           "DROID_DISABLE_AUTO_UPDATE": "true",
