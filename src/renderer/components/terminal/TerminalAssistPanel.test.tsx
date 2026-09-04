@@ -90,3 +90,18 @@ describe('TerminalAssistPanel', () => {
     ).not.toBeInTheDocument()
   })
 })
+
+describe('TerminalAssistPanel keyboard', () => {
+  it('closes on Escape', () => {
+    const onClose = vi.fn()
+    render(
+      <TerminalAssistPanel
+        state={{ kind: 'explain', status: 'loading' }}
+        onClose={onClose}
+        onInsertCommand={vi.fn()}
+      />
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+})

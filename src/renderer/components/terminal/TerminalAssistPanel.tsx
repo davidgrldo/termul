@@ -1,6 +1,6 @@
 import { Sparkles, X } from 'lucide-react'
 import type React from 'react'
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import { renderChatMarkdown } from '@/lib/chat-markdown'
 import { cn } from '@/lib/utils'
 
@@ -51,6 +51,15 @@ export function TerminalAssistPanel({
     [state.status, state.text]
   )
   const title = state.kind === 'fix' ? 'Fix command' : 'Explain output'
+
+  // Esc closes the panel (keyboard parity with the close button).
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
 
   return (
     <aside
