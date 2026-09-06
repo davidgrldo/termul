@@ -4029,7 +4029,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
               void logFrontendError({
                 level: 'warn',
                 source: 'acp.assistTerminal.lateCleanup',
-                message: `Failed to close late temporary ACP session: ${String(error)}`
+                message: 'failed to close late temporary ACP session (details withheld)'
               })
             } finally {
               terminalAssistCollectors.delete(lateSessionId)
@@ -4091,7 +4091,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     } catch (error) {
       void logFrontendError({
         source: 'acp.assistTerminal',
-        message: `Terminal assist (${kind}) failed: ${String(error)}`
+        message: `Terminal assist (${kind}) failed (details withheld)`
       })
       throw error
     } finally {
@@ -4116,7 +4116,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           void logFrontendError({
             level: 'warn',
             source: 'acp.assistTerminal.cleanup',
-            message: `Failed to dispose temporary ACP session: ${String(error)}`
+            message: 'failed to dispose temporary ACP session (details withheld)'
           })
         } finally {
           terminalAssistCollectors.delete(temporarySessionId)
