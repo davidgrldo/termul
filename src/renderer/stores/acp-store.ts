@@ -3227,11 +3227,19 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     try {
       const configs = await loadAgentConfigsFromDisk()
       set({ agentConfigs: configs })
-    } catch (err) {
+    } catch {
       // A real storage/backend error is surfaced by the persistence layer; at the
       // store level we log and leave the list empty rather than crashing app
-      // mount. (A missing key already returns [] without throwing.)
-      console.error('[acp] failed to load agent configs', err)
+      // mount. (A missing key already returns [] without throwing.) Routed
+      // through log-api rather than console.* — an async console write that
+      // lands after a test run's last tick races vitest's worker RPC teardown
+      // ("onUserConsoleLog pending") and has failed CI twice on otherwise
+      // green runs (#689, #690).
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp.loadAgentConfigs',
+        message: 'failed to load agent configs; leaving the list empty'
+      })
     }
   },
 
@@ -4410,8 +4418,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       })
       // Reclaim any app-owned temp files staged for this session.
       void deleteSessionTempFiles(id)
-    } catch (e) {
-      console.error('[acp] failed to delete session history', e)
+    } catch {
+      // Same console-vs-log-api rationale as loadAgentConfigs: async console
+      // writes race vitest worker teardown; details stay out of backend logs.
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp.deleteHistorySession',
+        message: 'failed to delete session history'
+      })
     }
   },
 
