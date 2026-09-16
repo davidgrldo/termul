@@ -6,6 +6,9 @@ vi.mock('@/lib/log-api', () => ({
   logFrontendError: vi.fn()
 }))
 
+// Static import of the globally mocked (vitest.setup.ts) Tauri IPC surface —
+// the desktop-path tests assert the exact command names + payloads.
+import { invoke } from '@tauri-apps/api/core'
 import { logFrontendError } from '@/lib/log-api'
 import {
   _resetAcpTransportForTests,
@@ -214,6 +217,11 @@ class FakeWebSocket {
       return
     }
     if (req.type === 'dispose_ephemeral_session') {
+      this.emitReply({ id: req.id, ok: true, payload: {} })
+      return
+    }
+    if (req.type === 'promote_session') {
+      // Story 8: the host promotes the warm-pool session to durable — ok.
       this.emitReply({ id: req.id, ok: true, payload: {} })
       return
     }
@@ -629,6 +637,75 @@ describe('WsAcpTransport', () => {
     transport.dispose()
   })
 
+  it('promoteSession sends promote_session then subscribes (story 8)', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await transport.promoteSession?.('agent-1', 'sess-warm')
+
+    const sent = sock.sent.map((s) => JSON.parse(s) as { type: string; payload: unknown })
+    const promoteIdx = sent.findIndex((r) => r.type === 'promote_session')
+    const subscribeIdx = sent.findIndex(
+      (r) =>
+        r.type === 'subscribe' && (r.payload as { sessionId?: string }).sessionId === 'sess-warm'
+    )
+    expect(promoteIdx).toBeGreaterThanOrEqual(0)
+    expect(subscribeIdx).toBeGreaterThanOrEqual(0)
+    // The promote must land BEFORE the subscribe so the first prompt persists
+    // (durability handoff, then stream attach).
+    expect(promoteIdx).toBeLessThan(subscribeIdx)
+    expect(sent[promoteIdx]?.payload).toEqual({ agentId: 'agent-1', sessionId: 'sess-warm' })
+
+    transport.dispose()
+  })
+
+  it('promoteSession resolves when the post-promotion subscribe fails (story 8)', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const internals = transport as unknown as TransportInternals
+    const sock = internals.socket
+    vi.mocked(logFrontendError).mockClear()
+
+    // A subscribe failure AFTER a successful promote must not reject the
+    // promotion: the session is already durable on the host. (Non-STALE code
+    // so subscribeSession throws instead of entering snapshot recovery.)
+    sock.subscribeFailureCodes.set('sess-warm', 'agent_crashed')
+
+    await expect(transport.promoteSession?.('agent-1', 'sess-warm')).resolves.toBeUndefined()
+    expect(logFrontendError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: 'warn',
+        source: 'WsAcpTransport.promoteSession',
+        message: expect.stringContaining('sess-warm')
+      })
+    )
+    // The optimistic pre-request subscribed mark is cleared, so the
+    // already-subscribed guard cannot suppress a later retry.
+    expect(internals.subscribed.has('sess-warm')).toBe(false)
+
+    // Retry eligibility: once the transient failure clears, a re-promote (or
+    // the next sendPrompt's subscribe) re-attaches the live stream.
+    sock.subscribeFailureCodes.delete('sess-warm')
+    const subscribesFor = () =>
+      sock.sent.filter((s) => {
+        const frame = JSON.parse(s) as { type: string; payload?: { sessionId?: string } }
+        return frame.type === 'subscribe' && frame.payload?.sessionId === 'sess-warm'
+      }).length
+    const subscribesBefore = subscribesFor()
+    await expect(transport.promoteSession?.('agent-1', 'sess-warm')).resolves.toBeUndefined()
+    expect(subscribesFor()).toBe(subscribesBefore + 1)
+    expect(internals.subscribed.has('sess-warm')).toBe(true)
+
+    transport.dispose()
+  })
+
   it('timeout setters are desktop-only no-ops on the WS transport', async () => {
     const transport = new WsAcpTransport({
       url: 'ws://test/ws',
@@ -645,7 +722,6 @@ describe('WsAcpTransport', () => {
     await transport.setTurnIdleTimeout(1800)
     await transport.setSessionNewTimeout(120)
     await transport.setSessionReopenTimeout(300)
-    await transport.setFirstPromptWarmupTimeout(0)
 
     expect(sock.sent.length).toBe(sentBefore)
     transport.dispose()
@@ -1440,6 +1516,28 @@ describe('WsAcpTransport', () => {
     })
     expect(frames.some((frame) => frame.type === 'subscribe')).toBe(false)
     expect(transport.getSessionCursor('sess-chatflow')).toBeNull()
+    transport.dispose()
+  })
+
+  it('forwards promotable ephemeral creation over WS (story 8)', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await transport.newSession('a1', '/work', undefined, { ephemeral: true, promotable: true })
+
+    const frames = sock.sent.map((raw) => JSON.parse(raw) as { type: string; payload: unknown })
+    expect(frames).toContainEqual({
+      id: expect.any(String),
+      type: 'create_session',
+      payload: { agentId: 'a1', cwd: '/work', ephemeral: true, promotable: true }
+    })
+    // Ephemeral: still no subscribe at create (the subscribe happens on
+    // `promoteSession`).
+    expect(frames.some((frame) => frame.type === 'subscribe')).toBe(false)
     transport.dispose()
   })
 
@@ -2531,7 +2629,6 @@ describe('createAcpTransport selection', () => {
   })
 
   it('desktop load/resume return the typed Tauri invoke outcome', async () => {
-    const { invoke } = await import('@tauri-apps/api/core')
     const outcome = { configOptions: [] }
     vi.mocked(invoke).mockResolvedValue(outcome)
     const transport = createAcpTransport({ force: 'tauri' })
@@ -2547,6 +2644,36 @@ describe('createAcpTransport selection', () => {
       agentId: 'a1',
       sessionId: 's1',
       cwd: '/work'
+    })
+    transport.dispose()
+  })
+
+  it('desktop promoteSession invokes acp_promote_session and resolves on success', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    const transport = createAcpTransport({ force: 'tauri' })
+
+    // Story 8: the desktop path delegates promotion to the Rust driver via
+    // `acp_promote_session` — a successful command resolves with no payload.
+    await expect(transport.promoteSession?.('a1', 's1')).resolves.toBeUndefined()
+    expect(invoke).toHaveBeenCalledWith('acp_promote_session', {
+      agentId: 'a1',
+      sessionId: 's1'
+    })
+    transport.dispose()
+  })
+
+  it('desktop promoteSession propagates a failed promotion outcome', async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error('failed to persist promoted session: disk full'))
+    const transport = createAcpTransport({ force: 'tauri' })
+
+    // A backend promote failure must reject so the store can re-mark the
+    // session ephemeral and warn the user (chat stays non-durable).
+    await expect(transport.promoteSession?.('a1', 's1')).rejects.toThrow(
+      'failed to persist promoted session'
+    )
+    expect(invoke).toHaveBeenCalledWith('acp_promote_session', {
+      agentId: 'a1',
+      sessionId: 's1'
     })
     transport.dispose()
   })
