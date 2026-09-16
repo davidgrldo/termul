@@ -210,7 +210,13 @@ export interface AcpTransport {
   getSessionPayload?(sessionId: SessionId): Promise<SessionPayload | null>
   /** Tail-first variant of `getSessionPayload`: fetches only the last `limit` messages. */
   getSessionPayloadTail?(sessionId: SessionId, limit: number): Promise<SessionPayload | null>
-  onEvent<T>(eventName: string, callback: (payload: T) => void): () => void
+  /**
+   * `eventSeq` is the server envelope seq of a per-session event (web only —
+   * absent on Tauri IPC and on agent-level/relay frames). It lets store
+   * handlers drop events already covered by the authoritative fetched payload
+   * (CAP-3 replay contract).
+   */
+  onEvent<T>(eventName: string, callback: (payload: T, eventSeq?: number) => void): () => void
   /** Web: open socket + placeholder authenticate. No-op on Tauri. */
   connect(): Promise<void>
   /** Web: subscribe to a session with cursor for reconnect/gap-fill. */
@@ -240,9 +246,17 @@ export interface AcpTransport {
   getConnectionState?(): AcpConnectionState
   setRecoveryHandler?(
     handler: (
-      recovery: SessionSnapshotEvent | { sessionId: string; degraded: true }
+      recovery: SessionSnapshotEvent | { sessionId: string; degraded: true },
+      reopenGeneration?: number
     ) => Promise<void>
   ): void
+  /**
+   * Register a provider for the store's per-session reopen generation. The
+   * transport captures it BEFORE the recovery round-trip and threads it to
+   * the recovery handler so a late snapshot cannot install over a session
+   * that was torn down or replaced mid-recovery. WS only.
+   */
+  setRecoveryGenerationProvider?(provider: (sessionId: SessionId) => number): void
   getSessionCursor?(sessionId: SessionId): number | null
   /** R2: fetch the server-authoritative replay watermark for a session
    * (without subscribing). Used by the refresh-resume hook to seed a fresh
@@ -365,7 +379,7 @@ function createTauriAcpTransport(): AcpTransport {
     authenticate: async (agentId, methodId) => {
       await invoke('acp_authenticate', { agentId, methodId })
     },
-    onEvent<T>(eventName: string, callback: (payload: T) => void): () => void {
+    onEvent<T>(eventName: string, callback: (payload: T, eventSeq?: number) => void): () => void {
       let resolvedUnlisten: UnlistenFn | null = null
       let unlistenCalledEarly = false
 
@@ -482,7 +496,7 @@ type Pending = {
   deadline?: number
 }
 
-type EventListener = (payload: unknown) => void
+type EventListener = (payload: unknown, eventSeq?: number) => void
 
 /**
  * Multiplexed ACP WS client.
@@ -526,8 +540,10 @@ export class WsAcpTransport implements AcpTransport {
   /** Idempotent prompt_complete turn ids already delivered, scoped by session. */
   private readonly seenTurnIds = new Map<string, Set<string>>()
   private recoveryHandler?: (
-    recovery: SessionSnapshotEvent | { sessionId: string; degraded: true }
+    recovery: SessionSnapshotEvent | { sessionId: string; degraded: true },
+    reopenGeneration?: number
   ) => Promise<void>
+  private recoveryGenerationProvider?: (sessionId: SessionId) => number
   private reconnectPriorityProvider?: () => SessionId[]
   private readonly wsUrl: string
   private readonly webSocketCtor: typeof WebSocket
@@ -600,10 +616,15 @@ export class WsAcpTransport implements AcpTransport {
 
   setRecoveryHandler(
     handler: (
-      recovery: SessionSnapshotEvent | { sessionId: string; degraded: true }
+      recovery: SessionSnapshotEvent | { sessionId: string; degraded: true },
+      reopenGeneration?: number
     ) => Promise<void>
   ): void {
     this.recoveryHandler = handler
+  }
+
+  setRecoveryGenerationProvider(provider: (sessionId: SessionId) => number): void {
+    this.recoveryGenerationProvider = provider
   }
 
   setReconnectPriorityProvider(provider: () => SessionId[]): void {
@@ -684,13 +705,18 @@ export class WsAcpTransport implements AcpTransport {
       await this.request('subscribe', payload)
     } catch (err) {
       if (err instanceof AcpTransportError && err.code === WS_ERROR_CODES.STALE) {
+        // Capture the store's reopen generation BEFORE the recovery
+        // round-trip: a close/delete/reopen during the await invalidates it
+        // and the store rejects the late install so recovery cannot
+        // resurrect a torn-down or replaced session.
+        const reopenGeneration = this.recoveryGenerationProvider?.(sessionId)
         if (this.negotiatedHistoryMode === 'server') {
           const recovery = await this.request<SessionSnapshotEvent>('recover_session_snapshot', {
             sessionId
           })
           this.lastSeq.set(sessionId, recovery.watermark)
           this.seenTurnIds.delete(sessionId)
-          await this.recoveryHandler?.(recovery)
+          await this.recoveryHandler?.(recovery, reopenGeneration)
           // handle_recover_session_snapshot server-side re-registers the
           // subscription for continued live delivery — no separate subscribe
           // call needed here.
@@ -699,21 +725,21 @@ export class WsAcpTransport implements AcpTransport {
         this.lastSeq.delete(sessionId)
         this.seenTurnIds.delete(sessionId)
         await this.request('subscribe', { sessionId })
-        await this.recoveryHandler?.({ sessionId, degraded: true })
+        await this.recoveryHandler?.({ sessionId, degraded: true }, reopenGeneration)
         return
       }
       throw err
     }
   }
 
-  onEvent<T>(eventName: string, callback: (payload: T) => void): () => void {
+  onEvent<T>(eventName: string, callback: (payload: T, eventSeq?: number) => void): () => void {
     const wsType = toWsEventType(eventName)
     let set = this.listeners.get(wsType)
     if (!set) {
       set = new Set()
       this.listeners.set(wsType, set)
     }
-    const wrapped: EventListener = (payload) => callback(payload as T)
+    const wrapped: EventListener = (payload, eventSeq) => callback(payload as T, eventSeq)
     set.add(wrapped)
     // Ensure socket is up so events can arrive.
     void this.connect().catch(console.error)
@@ -1665,15 +1691,18 @@ export class WsAcpTransport implements AcpTransport {
         seen.add(turnId)
       }
     }
-    this.emitLocal(evt.type, evt.payload)
+    // Pass the envelope seq through so store handlers can seq-dedupe live
+    // events against the authoritative fetched payload (CAP-3 replay
+    // contract): events already covered by the payload are dropped.
+    this.emitLocal(evt.type, evt.payload, evt.seq)
   }
 
-  private emitLocal(wsType: string, payload: unknown): void {
+  private emitLocal(wsType: string, payload: unknown, eventSeq?: number): void {
     const set = this.listeners.get(wsType)
     if (!set) return
     for (const cb of set) {
       try {
-        cb(payload)
+        cb(payload, eventSeq)
       } catch (err) {
         console.error('[acp-transport] listener error', err)
       }

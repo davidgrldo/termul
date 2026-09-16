@@ -975,6 +975,36 @@ describe('WsAcpTransport', () => {
     transport.dispose()
   })
 
+  it('passes the envelope seq to listeners so the store can seq-dedupe against the payload', async () => {
+    // CAP-3 replay contract (story 11): the fetched payload is authoritative;
+    // store handlers drop live events whose envelope seq the payload already
+    // covers. That requires the envelope seq to reach the listener.
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const seen: Array<{ payload: unknown; eventSeq?: number }> = []
+    transport.onEvent('acp:message_chunk', (p, eventSeq) => {
+      seen.push({ payload: p, eventSeq })
+    })
+
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.emit({ sid: 's1', seq: 7, type: 'message_chunk', payload: { n: 7 } })
+    expect(seen).toEqual([{ payload: { n: 7 }, eventSeq: 7 }])
+    // Agent-level / relay events carry no per-session seq: the listener
+    // receives undefined (never a 0 that a `seq <= watermark` check could
+    // misread as history-covered).
+    const agentEvents: Array<{ payload: unknown; eventSeq?: number }> = []
+    transport.onEvent('acp:agent_spawned', (p, eventSeq) => {
+      agentEvents.push({ payload: p, eventSeq })
+    })
+    sock.emit({ sid: null, seq: 0, type: 'agent_spawned', payload: { agentId: 'a1' } })
+    expect(agentEvents).toEqual([{ payload: { agentId: 'a1' }, eventSeq: undefined }])
+    expect(seen).toHaveLength(1)
+    transport.dispose()
+  })
+
   it('reload simulates cursor-replay-then-continue (fresh transport + fresh socket)', async () => {
     // Category B/E: simulate a page reload by creating a FRESH transport
     // whose `lastSeq` cursor is restored from the HOST (the cross-client
@@ -1079,6 +1109,63 @@ describe('WsAcpTransport', () => {
     await transport.connect()
     await transport.subscribeSession('s1', 99)
     expect(recoveries).toEqual([{ sessionId: 's1', degraded: true }])
+    transport.dispose()
+  })
+  it('captures the reopen generation before the snapshot round-trip and threads it to recovery', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    const order: string[] = []
+    transport.setRecoveryGenerationProvider((sessionId) => {
+      order.push(`capture:${sessionId}`)
+      return 5
+    })
+    const generations: Array<number | undefined> = []
+    transport.setRecoveryHandler(async (_recovery, reopenGeneration) => {
+      generations.push(reopenGeneration)
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.snapshotEvents = [
+      { sid: 's1', seq: 42, type: 'message_chunk', payload: { content: { text: 'snapshot' } } }
+    ]
+    const origSend = sock.send.bind(sock)
+    sock.send = (data: string) => {
+      order.push(`send:${JSON.parse(data).type}`)
+      origSend(data)
+    }
+
+    await transport.subscribeSession('s1', 99)
+
+    // The generation handed to the handler is the one captured BEFORE the
+    // recover_session_snapshot request went out — a mid-flight close/reopen
+    // is detected by the store comparing against the CURRENT generation.
+    expect(generations).toEqual([5])
+    expect(order.indexOf('capture:s1')).toBeGreaterThanOrEqual(0)
+    expect(order.indexOf('capture:s1')).toBeLessThan(order.indexOf('send:recover_session_snapshot'))
+    transport.dispose()
+  })
+
+  it('threads the reopen generation to degraded (live-only) recovery', async () => {
+    class LiveOnlySocket extends FakeWebSocket {
+      constructor(url: string) {
+        super(url)
+        this.historyMode = 'live_only'
+      }
+    }
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: LiveOnlySocket as unknown as typeof WebSocket
+    })
+    transport.setRecoveryGenerationProvider(() => 7)
+    const generations: Array<number | undefined> = []
+    transport.setRecoveryHandler(async (_recovery, reopenGeneration) => {
+      generations.push(reopenGeneration)
+    })
+    await transport.connect()
+    await transport.subscribeSession('s1', 99)
+    expect(generations).toEqual([7])
     transport.dispose()
   })
 
