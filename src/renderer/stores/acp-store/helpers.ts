@@ -1463,7 +1463,12 @@ export async function reapplyPersistedComposerOptions(
   // error/launch-fail state has no stable advertised surface to validate
   // picks against, and firing set-config calls there can race the launch
   // failure path.
-  if (!session || session.status !== 'active' || session.configOptions.length === 0) return
+  if (
+    !session ||
+    session.status !== 'active' ||
+    (session.configOptions.length === 0 && (session.models?.availableModels.length ?? 0) === 0)
+  )
+    return
   reapplyInFlight.add(sessionId)
   // Snapshot the live values when the read starts. The read is async; if the
   // user (or any event) changes a value while it is in flight, the change is
@@ -1512,10 +1517,14 @@ export async function reapplyPersistedComposerOptions(
       const modelOption = live?.configOptions.find((o) => o.category === 'model')
       const current = modelOption?.currentValue ?? live?.models?.currentModelId ?? null
       if (current !== modelAtReadStart) return // model changed during read
+      // Advertised via a model-category config option (flattened for groups)
+      // or through the native session.models state when no option exists.
       const advertised =
-        modelOption != null &&
-        (modelOption.type === 'boolean' ||
-          flattenConfigOptionValues(modelOption).some((v) => v.value === saved.modelId))
+        (modelOption != null &&
+          (modelOption.type === 'boolean' ||
+            flattenConfigOptionValues(modelOption).some((v) => v.value === saved.modelId))) ||
+        (modelOption == null &&
+          (live?.models?.availableModels.some((m) => m.modelId === saved.modelId) ?? false))
       if (advertised && current !== saved.modelId) {
         try {
           await get().setModel(sessionId, saved.modelId)

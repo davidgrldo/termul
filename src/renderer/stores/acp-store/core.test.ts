@@ -792,3 +792,43 @@ describe('reapplyPersistedComposerOptions — review hardening (#1488)', () => {
     expect(call?.[1]).toMatchObject({ configId: 'thinking', valueId: 'extreme' })
   })
 })
+
+describe('reapplyPersistedComposerOptions — native models path (#1488 review)', () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockClear()
+    mockPersistenceApi.read.mockReset()
+    mockPersistenceApi.read.mockResolvedValue({ success: false })
+  })
+
+  it('heals a saved model on a session that advertises only native session.models', async () => {
+    seedSession('s-native', 'agent-1', false)
+    useAcpStore.setState({
+      sessions: {
+        ...useAcpStore.getState().sessions,
+        's-native': {
+          ...useAcpStore.getState().sessions['s-native'],
+          configOptions: [],
+          models: {
+            currentModelId: 'sonnet',
+            availableModels: [
+              { modelId: 'sonnet', name: 'Sonnet' },
+              { modelId: 'opus', name: 'Opus' }
+            ]
+          }
+        } as never
+      },
+      agentConfigs: [{ id: 'cfg-1', name: 'Agent', command: 'agent', args: [], env: {} }],
+      selectedAgentConfigId: 'cfg-1'
+    })
+    mockPersistenceApi.read.mockResolvedValueOnce({
+      success: true,
+      data: { modelId: 'opus' }
+    })
+    vi.mocked(invoke).mockImplementation(async () => 'ok')
+
+    await reapplyPersistedComposerOptions(useAcpStore.getState as never, 's-native', 'cfg-1')
+
+    const call = vi.mocked(invoke).mock.calls.find(([c]) => String(c) === 'acp_set_model')
+    expect(call?.[1]).toMatchObject({ modelId: 'opus' })
+  })
+})
