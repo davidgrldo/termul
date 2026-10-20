@@ -1465,6 +1465,16 @@ export async function reapplyPersistedComposerOptions(
   // failure path.
   if (!session || session.status !== 'active' || session.configOptions.length === 0) return
   reapplyInFlight.add(sessionId)
+  // Snapshot the live values when the read starts. The read is async; if the
+  // user (or any event) changes a value while it is in flight, the change is
+  // newer than the persisted record and must win — the saved value for that
+  // option is then skipped instead of undoing it (review: race on #1488).
+  const valuesAtReadStart = new Map<string, string | boolean>()
+  for (const option of session.configOptions) valuesAtReadStart.set(option.id, option.currentValue)
+  const modelAtReadStart =
+    session.configOptions.find((o) => o.category === 'model')?.currentValue ??
+    session.models?.currentModelId ??
+    null
   try {
     const result = await persistenceApi.read<PersistedComposerOptions>(
       PersistenceKeys.lastComposerOptions(configId)
@@ -1475,8 +1485,11 @@ export async function reapplyPersistedComposerOptions(
     for (const [optionId, valueId] of Object.entries(saved.configValues ?? {})) {
       const option = get().sessions[sessionId]?.configOptions.find((o) => o.id === optionId)
       if (!option || option.currentValue === valueId) continue
+      if (valuesAtReadStart.get(optionId) !== option.currentValue) continue // changed during read
+      // Grouped selects nest their values; flatten like mergeAgentConfigOptions.
       const advertised =
-        option.type === 'boolean' || option.options?.some((v) => v.value === valueId)
+        option.type === 'boolean' ||
+        flattenConfigOptionValues(option).some((v) => v.value === valueId)
       if (!advertised) continue
       try {
         await get().setConfigOption(sessionId, optionId, valueId)
@@ -1498,7 +1511,11 @@ export async function reapplyPersistedComposerOptions(
       const live = get().sessions[sessionId]
       const modelOption = live?.configOptions.find((o) => o.category === 'model')
       const current = modelOption?.currentValue ?? live?.models?.currentModelId ?? null
-      const advertised = modelOption?.options?.some((v) => v.value === saved.modelId) ?? false
+      if (current !== modelAtReadStart) return // model changed during read
+      const advertised =
+        modelOption != null &&
+        (modelOption.type === 'boolean' ||
+          flattenConfigOptionValues(modelOption).some((v) => v.value === saved.modelId))
       if (advertised && current !== saved.modelId) {
         try {
           await get().setModel(sessionId, saved.modelId)

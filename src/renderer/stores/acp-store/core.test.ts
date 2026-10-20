@@ -686,3 +686,109 @@ describe('reapplyPersistedComposerOptions (#1486/#1479)', () => {
     expect(vi.mocked(invoke).mock.calls.some(([c]) => String(c).startsWith('acp_set_'))).toBe(false)
   })
 })
+
+describe('reapplyPersistedComposerOptions — review hardening (#1488)', () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockClear()
+    mockPersistenceApi.read.mockReset()
+    mockPersistenceApi.read.mockResolvedValue({ success: false })
+  })
+
+  function seedForReview(sessionId: string): void {
+    useAcpStore.setState({
+      sessions: {
+        ...useAcpStore.getState().sessions,
+        [sessionId]: {
+          ...useAcpStore.getState().sessions[sessionId],
+          configOptions: [
+            makeConfigOption('thinking', 'default', ['default', 'high'], 'thought_level')
+          ],
+          models: null
+        } as never
+      },
+      agentConfigs: [{ id: 'cfg-1', name: 'Agent', command: 'agent', args: [], env: {} }],
+      selectedAgentConfigId: 'cfg-1'
+    })
+  }
+
+  it('does not undo a user selection made while the read is in flight', async () => {
+    seedSession('s-race', 'agent-1', false)
+    seedForReview('s-race')
+    let resolveRead: (v: { success: boolean; data?: unknown }) => void = () => {}
+    mockPersistenceApi.read.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRead = resolve
+        })
+    )
+    vi.mocked(invoke).mockImplementation(async () => 'ok')
+
+    const pending = reapplyPersistedComposerOptions(
+      useAcpStore.getState as never,
+      's-race',
+      'cfg-1'
+    )
+    // While the read is pending, the user picks `high` through the composer.
+    useAcpStore.setState({
+      sessions: {
+        ...useAcpStore.getState().sessions,
+        's-race': {
+          ...useAcpStore.getState().sessions['s-race'],
+          configOptions: [
+            makeConfigOption('thinking', 'high', ['default', 'high'], 'thought_level')
+          ]
+        } as never
+      }
+    })
+    resolveRead({ success: true, data: { configValues: { thinking: 'default' } } })
+    await pending
+
+    expect(vi.mocked(invoke).mock.calls.some(([c]) => String(c) === 'acp_set_config_option')).toBe(
+      false
+    )
+  })
+
+  it('recognizes grouped advertised values when healing', async () => {
+    seedSession('s-group', 'agent-1', false)
+    seedForReview('s-group')
+    // A grouped select: the saved value only appears in a nested group.
+    useAcpStore.setState({
+      sessions: {
+        ...useAcpStore.getState().sessions,
+        's-group': {
+          ...useAcpStore.getState().sessions['s-group'],
+          configOptions: [
+            {
+              id: 'thinking',
+              name: 'thinking',
+              category: 'thought_level',
+              type: 'select',
+              currentValue: 'default',
+              options: [
+                { value: 'default', name: 'Default' },
+                {
+                  group: 'Advanced',
+                  name: 'Advanced',
+                  options: [
+                    { value: 'deep', name: 'Deep' },
+                    { value: 'extreme', name: 'Extreme' }
+                  ]
+                }
+              ]
+            }
+          ]
+        } as never
+      }
+    })
+    mockPersistenceApi.read.mockResolvedValueOnce({
+      success: true,
+      data: { configValues: { thinking: 'extreme' } }
+    })
+    vi.mocked(invoke).mockImplementation(async () => 'ok')
+
+    await reapplyPersistedComposerOptions(useAcpStore.getState as never, 's-group', 'cfg-1')
+
+    const call = vi.mocked(invoke).mock.calls.find(([c]) => String(c) === 'acp_set_config_option')
+    expect(call?.[1]).toMatchObject({ configId: 'thinking', valueId: 'extreme' })
+  })
+})
