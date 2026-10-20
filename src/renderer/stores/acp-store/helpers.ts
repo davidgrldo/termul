@@ -1459,7 +1459,11 @@ export async function reapplyPersistedComposerOptions(
 ): Promise<void> {
   if (reapplyInFlight.has(sessionId)) return
   const session = get().sessions[sessionId]
-  if (!session || session.configOptions.length === 0) return
+  // Only heal live chats: a session still initializing or sitting in an
+  // error/launch-fail state has no stable advertised surface to validate
+  // picks against, and firing set-config calls there can race the launch
+  // failure path.
+  if (!session || session.status !== 'active' || session.configOptions.length === 0) return
   reapplyInFlight.add(sessionId)
   try {
     const result = await persistenceApi.read<PersistedComposerOptions>(
