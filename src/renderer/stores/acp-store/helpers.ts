@@ -5,6 +5,7 @@
  */
 
 import type { BugReportSubmitRequest } from '@shared/types/bug-report.types'
+import { type PersistedComposerOptions, PersistenceKeys } from '@shared/types/persistence.types'
 import { UNASSIGNED_PROJECT_ID } from '@shared/types/web-projects.types'
 import { flattenConfigOptionValues } from '@/components/chat/chat-input-bar-config'
 import { stripHandoffPreamble } from '@/components/chat/handoff-summary'
@@ -42,6 +43,7 @@ import {
   isAgentAuthRequiredError,
   isClaudeAccountSignedOutError
 } from '@/lib/agents/acp-spawn-errors'
+import { persistenceApi } from '@/lib/api'
 import { logFrontendError } from '@/lib/log-api'
 import {
   isFolderTokenPath,
@@ -1436,6 +1438,83 @@ export function cacheOptionsFromSession(set: AcpSet, get: AcpGet, sessionId: Ses
     modes: session.modes ?? null,
     configOptions: session.configOptions ?? []
   })
+  // #1486/#1479: advertised options landing on a live session (fresh
+  // session/new after a branch-checkout re-prepare, or the first
+  // config_option_update after an idle reopen) is exactly the moment a
+  // silently-reset pick can be healed from the persisted composer options.
+  // Idempotent: values equal to the session's current ones are no-ops, and
+  // picks no longer advertised are dropped.
+  void reapplyPersistedComposerOptions(get, sessionId, configId)
+}
+
+/** Sessions with a reapply currently in flight (dedupes event storms). */
+const reapplyInFlight = new Set<SessionId>()
+
+/** Minimal structural shape reapply needs from the store (keeps helpers
+ *  decoupled from the full AcpState action surface). */
+export async function reapplyPersistedComposerOptions(
+  get: AcpGet,
+  sessionId: SessionId,
+  configId: string
+): Promise<void> {
+  if (reapplyInFlight.has(sessionId)) return
+  const session = get().sessions[sessionId]
+  if (!session || session.configOptions.length === 0) return
+  reapplyInFlight.add(sessionId)
+  try {
+    const result = await persistenceApi.read<PersistedComposerOptions>(
+      PersistenceKeys.lastComposerOptions(configId)
+    )
+    if (!result.success || !result.data) return
+    const saved = result.data
+
+    for (const [optionId, valueId] of Object.entries(saved.configValues ?? {})) {
+      const option = get().sessions[sessionId]?.configOptions.find((o) => o.id === optionId)
+      if (!option || option.currentValue === valueId) continue
+      const advertised =
+        option.type === 'boolean' || option.options?.some((v) => v.value === valueId)
+      if (!advertised) continue
+      try {
+        await get().setConfigOption(sessionId, optionId, valueId)
+        void logFrontendError({
+          level: 'info',
+          source: 'acp.reapplyComposerOptions',
+          message: `re-applied persisted config '${optionId}' on session ${sessionId} (#1486/#1479)`
+        })
+      } catch {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.reapplyComposerOptions',
+          message: `failed to re-apply persisted config '${optionId}' (details withheld)`
+        })
+      }
+    }
+
+    if (saved.modelId) {
+      const live = get().sessions[sessionId]
+      const modelOption = live?.configOptions.find((o) => o.category === 'model')
+      const current = modelOption?.currentValue ?? live?.models?.currentModelId ?? null
+      const advertised = modelOption?.options?.some((v) => v.value === saved.modelId) ?? false
+      if (advertised && current !== saved.modelId) {
+        try {
+          await get().setModel(sessionId, saved.modelId)
+          void logFrontendError({
+            level: 'info',
+            source: 'acp.reapplyComposerOptions',
+            message: `re-applied persisted model on session ${sessionId} (#1486/#1479)`
+          })
+        } catch {
+          void logFrontendError({
+            level: 'warn',
+            source: 'acp.reapplyComposerOptions',
+            message: 'failed to re-apply persisted model (details withheld)'
+          })
+        }
+      }
+    }
+  } finally {
+    reapplyInFlight.delete(sessionId)
+  }
 }
 
 /** Best-effort tear-down for a session created by a cancelled/stale prepare. */
