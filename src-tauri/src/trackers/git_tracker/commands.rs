@@ -10,7 +10,47 @@ pub fn git_get_status_detail(cwd: &str) -> Result<Vec<GitStatusDetail>, String> 
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(git_get_status_detail_from_output(&stdout))
+    Ok(git_get_status_detail_from_output(&expand_untracked_dirs(
+        cwd, &stdout,
+    )))
+}
+
+/// Rewrite `?? <dir>/` porcelain lines into one `?? <file>` line per file
+/// inside the directory (#1492). Git collapses a wholly-untracked directory
+/// to a single trailing-slash entry; the Changes panel is file-granular, so
+/// the directory itself would later be handed to the single-file diff loader
+/// and fail with "Is a directory". Expansion uses
+/// `ls-files --others --exclude-standard` so ignored files stay hidden and
+/// the panel lists exactly what staging would add. An empty directory
+/// (nothing to stage) drops out entirely; on any git failure the original
+/// line is kept so status never regresses.
+fn expand_untracked_dirs(cwd: &str, output: &str) -> String {
+    let mut out = String::with_capacity(output.len());
+    for line in output.lines() {
+        if let Some(dir) = line.strip_prefix("?? ").filter(|p| p.ends_with('/')) {
+            let expanded = GitTracker::run_git_command(
+                cwd,
+                &["ls-files", "--others", "--exclude-standard", "--", dir],
+            )
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+            let mut any = false;
+            for file in expanded.lines().filter(|l| !l.is_empty()) {
+                any = true;
+                out.push_str("?? ");
+                out.push_str(file);
+                out.push('\n');
+            }
+            if any {
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 pub(super) fn git_get_status_detail_from_output(output: &str) -> Vec<GitStatusDetail> {
@@ -89,6 +129,15 @@ pub(super) fn build_diff_args(path: &str, is_untracked: bool, staged: bool) -> V
 
 pub fn git_get_diff(cwd: &str, path: &str, staged: bool) -> Result<String, String> {
     if is_git_ignored(cwd, path)? {
+        return Ok(String::new());
+    }
+
+    // Defense in depth (#1492): a directory path must never reach the
+    // single-file diff machinery — `diff --no-index /dev/null <dir>` fails
+    // and the read_to_string fallback surfaces "Is a directory (os error
+    // 21)". The status expansion upstream keeps directories out of the
+    // panel; this guard covers any other caller (web twin, stale selection).
+    if std::path::Path::new(cwd).join(path).is_dir() {
         return Ok(String::new());
     }
 

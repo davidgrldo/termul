@@ -1436,3 +1436,62 @@ async fn a_cwd_snapshot_requested_while_one_runs_gets_that_result() {
     drop(running);
     assert_eq!(GitTracker::poll_git_snapshot(cwd).await, (None, None));
 }
+
+// #1492: wholly-untracked directories must expand to their files in the
+// Changes panel, and a directory path must never reach the diff loader.
+#[test]
+fn it_status_detail_expands_untracked_directories_into_files() {
+    if git_missing() {
+        return;
+    }
+    let repo = init_repo("untracked-dir");
+    std::fs::create_dir_all(repo.join("newdir/nested")).unwrap();
+    std::fs::write(repo.join("newdir/a.txt"), "one\n").unwrap();
+    std::fs::write(repo.join("newdir/nested/b.txt"), "two\n").unwrap();
+    std::fs::write(repo.join("tracked.txt"), "keep\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    // Stage nothing new: newdir/ is wholly untracked -> porcelain shows
+    // `?? newdir/`.
+    std::fs::create_dir_all(repo.join("fresh/inner")).unwrap();
+    std::fs::write(repo.join("fresh/one.txt"), "1\n").unwrap();
+    std::fs::write(repo.join("fresh/inner/two.txt"), "2\n").unwrap();
+
+    let details = git_get_status_detail(repo.to_str().unwrap()).unwrap();
+    let untracked: Vec<&str> = details
+        .iter()
+        .filter(|d| d.status == "untracked")
+        .map(|d| d.path.as_str())
+        .collect();
+    assert!(untracked.contains(&"fresh/one.txt"), "files must be listed, got {untracked:?}");
+    assert!(
+        untracked.contains(&"fresh/inner/two.txt"),
+        "nested files must be listed, got {untracked:?}"
+    );
+    assert!(
+        !untracked.iter().any(|p| p.ends_with('/')),
+        "no directory entry may remain, got {untracked:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn it_get_diff_on_a_directory_returns_empty_instead_of_os_error() {
+    if git_missing() {
+        return;
+    }
+    let repo = init_repo("untracked-dir-diff");
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    std::fs::create_dir_all(repo.join("dir")).unwrap();
+    std::fs::write(repo.join("dir/x.txt"), "x\n").unwrap();
+
+    let cwd = repo.to_str().unwrap();
+    let diff = git_get_diff(cwd, "dir", false).unwrap();
+    assert!(diff.is_empty(), "directory diff must be empty, got: {diff}");
+    // And the expanded file path diffs cleanly as an all-additions patch.
+    let file_diff = git_get_diff(cwd, "dir/x.txt", false).unwrap();
+    assert!(file_diff.contains("+x"), "untracked file diff should show additions:\n{file_diff}");
+    std::fs::remove_dir_all(&repo).ok();
+}
