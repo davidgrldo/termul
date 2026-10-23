@@ -1495,3 +1495,59 @@ fn it_get_diff_on_a_directory_returns_empty_instead_of_os_error() {
     assert!(file_diff.contains("+x"), "untracked file diff should show additions:\n{file_diff}");
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// #1492 review: quoted directory names and nested-cwd (root-relative porcelain).
+#[test]
+fn it_status_detail_expands_quoted_untracked_directory_names() {
+    if git_missing() {
+        return;
+    }
+    let repo = init_repo("untracked-quoted");
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    // A directory name that forces porcelain C-quoting (space + dquote).
+    let dir = "we ird\"q";
+    std::fs::create_dir_all(repo.join(dir)).unwrap();
+    std::fs::write(repo.join(dir).join("f.txt"), "x\n").unwrap();
+
+    let details = git_get_status_detail(repo.to_str().unwrap()).unwrap();
+    let untracked: Vec<&str> = details
+        .iter()
+        .filter(|d| d.status == "untracked")
+        .map(|d| d.path.as_str())
+        .collect();
+    assert!(
+        untracked.contains(&"we ird\"q/f.txt"),
+        "quoted dir must expand to its file, got {untracked:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn it_status_detail_expansion_is_root_relative_from_nested_cwd() {
+    if git_missing() {
+        return;
+    }
+    let repo = init_repo("untracked-nested");
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    std::fs::create_dir_all(repo.join("sub/newdir")).unwrap();
+    std::fs::write(repo.join("sub/newdir/b.txt"), "b\n").unwrap();
+
+    // From a nested cwd, porcelain rows are repo-root-relative; the expanded
+    // files must be too (they replace the root-relative `?? sub/` row).
+    let nested = repo.join("sub");
+    let details = git_get_status_detail(nested.to_str().unwrap()).unwrap();
+    let untracked: Vec<&str> = details
+        .iter()
+        .filter(|d| d.status == "untracked")
+        .map(|d| d.path.as_str())
+        .collect();
+    assert!(
+        untracked.contains(&"sub/newdir/b.txt"),
+        "expansion must be root-relative like the status row, got {untracked:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
