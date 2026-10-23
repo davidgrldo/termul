@@ -1502,6 +1502,11 @@ fn it_status_detail_expands_quoted_untracked_directory_names() {
     if git_missing() {
         return;
     }
+    // `"` is not valid in Windows path names; the quoted-name scenario is
+    // POSIX-only by construction.
+    if cfg!(windows) {
+        return;
+    }
     let repo = init_repo("untracked-quoted");
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -1520,6 +1525,38 @@ fn it_status_detail_expands_quoted_untracked_directory_names() {
     assert!(
         untracked.contains(&"we ird\"q/f.txt"),
         "quoted dir must expand to its file, got {untracked:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn it_status_detail_expands_directory_named_like_a_pathspec_magic() {
+    if git_missing() {
+        return;
+    }
+    let repo = init_repo("untracked-magic");
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    // A directory literally named like pathspec exclusion magic must be
+    // expanded as a path, not swallowed as a directive.
+    std::fs::create_dir_all(repo.join(":(exclude)fresh")).unwrap();
+    std::fs::write(repo.join(":(exclude)fresh/one.txt"), "1\n").unwrap();
+    std::fs::write(repo.join("outside.txt"), "keep\n").unwrap();
+
+    let details = git_get_status_detail(repo.to_str().unwrap()).unwrap();
+    let untracked: Vec<&str> = details
+        .iter()
+        .filter(|d| d.status == "untracked")
+        .map(|d| d.path.as_str())
+        .collect();
+    assert!(
+        untracked.contains(&":(exclude)fresh/one.txt"),
+        "magic-named dir must expand to its file, got {untracked:?}"
+    );
+    assert!(
+        untracked.contains(&"outside.txt"),
+        "sibling untracked file must remain, got {untracked:?}"
     );
     std::fs::remove_dir_all(&repo).ok();
 }

@@ -99,9 +99,19 @@ fn expand_untracked_dirs(cwd: &str, output: &str) -> String {
             if is_dir_entry {
                 let dir_arg = unquoted.as_str();
                 if let Some(git_root) = root(&mut repo_root_cache) {
+                    // `:(literal)` disables pathspec magic: a directory
+                    // literally named `:(exclude)…` must be treated as a
+                    // path, not as an exclusion directive.
+                    let literal_arg = format!(":(literal){dir_arg}");
                     let expanded = GitTracker::run_git_command(
                         &git_root,
-                        &["ls-files", "--others", "--exclude-standard", "--", dir_arg],
+                        &[
+                            "ls-files",
+                            "--others",
+                            "--exclude-standard",
+                            "--",
+                            &literal_arg,
+                        ],
                     )
                     .filter(|o| o.status.success())
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
