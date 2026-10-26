@@ -24,7 +24,7 @@ export type Env = {
   /**
    * Optional pepper for the rate-limit IP hash (#1531). An unsalted SHA-256
    * of an IP is trivially dictionary-attacked (IPv4 space is only 2^32).
-   * Set via `wrangler secret put TESTIMONIAL_RATE_LIMIT_SALT` — never a
+   * Set via `wrangler pages secret put TESTIMONIAL_RATE_LIMIT_SALT --project-name termul-landing` — never a
    * committed value. Rotating the salt simply orphans in-flight rate-limit
    * rows for the short window duration, which is acceptable.
    * Unset keeps the legacy unsalted hash so existing rows stay consistent.
