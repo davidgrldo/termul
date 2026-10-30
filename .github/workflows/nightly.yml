@@ -507,6 +507,21 @@ jobs:
           assets+=(latest-nightly.json)
           gh release upload nightly --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
 
+      # Versioned assets get a new name every night and are never clobbered, so
+      # without this the release hits GitHub's 1000-asset cap (#1508). Runs after
+      # the upload so latest-nightly.json never points at a deleted file.
+      - name: Prune older nightly versions from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.nightly_version }}
+        run: |
+          gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name | select(test("-nightly\\.[0-9]{8}\\.") and (contains(env.VERSION) | not))' |
+          while IFS= read -r name; do
+            echo "Deleting $name"
+            gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes
+          done
+
   # The image downloads and verifies the `nightly` release assets, so it runs
   # after publish.
   container_image:
