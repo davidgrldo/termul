@@ -487,8 +487,17 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.nightly_version }}
         shell: bash
         run: |
-          if ! gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "No nightly release yet; nothing to prune."
+          err="$RUNNER_TEMP/release-view.err"
+          if ! release="$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets 2>"$err")"; then
+            if grep -q 'release not found' "$err"; then
+              echo "No nightly release yet; nothing to prune."
+              exit 0
+            fi
+            cat "$err" >&2
+            exit 1
+          fi
+          if ! jq -e 'any(.assets[]; .name == "latest-nightly.json")' <<< "$release" >/dev/null; then
+            echo "Release has no latest-nightly.json; skipping prune so no live asset is deleted."
             exit 0
           fi
           PUBLISHED="$(gh release download nightly --repo "$GITHUB_REPOSITORY" -p latest-nightly.json -O - | jq -r '.version')"
@@ -496,9 +505,8 @@ jobs:
             echo "latest-nightly.json has no version" >&2
             exit 1
           fi
-          export PUBLISHED
-          gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[].name | select(test("-nightly\\.[0-9]{8}\\.") and ((contains(env.VERSION) or contains(env.PUBLISHED)) | not))' |
+          jq -r --arg current "$VERSION" --arg published "$PUBLISHED" \
+            '.assets[].name | select(test("-nightly\\.[0-9]{8}\\.") and ((contains($current) or contains($published)) | not))' <<< "$release" |
           while IFS= read -r name; do
             echo "Deleting $name"
             gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes
